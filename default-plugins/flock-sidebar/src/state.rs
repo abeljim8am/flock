@@ -180,7 +180,6 @@ impl PaneAgentState {
 
     /// Record an agent self-report (Phase 5 hook channel). Returns whether the
     /// arbitrated state or label changed.
-    #[allow(dead_code)] // wired up by the Phase 5 hook channel (`pipe()`).
     pub fn set_hook_authority(
         &mut self,
         source: String,
@@ -204,7 +203,6 @@ impl PaneAgentState {
 
     /// Clear any hook authority (e.g. on agent exit). Returns whether the
     /// arbitrated state or label changed.
-    #[allow(dead_code)] // wired up by the Phase 5 hook channel (`pipe()`).
     pub fn clear_hook_authority(&mut self, now: Instant) -> bool {
         if self.hook_authority.is_none() {
             return false;
@@ -572,7 +570,7 @@ mod tests {
         let mut pane = PaneAgentState::new();
         pane.observe_screen(Some(Agent::Pi), detection(AgentState::Idle), now);
         pane.set_hook_authority(
-            "herdr:pi".into(),
+            "flock:pi".into(),
             "pi".into(),
             AgentState::Working,
             None,
@@ -591,7 +589,7 @@ mod tests {
         let mut pane = PaneAgentState::new();
         pane.observe_screen(Some(Agent::Pi), detection(AgentState::Idle), now);
         pane.set_hook_authority(
-            "herdr:custom".into(),
+            "flock:custom".into(),
             "custom-agent".into(),
             AgentState::Working,
             None,
@@ -610,7 +608,7 @@ mod tests {
         let mut pane = PaneAgentState::new();
         pane.observe_screen(Some(Agent::Codex), detection(AgentState::Idle), now);
         pane.set_hook_authority(
-            "herdr:codex".into(),
+            "flock:codex".into(),
             "codex".into(),
             AgentState::Working,
             None,
@@ -634,7 +632,7 @@ mod tests {
         let mut pane = PaneAgentState::new();
         pane.observe_screen(Some(Agent::Codex), detection(AgentState::Idle), now);
         pane.set_hook_authority(
-            "herdr:codex".into(),
+            "flock:codex".into(),
             "codex".into(),
             AgentState::Working,
             None,
@@ -657,7 +655,7 @@ mod tests {
         let mut pane = PaneAgentState::new();
         pane.observe_screen(Some(Agent::Codex), detection(AgentState::Working), now);
         pane.set_hook_authority(
-            "herdr:codex".into(),
+            "flock:codex".into(),
             "codex".into(),
             AgentState::Blocked,
             None,
@@ -704,7 +702,7 @@ mod tests {
         let now = Instant::now();
         let mut pane = PaneAgentState::new();
         pane.set_hook_authority(
-            "herdr:pi".into(),
+            "flock:pi".into(),
             "pi".into(),
             AgentState::Working,
             None,
@@ -723,7 +721,7 @@ mod tests {
         let now = Instant::now();
         let mut pane = PaneAgentState::new();
         pane.set_hook_authority(
-            "herdr:codex".into(),
+            "flock:codex".into(),
             "codex".into(),
             AgentState::Working,
             None,
@@ -749,7 +747,7 @@ mod tests {
         let mut pane = PaneAgentState::new();
         pane.observe_screen(Some(Agent::Codex), detection(AgentState::Working), now);
         pane.set_hook_authority(
-            "herdr:codex".into(),
+            "flock:codex".into(),
             "codex".into(),
             AgentState::Idle,
             None,

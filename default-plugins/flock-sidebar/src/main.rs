@@ -21,8 +21,18 @@
 //! `PaneUpdate`/`TabUpdate` (`is_focused` + the active tab) and fed into each
 //! pane's seen arbitration — see [`State::sync_focus`] and
 //! [`state::PaneAgentState::set_focused`].
+//!
+//! Phase 5 adds the hook channel: agents report their own state directly through
+//! a `zellij pipe --name flock-state` message (requires the `ReadCliPipes`
+//! permission), which [`State::pipe`] parses (see [`hook`]) and applies to the
+//! target pane as a hook authority. The Phase 2 arbitration already favors a
+//! hook report over screen detection — with strong visible signals still able to
+//! veto a stale, non-blocked hook — so a self-report overrides screen detection
+//! per that precedence. The bundled `assets/*/flock-agent-state.sh` hooks are
+//! ported from herdr's, retargeted from its socket onto `zellij pipe`.
 
 mod detect;
+mod hook;
 mod palette;
 mod state;
 mod ui;
@@ -31,6 +41,7 @@ use std::collections::{BTreeMap, HashSet};
 use std::time::Instant;
 
 use detect::{detect_agent, identify_agent_from_command, AgentState};
+use hook::{parse_hook_report, HookReport, HOOK_PIPE_NAME};
 use palette::Theme;
 use state::PaneAgentState;
 use ui::{ClickTarget, Target};
@@ -240,6 +251,23 @@ impl ZellijPlugin for State {
         should_render
     }
 
+    fn pipe(&mut self, pipe_message: PipeMessage) -> bool {
+        // Only the agent self-report channel concerns us; ignore everything else
+        // so we don't claim pipes meant for other plugins.
+        if pipe_message.name != HOOK_PIPE_NAME {
+            return false;
+        }
+        match parse_hook_report(&pipe_message.args) {
+            Ok(report) => self.apply_hook_report(report),
+            Err(reason) => {
+                // A malformed report is dropped, not applied — log for the
+                // operator and leave every pane's state untouched.
+                eprintln!("flock-sidebar: ignoring {HOOK_PIPE_NAME} report: {reason}");
+                false
+            },
+        }
+    }
+
     fn render(&mut self, rows: usize, cols: usize) {
         self.rows = rows;
         self.cols = cols;
@@ -297,6 +325,33 @@ impl State {
             Some(Target::Pane(PaneId::Terminal(id))) => focus_terminal_pane(id, false, false),
             Some(Target::Pane(PaneId::Plugin(id))) => focus_plugin_pane(id, false, false),
             None => {},
+        }
+    }
+
+    /// Apply a parsed agent self-report (Phase 5 hook channel) to its target
+    /// pane. The pane's [`PaneAgentState`] entry is created on demand — a hook
+    /// can arrive before we've seen the pane's command or any render report — so
+    /// a self-reporting agent shows up immediately. Returns whether the sidebar
+    /// needs a repaint. The Phase 2 arbitration takes it from here: the hook is
+    /// the authority unless a strong visible screen signal vetoes it.
+    fn apply_hook_report(&mut self, report: HookReport) -> bool {
+        let now = Instant::now();
+        match report {
+            HookReport::State {
+                pane_id,
+                source,
+                agent_label,
+                state,
+                message,
+            } => {
+                let entry = self.agents.entry(pane_id).or_default();
+                entry.set_hook_authority(source, agent_label, state, message, now)
+            },
+            HookReport::Release { pane_id } => match self.agents.get_mut(&pane_id) {
+                // Releasing a pane we never tracked is a no-op.
+                Some(entry) => entry.clear_hook_authority(now),
+                None => false,
+            },
         }
     }
 
