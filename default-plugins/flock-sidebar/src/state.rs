@@ -60,11 +60,26 @@ pub struct PaneAgentState {
     last_detection: Option<AgentDetection>,
     /// The arbitrated effective state.
     pub state: AgentState,
-    /// Whether the user has looked at this pane since it last changed state. The
-    /// sidebar renders Done as the blue "done-unseen" icon until seen. Phase 4
-    /// wires the focus/visibility tracking that flips this; it defaults to
-    /// `true` so nothing reads as unseen before that lands.
+    /// Whether the user has looked at this pane since it last finished in the
+    /// background. The sidebar renders a background completion as the teal
+    /// "done-unseen" icon until the pane is focused, then reverts to the seen
+    /// (green ✓) icon. Defaults to `true` so a pane reads as seen until it
+    /// actually completes work unobserved.
     pub seen: bool,
+    /// Whether this pane is currently being viewed — the focused pane in the
+    /// active tab of the plugin's session. Drives the seen/unseen arbitration:
+    /// a completion while focused is seen immediately; a completion while
+    /// unfocused becomes Done-unseen until the user focuses the pane.
+    focused: bool,
+}
+
+/// A Working/Blocked → Idle transition: the agent finished or stopped waiting.
+/// Only this shape marks a pane unseen — an agent that merely starts idle (e.g.
+/// Unknown → Idle) is not a completion the user needs to be notified about.
+/// Ported from herdr's `app::actions::is_background_completion_transition`.
+fn is_background_completion_transition(previous: AgentState, current: AgentState) -> bool {
+    matches!(current, AgentState::Idle)
+        && matches!(previous, AgentState::Working | AgentState::Blocked)
 }
 
 impl Default for PaneAgentState {
@@ -82,6 +97,7 @@ impl Default for PaneAgentState {
             last_detection: None,
             state: AgentState::Unknown,
             seen: true,
+            focused: false,
         }
     }
 }
@@ -200,6 +216,21 @@ impl PaneAgentState {
         self.changed_since(&snapshot)
     }
 
+    /// Update whether this pane is currently being viewed (the focused pane in
+    /// the active tab). Viewing a pane marks it seen, clearing any Done-unseen
+    /// notification — herdr does this on tab/workspace switch via
+    /// `mark_active_tab_seen`. Returns whether the seen flag changed (the only
+    /// render-visible effect; the focus flag itself only influences *future*
+    /// completion arbitration).
+    pub fn set_focused(&mut self, focused: bool) -> bool {
+        self.focused = focused;
+        if focused && !self.seen {
+            self.seen = true;
+            return true;
+        }
+        false
+    }
+
     /// Re-evaluate time-based holds/grace windows on a `Timer` fire, re-running
     /// the last screen detection so the Claude working-hold and stale-hook-idle
     /// grace can expire without a new render report. Returns whether the
@@ -257,6 +288,7 @@ impl PaneAgentState {
     }
 
     fn recompute(&mut self, now: Instant) {
+        let previous = self.state;
         let state = if self
             .hook_authority
             .as_ref()
@@ -275,6 +307,21 @@ impl PaneAgentState {
                 .unwrap_or(self.fallback_state)
         };
         self.state = state;
+        self.update_seen(previous, state);
+    }
+
+    /// Arbitrate the seen/unseen flag on a state transition, mirroring herdr's
+    /// `apply_pane_state_change`: any non-idle state is seen (the pane is active
+    /// again), while a background completion (Working/Blocked → Idle) is seen
+    /// only if the pane is currently being viewed. Otherwise the flag is left
+    /// untouched — an unseen Done pane stays unseen across idle observations
+    /// until the user focuses it (see [`set_focused`](Self::set_focused)).
+    fn update_seen(&mut self, previous: AgentState, current: AgentState) {
+        if current != AgentState::Idle {
+            self.seen = true;
+        } else if is_background_completion_transition(previous, current) {
+            self.seen = self.focused;
+        }
     }
 
     fn visible_blocker_overrides_hook(&self) -> bool {
@@ -716,6 +763,85 @@ mod tests {
             now,
         );
         assert_eq!(pane.state, AgentState::Working);
+    }
+
+    // ---- seen / Done-unseen tracking (Phase 4) ----
+
+    #[test]
+    fn background_completion_marks_unseen() {
+        let now = Instant::now();
+        let mut pane = PaneAgentState::new();
+        // Working in the background (not focused), then it finishes.
+        pane.observe_screen(Some(Agent::Codex), detection(AgentState::Working), now);
+        assert!(pane.seen);
+        let changed = pane.observe_screen(Some(Agent::Codex), detection(AgentState::Idle), now);
+        assert!(changed);
+        assert_eq!(pane.state, AgentState::Idle);
+        assert!(!pane.seen, "an unfocused completion should read as Done-unseen");
+    }
+
+    #[test]
+    fn completion_while_focused_stays_seen() {
+        let now = Instant::now();
+        let mut pane = PaneAgentState::new();
+        pane.set_focused(true);
+        pane.observe_screen(Some(Agent::Codex), detection(AgentState::Working), now);
+        pane.observe_screen(Some(Agent::Codex), detection(AgentState::Idle), now);
+        assert_eq!(pane.state, AgentState::Idle);
+        assert!(pane.seen, "a completion the user is watching is already seen");
+    }
+
+    #[test]
+    fn focusing_clears_done_unseen() {
+        let now = Instant::now();
+        let mut pane = PaneAgentState::new();
+        pane.observe_screen(Some(Agent::Codex), detection(AgentState::Working), now);
+        pane.observe_screen(Some(Agent::Codex), detection(AgentState::Idle), now);
+        assert!(!pane.seen);
+
+        // Focusing the pane clears the notification and reports the change.
+        let changed = pane.set_focused(true);
+        assert!(changed);
+        assert!(pane.seen);
+        // Re-focusing an already-seen pane is a no-op.
+        assert!(!pane.set_focused(true));
+    }
+
+    #[test]
+    fn initial_idle_in_background_stays_seen() {
+        let now = Instant::now();
+        let mut pane = PaneAgentState::new();
+        // First observation is already Idle (Unknown → Idle): not a completion,
+        // so it must not raise a Done-unseen notification.
+        pane.observe_screen(Some(Agent::Codex), detection(AgentState::Idle), now);
+        assert_eq!(pane.state, AgentState::Idle);
+        assert!(pane.seen);
+    }
+
+    #[test]
+    fn restarting_work_after_unseen_clears_the_flag() {
+        let now = Instant::now();
+        let mut pane = PaneAgentState::new();
+        pane.observe_screen(Some(Agent::Codex), detection(AgentState::Working), now);
+        pane.observe_screen(Some(Agent::Codex), detection(AgentState::Idle), now);
+        assert!(!pane.seen);
+
+        // The agent picks work back up — any non-idle state resets seen.
+        pane.observe_screen(Some(Agent::Codex), detection(AgentState::Working), now);
+        assert_eq!(pane.state, AgentState::Working);
+        assert!(pane.seen);
+    }
+
+    #[test]
+    fn unseen_persists_across_idle_observations_until_focused() {
+        let now = Instant::now();
+        let mut pane = PaneAgentState::new();
+        pane.observe_screen(Some(Agent::Codex), detection(AgentState::Working), now);
+        pane.observe_screen(Some(Agent::Codex), detection(AgentState::Idle), now);
+        assert!(!pane.seen);
+        // Repeated idle frames must not silently re-mark it seen.
+        pane.observe_screen(Some(Agent::Codex), detection(AgentState::Idle), now);
+        assert!(!pane.seen);
     }
 
     #[test]

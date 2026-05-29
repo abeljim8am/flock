@@ -13,6 +13,14 @@
 //! of per-pane agent + state rows with herdr's exact state icons/colors, plus
 //! mouse scroll and click-to-focus. The same `Timer` now also advances a spinner
 //! for working agents.
+//!
+//! Phase 4 adds unseen / notification tracking: when an agent pane finishes in
+//! the background (a Working/Blocked → Idle transition while it is *not* the
+//! focused pane), it shows herdr's Done-unseen icon (teal `●`) until the user
+//! focuses it, then reverts to the seen icon (green `✓`). Focus is tracked from
+//! `PaneUpdate`/`TabUpdate` (`is_focused` + the active tab) and fed into each
+//! pane's seen arbitration — see [`State::sync_focus`] and
+//! [`state::PaneAgentState::set_focused`].
 
 mod detect;
 mod palette;
@@ -121,10 +129,14 @@ impl ZellijPlugin for State {
                 self.panes = manifest;
                 // Drop tracked state for panes that no longer exist.
                 self.prune_closed_panes();
+                // A focus change here may clear a Done-unseen notification.
+                self.sync_focus();
                 should_render = true;
             },
             Event::TabUpdate(tabs) => {
                 self.tabs = tabs;
+                // The active tab feeds which pane counts as "viewed".
+                self.sync_focus();
                 should_render = true;
             },
             Event::SessionUpdate(sessions, _resurrectable) => {
@@ -197,7 +209,9 @@ impl ZellijPlugin for State {
                 },
                 _ => {},
             },
-            // Subscribed now, handled in later phases.
+            // Reports the *plugin's* own pane visibility, not an agent pane's,
+            // so it doesn't bear on seen-tracking (that follows the focused
+            // terminal pane via `PaneUpdate`). Kept subscribed for later phases.
             Event::Visible(_) => {},
             Event::Key(key) => {
                 if key.has_no_modifiers() {
@@ -283,6 +297,33 @@ impl State {
             Some(Target::Pane(PaneId::Terminal(id))) => focus_terminal_pane(id, false, false),
             Some(Target::Pane(PaneId::Plugin(id))) => focus_plugin_pane(id, false, false),
             None => {},
+        }
+    }
+
+    /// Push the current focus picture into each tracked pane's state: a pane is
+    /// "viewed" when it is the focused pane in the active tab. Focusing a pane
+    /// clears its Done-unseen notification (see [`PaneAgentState::set_focused`]),
+    /// and the flag also tells the next completion whether it happened under the
+    /// user's eye. Only our own session's panes are in the manifest, which is
+    /// exactly the set whose screens we can observe.
+    fn sync_focus(&mut self) {
+        let active_tab = self
+            .tabs
+            .iter()
+            .find(|tab| tab.active)
+            .map(|tab| tab.position);
+        for (tab_idx, panes_in_tab) in &self.panes.panes {
+            let tab_is_active = active_tab == Some(*tab_idx);
+            for pane in panes_in_tab {
+                let pane_id = if pane.is_plugin {
+                    PaneId::Plugin(pane.id)
+                } else {
+                    PaneId::Terminal(pane.id)
+                };
+                if let Some(entry) = self.agents.get_mut(&pane_id) {
+                    entry.set_focused(tab_is_active && pane.is_focused);
+                }
+            }
         }
     }
 

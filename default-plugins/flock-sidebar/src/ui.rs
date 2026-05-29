@@ -122,8 +122,9 @@ pub struct AgentEntry {
     /// than one tab (matching herdr's multi-tab `pane_details` labelling).
     pub label: String,
     pub state: AgentState,
-    /// Whether the user has looked at this pane since it last changed. Phase 4
-    /// wires real tracking; until then everything is treated as seen.
+    /// Whether the user has looked at this pane since it last finished in the
+    /// background. A Done pane that hasn't been seen renders with the teal
+    /// "done-unseen" icon until focused.
     pub seen: bool,
     /// Whether this is the focused pane in the focused tab.
     pub is_active: bool,
