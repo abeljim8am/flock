@@ -60,6 +60,11 @@ pub struct PaneAgentState {
     last_detection: Option<AgentDetection>,
     /// The arbitrated effective state.
     pub state: AgentState,
+    /// Whether the user has looked at this pane since it last changed state. The
+    /// sidebar renders Done as the blue "done-unseen" icon until seen. Phase 4
+    /// wires the focus/visibility tracking that flips this; it defaults to
+    /// `true` so nothing reads as unseen before that lands.
+    pub seen: bool,
 }
 
 impl Default for PaneAgentState {
@@ -76,6 +81,7 @@ impl Default for PaneAgentState {
             last_claude_working_at: None,
             last_detection: None,
             state: AgentState::Unknown,
+            seen: true,
         }
     }
 }

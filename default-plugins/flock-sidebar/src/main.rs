@@ -1,6 +1,6 @@
 //! flock-sidebar — an agent-aware sidebar plugin for Zellij.
 //!
-//! Phase 2 adds agent detection for the plugin's own session: it identifies
+//! Phase 2 added agent detection for the plugin's own session: it identifies
 //! which panes run AI coding agents (from their `CommandChanged` argv) and
 //! classifies each one's live state (Idle / Working / Blocked) by matching the
 //! pane's on-screen chrome via the ported herdr detectors. The herdr async
@@ -8,22 +8,34 @@
 //! content, `CommandChanged` pushes the running command, and a recurring `Timer`
 //! drives the Claude working-hold / stale-hook grace windows.
 //!
-//! The sidebar render is still a debug list; the herdr-fidelity UI is Phase 3.
+//! Phase 3 renders that detected state as herdr's sidebar, re-targeted from
+//! `ratatui` onto the plugin's raw-ANSI output (see [`ui`]): a scrollable list
+//! of per-pane agent + state rows with herdr's exact state icons/colors, plus
+//! mouse scroll and click-to-focus. The same `Timer` now also advances a spinner
+//! for working agents.
 
 mod detect;
+mod palette;
 mod state;
+mod ui;
 
 use std::collections::{BTreeMap, HashSet};
 use std::time::Instant;
 
 use detect::{detect_agent, identify_agent_from_command, AgentState};
+use palette::Theme;
 use state::PaneAgentState;
+use ui::{ClickTarget, Target};
 use zellij_tile::prelude::*;
 
-/// How often we re-evaluate time-based holds/grace windows. herdr polled every
-/// 300ms; we only need a tick frequent enough to expire the 1.2s Claude hold and
-/// the 2s stale-hook window without a new render report.
+/// How often we re-evaluate time-based holds/grace windows when nothing is
+/// animating. herdr polled every 300ms; we only need a tick frequent enough to
+/// expire the 1.2s Claude hold and the 2s stale-hook window without a new render
+/// report.
 const STATE_TICK_SECS: f64 = 0.5;
+/// Faster cadence used while at least one agent is working, so the spinner
+/// animates smoothly (~8 frames/sec).
+const SPINNER_TICK_SECS: f64 = 0.12;
 
 #[derive(Default)]
 struct State {
@@ -40,7 +52,18 @@ struct State {
     agents: BTreeMap<PaneId, PaneAgentState>,
     /// Whether the recurring state tick timer has been armed.
     timer_running: bool,
-    /// Plugin pane dimensions from the last render, for mouse hit-testing later.
+    /// Sidebar colors, resolved from the user's active zellij theme (updated on
+    /// each `ModeUpdate`).
+    palette: Theme,
+    /// Unified keyboard selection cursor over the sessions then the agents.
+    selected: usize,
+    /// Scroll offset into the agent list.
+    scroll: usize,
+    /// Spinner animation frame counter, advanced by the timer while working.
+    spinner_tick: u32,
+    /// Row → selection-index map from the last render, for mouse hit-testing.
+    click_map: Vec<ClickTarget>,
+    /// Plugin pane dimensions from the last render, for mouse hit-testing.
     rows: usize,
     cols: usize,
 }
@@ -52,16 +75,19 @@ impl ZellijPlugin for State {
         // Permissions needed across all phases:
         // - ReadApplicationState: pane/tab/session manifests
         // - ReadPaneContents: PaneRenderReportWithAnsi screen scraping (Phase 2)
+        // - ChangeApplicationState: switch session / focus pane on activation
         // - ReadCliPipes: agent hook reports via `zellij pipe` (Phase 5)
         // - RunCommands: git branch / ahead-behind (Phase 6)
         request_permission(&[
             PermissionType::ReadApplicationState,
             PermissionType::ReadPaneContents,
+            PermissionType::ChangeApplicationState,
             PermissionType::ReadCliPipes,
             PermissionType::RunCommands,
         ]);
 
         subscribe(&[
+            EventType::ModeUpdate,
             EventType::PaneUpdate,
             EventType::TabUpdate,
             EventType::SessionUpdate,
@@ -84,6 +110,11 @@ impl ZellijPlugin for State {
         match event {
             Event::PermissionRequestResult(result) => {
                 self.permissions_granted = matches!(result, PermissionStatus::Granted);
+                should_render = true;
+            },
+            Event::ModeUpdate(mode_info) => {
+                // Track the active theme so the sidebar's colors follow it.
+                self.palette = Theme::from_style(&mode_info.style);
                 should_render = true;
             },
             Event::PaneUpdate(manifest) => {
@@ -131,16 +162,63 @@ impl ZellijPlugin for State {
                         should_render = true;
                     }
                 }
-                // Re-arm the recurring tick.
-                set_timeout(STATE_TICK_SECS);
+                // While anything is working, animate the spinner and tick faster;
+                // otherwise fall back to the slow hold/grace cadence.
+                let working = self.any_working();
+                if working {
+                    self.spinner_tick = self.spinner_tick.wrapping_add(1);
+                    should_render = true;
+                }
+                set_timeout(if working {
+                    SPINNER_TICK_SECS
+                } else {
+                    STATE_TICK_SECS
+                });
+            },
+            Event::Mouse(mouse) => match mouse {
+                // The wheel moves the keyboard cursor, so scrolling and selection
+                // stay in lockstep (the agent list follows the cursor in render).
+                Mouse::ScrollUp(n) => {
+                    self.select_prev(n.max(1));
+                    should_render = true;
+                },
+                Mouse::ScrollDown(n) => {
+                    self.select_next(n.max(1));
+                    should_render = true;
+                },
+                Mouse::LeftClick(line, _) => {
+                    if line >= 0 {
+                        if let Some(index) = ui::index_at_row(&self.click_map, line as usize) {
+                            self.selected = index;
+                            self.activate_selected();
+                            should_render = true;
+                        }
+                    }
+                },
+                _ => {},
             },
             // Subscribed now, handled in later phases.
-            Event::Mouse(_) => {},
             Event::Visible(_) => {},
             Event::Key(key) => {
-                // Esc closes the sidebar when it's focused (e.g. a floating pane).
-                if key.bare_key == BareKey::Esc && key.has_no_modifiers() {
-                    close_self();
+                if key.has_no_modifiers() {
+                    match key.bare_key {
+                        // Keyboard-first navigation over sessions + agents.
+                        BareKey::Up | BareKey::Char('k') => {
+                            self.select_prev(1);
+                            should_render = true;
+                        },
+                        BareKey::Down | BareKey::Char('j') => {
+                            self.select_next(1);
+                            should_render = true;
+                        },
+                        BareKey::Enter => {
+                            self.activate_selected();
+                            should_render = true;
+                        },
+                        // Esc closes the sidebar when it's focused (e.g. a float).
+                        BareKey::Esc => close_self(),
+                        _ => {},
+                    }
                 }
             },
             _ => {},
@@ -152,66 +230,62 @@ impl ZellijPlugin for State {
         self.rows = rows;
         self.cols = cols;
 
-        let title = Text::new("🐑 flock").color_range(2, ..);
-        print_text_with_coordinates(title, 0, 0, Some(cols), None);
-
-        if !self.permissions_granted {
-            let hint = Text::new("waiting for permissions…").color_range(3, ..);
-            print_text_with_coordinates(hint, 0, 2, Some(cols), None);
-            return;
-        }
-
-        // Build a pane-id → title lookup for labelling agent rows.
-        let mut titles: BTreeMap<PaneId, String> = BTreeMap::new();
-        for panes in self.panes.panes.values() {
-            for pane in panes {
-                let pane_id = if pane.is_plugin {
-                    PaneId::Plugin(pane.id)
-                } else {
-                    PaneId::Terminal(pane.id)
-                };
-                titles.insert(pane_id, pane.title.clone());
-            }
-        }
-
-        let agents: Vec<(&PaneId, &PaneAgentState)> = self
-            .agents
-            .iter()
-            .filter(|(_, st)| st.is_agent())
-            .collect();
-
-        let summary = format!("{} agent(s)", agents.len());
-        print_text_with_coordinates(Text::new(summary), 0, 2, Some(cols), None);
-
-        if agents.is_empty() {
-            let placeholder = Text::new("no agents detected yet").color_range(0, ..);
-            print_text_with_coordinates(placeholder, 0, 4, Some(cols), None);
-            return;
-        }
-
-        let mut row = 4;
-        for (pane_id, st) in agents {
-            let label = st.effective_agent_label().unwrap_or_else(|| "?".to_string());
-            let (glyph, color) = state_glyph(st.state);
-            let title = titles
-                .get(pane_id)
-                .map(|t| t.as_str())
-                .unwrap_or("")
-                .trim();
-            let line = if title.is_empty() {
-                format!("{glyph} {label}  {}", state_word(st.state))
-            } else {
-                format!("{glyph} {label}  {}  {title}", state_word(st.state))
-            };
-            // Color just the leading glyph by the state.
-            let text = Text::new(line).color_range(color, 0..glyph.chars().count());
-            print_text_with_coordinates(text, 0, row, Some(cols), None);
-            row += 1;
-        }
+        let output = ui::render(ui::RenderInput {
+            permissions_granted: self.permissions_granted,
+            panes: &self.panes,
+            tabs: &self.tabs,
+            agents: &self.agents,
+            sessions: &self.sessions,
+            palette: &self.palette,
+            selected: self.selected,
+            scroll: self.scroll,
+            spinner_tick: self.spinner_tick,
+            rows,
+            cols,
+        });
+        self.selected = output.selected;
+        self.scroll = output.scroll;
+        self.click_map = output.click_map;
+        print!("{}", output.ansi);
     }
 }
 
 impl State {
+    /// Whether any tracked agent is currently in the Working state (drives the
+    /// faster spinner-animation timer cadence).
+    fn any_working(&self) -> bool {
+        self.agents
+            .values()
+            .any(|st| st.is_agent() && st.state == AgentState::Working)
+    }
+
+    /// The ordered navigable targets (sessions then agents). Rebuilt on demand;
+    /// the same ordering drives the render, so indices line up.
+    fn targets(&self) -> Vec<Target> {
+        ui::navigable_targets(&self.panes, &self.tabs, &self.agents, &self.sessions)
+    }
+
+    /// Move the selection cursor up by `n`, clamped at the top.
+    fn select_prev(&mut self, n: usize) {
+        self.selected = self.selected.saturating_sub(n);
+    }
+
+    /// Move the selection cursor down by `n`, clamped at the last target.
+    fn select_next(&mut self, n: usize) {
+        let last = self.targets().len().saturating_sub(1);
+        self.selected = self.selected.saturating_add(n).min(last);
+    }
+
+    /// Act on the selected row: switch to a session, or focus an agent pane.
+    fn activate_selected(&mut self) {
+        match self.targets().into_iter().nth(self.selected) {
+            Some(Target::Session(name)) => switch_session(Some(&name)),
+            Some(Target::Pane(PaneId::Terminal(id))) => focus_terminal_pane(id, false, false),
+            Some(Target::Pane(PaneId::Plugin(id))) => focus_plugin_pane(id, false, false),
+            None => {},
+        }
+    }
+
     /// Remove tracked agent state for panes that are no longer in the manifest.
     fn prune_closed_panes(&mut self) {
         let live: HashSet<PaneId> = self
@@ -285,25 +359,5 @@ fn strip_ansi_into(line: &str, out: &mut String) {
             },
             None => {},
         }
-    }
-}
-
-/// A single-glyph state indicator and its theme color index. Exact herdr colors
-/// (raw ANSI red/yellow/blue/green) land with the full UI in Phase 3.
-fn state_glyph(state: AgentState) -> (&'static str, usize) {
-    match state {
-        AgentState::Blocked => ("●", 1),
-        AgentState::Working => ("●", 3),
-        AgentState::Idle => ("●", 2),
-        AgentState::Unknown => ("○", 0),
-    }
-}
-
-fn state_word(state: AgentState) -> &'static str {
-    match state {
-        AgentState::Blocked => "blocked",
-        AgentState::Working => "working",
-        AgentState::Idle => "idle",
-        AgentState::Unknown => "unknown",
     }
 }
