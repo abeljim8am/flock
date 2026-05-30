@@ -103,4 +103,5 @@ tab_history {
 pane_history {
 }
 creation_time 300
+workspace_root "/home/aviram/my-project"
 

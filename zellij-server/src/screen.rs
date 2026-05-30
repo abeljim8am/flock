@@ -1458,6 +1458,11 @@ pub(crate) struct Screen {
     /// Resolved styling to apply when `host_terminal_theme_mode == Light`.
     /// `None` disables auto-switch. Refreshed on each reconfigure.
     host_theme_light_styling: Option<Styling>,
+    /// The folder this session was started in (the server's launch cwd). This
+    /// is the session's stable workspace identity, surfaced on `SessionInfo`
+    /// so plugins can group sessions by the project folder they belong to.
+    /// Empty until set (in `screen_thread_main`).
+    workspace_root: PathBuf,
 }
 
 /// A pending forward waiting to be dispatched once the current in-flight
@@ -1611,6 +1616,7 @@ impl Screen {
             host_terminal_theme_mode: None,
             host_theme_dark_styling: None,
             host_theme_light_styling: None,
+            workspace_root: PathBuf::new(),
         }
     }
 
@@ -3384,6 +3390,7 @@ impl Screen {
                 .map(|(k, v)| (*k, v.iter().map(|v| (*v).into()).collect()))
                 .collect(),
             creation_time,
+            workspace_root: self.workspace_root.clone(),
         };
         self.bus
             .senders
@@ -5695,6 +5702,10 @@ pub(crate) fn screen_thread_main(
     );
     screen.host_theme_dark_styling = host_theme_dark_styling;
     screen.host_theme_light_styling = host_theme_light_styling;
+    // The server process inherits (and, post-daemonization, retains) the cwd it
+    // was launched from — that folder is the session's workspace identity.
+    screen.workspace_root =
+        std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
 
     let mut pending_tab_ids: HashSet<usize> = HashSet::new();
     let mut pending_tab_switches: HashSet<(usize, ClientId)> = HashSet::new(); // usize is the
@@ -8611,6 +8622,7 @@ pub(crate) fn screen_thread_main(
                         .map(|(k, v)| (*k, v.iter().map(|v| (*v).into()).collect()))
                         .collect(),
                     creation_time,
+                    workspace_root: screen.workspace_root.clone(),
                 };
 
                 let session_layout_metadata = if screen.session_serialization {

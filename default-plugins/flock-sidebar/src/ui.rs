@@ -23,11 +23,13 @@
 //! precise while still matching whatever theme is configured.
 
 use std::collections::BTreeMap;
+use std::path::Path;
 
 use unicode_width::UnicodeWidthStr;
 use zellij_tile::prelude::{PaneId, PaneManifest, PaletteColor, SessionInfo, TabInfo};
 
 use crate::detect::{identify_agent_from_command, AgentState};
+use crate::git::GitInfo;
 use crate::palette::{bg, fg, goto, Theme, BOLD, DIM, NORMAL_INTENSITY, RESET};
 use crate::state::PaneAgentState;
 
@@ -202,18 +204,69 @@ pub fn build_entries(
     entries
 }
 
-/// The ordered list of navigable targets: every session (in list order) then
-/// every agent in the current session (in [`build_entries`] order). The same
-/// ordering is used by [`render`], so a selection index maps consistently
-/// whether it came from a keypress or a click.
+/// A folder grouping of sessions: every session started in the same
+/// `workspace_root` (the Phase 6 fork field) is collected under one header. The
+/// key is the workspace path (empty for sessions whose server didn't supply
+/// one); the label is that path's basename, shown in the header.
+pub struct WorkspaceGroup<'a> {
+    /// The workspace path string — the grouping key. Empty when unknown.
+    pub key: String,
+    /// Display label: the path's final component, or a placeholder.
+    pub label: String,
+    /// Sessions in this workspace, in their original list order.
+    pub sessions: Vec<&'a SessionInfo>,
+}
+
+/// Group sessions by their `workspace_root` folder. Groups are ordered by path
+/// so the layout is stable frame to frame; sessions whose server didn't report
+/// a workspace root collect under a single trailing "(no workspace)" group.
+pub fn group_sessions(sessions: &[SessionInfo]) -> Vec<WorkspaceGroup<'_>> {
+    let mut by_key: BTreeMap<String, Vec<&SessionInfo>> = BTreeMap::new();
+    for session in sessions {
+        let key = session.workspace_root.display().to_string();
+        by_key.entry(key).or_default().push(session);
+    }
+    let mut groups: Vec<WorkspaceGroup> = by_key
+        .into_iter()
+        .map(|(key, sessions)| {
+            let label = workspace_label(&key);
+            WorkspaceGroup {
+                key,
+                label,
+                sessions,
+            }
+        })
+        .collect();
+    // Keep the unknown-workspace group (empty key) last.
+    groups.sort_by(|a, b| a.key.is_empty().cmp(&b.key.is_empty()).then(a.key.cmp(&b.key)));
+    groups
+}
+
+/// Display label for a workspace path: its final component, or "(no workspace)"
+/// when the path is empty.
+fn workspace_label(key: &str) -> String {
+    if key.is_empty() {
+        return "(no workspace)".to_string();
+    }
+    Path::new(key)
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| key.to_string())
+}
+
+/// The ordered list of navigable targets: every session (grouped by workspace,
+/// in [`group_sessions`] order) then every agent in the current session (in
+/// [`build_entries`] order). The same ordering is used by [`render`], so a
+/// selection index maps consistently whether it came from a keypress or a click.
 pub fn navigable_targets(
     panes: &PaneManifest,
     tabs: &[TabInfo],
     agents: &BTreeMap<PaneId, PaneAgentState>,
     sessions: &[SessionInfo],
 ) -> Vec<Target> {
-    let mut targets: Vec<Target> = sessions
+    let mut targets: Vec<Target> = group_sessions(sessions)
         .iter()
+        .flat_map(|group| group.sessions.iter())
         .map(|s| Target::Session(s.name.clone()))
         .collect();
     targets.extend(
@@ -325,6 +378,33 @@ fn truncate_text(text: &str, max_width: usize) -> String {
     out
 }
 
+/// Render a workspace group header: the folder name, followed by its git branch
+/// and ahead/behind counts when the folder is a repo. Non-selectable — it is a
+/// label, not a navigable row, so it gets no click target.
+fn render_workspace_header(
+    out: &mut String,
+    y: usize,
+    cols: usize,
+    group: &WorkspaceGroup,
+    git: &BTreeMap<String, GitInfo>,
+    p: &Theme,
+) {
+    let label = truncate_text(&group.label, cols.saturating_sub(1));
+    let mut spans = vec![Span::new(" ", p.text), Span::new(label, p.text).bold()];
+    if let Some(info) = git.get(&group.key) {
+        if info.is_repo && !info.branch.is_empty() {
+            spans.push(Span::new(format!("  {}", info.branch), p.muted).dim());
+            if info.ahead > 0 {
+                spans.push(Span::new(format!(" ↑{}", info.ahead), p.green));
+            }
+            if info.behind > 0 {
+                spans.push(Span::new(format!(" ↓{}", info.behind), p.yellow));
+            }
+        }
+    }
+    render_row(out, 0, y, cols, None, &spans);
+}
+
 /// The full sidebar render input.
 pub struct RenderInput<'a> {
     pub permissions_granted: bool,
@@ -332,6 +412,8 @@ pub struct RenderInput<'a> {
     pub tabs: &'a [TabInfo],
     pub agents: &'a BTreeMap<PaneId, PaneAgentState>,
     pub sessions: &'a [SessionInfo],
+    /// Resolved git branch / ahead-behind per workspace path (the group key).
+    pub git: &'a BTreeMap<String, GitInfo>,
     pub palette: &'a Theme,
     /// Unified selection cursor over sessions-then-agents.
     pub selected: usize,
@@ -389,50 +471,71 @@ pub fn render(input: RenderInput) -> RenderOutput {
 
     let mut y = 0usize;
 
-    // ---- sessions section ----
-    render_row(&mut out, 0, y, cols, None, &[Span::new(" sessions", p.muted).bold()]);
+    // ---- workspaces section: sessions grouped by their start folder ----
+    render_row(&mut out, 0, y, cols, None, &[Span::new(" workspaces", p.muted).bold()]);
     y += 1;
 
-    if input.sessions.is_empty() {
+    let groups = group_sessions(input.sessions);
+    if groups.is_empty() {
         render_row(&mut out, 0, y, cols, None, &[Span::new(" (none)", p.muted).dim()]);
         y += 1;
     } else {
-        for (i, session) in input.sessions.iter().enumerate() {
+        // Running index into the flattened grouped session order — must match
+        // `navigable_targets`, which walks the groups the same way.
+        let mut session_index = 0usize;
+        for group in &groups {
             if y >= rows {
                 break;
             }
-            let activity = if session.is_current_session {
-                current_session_activity(input.agents)
-            } else if session_agent_count(session) > 0 {
-                // Other sessions: we can see agents exist but not whether they're
-                // running until the cross-session bus (Phase 7), so presence maps
-                // to the "stopped" bucket.
-                SessionActivity::Stopped
-            } else {
-                SessionActivity::None
-            };
-            let (dot, dot_color) = activity_dot(activity, p);
-            let is_selected = i == selected;
-            let row_bg = is_selected.then_some(p.selection_bg);
-            let name_color = if is_selected || session.is_current_session {
-                p.text
-            } else {
-                p.muted
-            };
-            let mut name = Span::new(session.name.clone(), name_color);
-            if is_selected || session.is_current_session {
-                name = name.bold();
-            }
-            render_row(
-                &mut out,
-                0,
-                y,
-                cols,
-                row_bg,
-                &[Span::new(" ", p.text), Span::new(dot, dot_color), Span::new(" ", p.text), name],
-            );
-            click_map.push(ClickTarget { row: y, index: i });
+            render_workspace_header(&mut out, y, cols, group, input.git, p);
             y += 1;
+            for session in &group.sessions {
+                if y >= rows {
+                    break;
+                }
+                let activity = if session.is_current_session {
+                    current_session_activity(input.agents)
+                } else if session_agent_count(session) > 0 {
+                    // Other sessions: we can see agents exist but not whether
+                    // they're running until the cross-session bus (Phase 7), so
+                    // presence maps to the "stopped" bucket.
+                    SessionActivity::Stopped
+                } else {
+                    SessionActivity::None
+                };
+                let (dot, dot_color) = activity_dot(activity, p);
+                let is_selected = session_index == selected;
+                let row_bg = is_selected.then_some(p.selection_bg);
+                let name_color = if is_selected || session.is_current_session {
+                    p.text
+                } else {
+                    p.muted
+                };
+                let mut name = Span::new(session.name.clone(), name_color);
+                if is_selected || session.is_current_session {
+                    name = name.bold();
+                }
+                // Sessions are indented one level under their workspace header.
+                render_row(
+                    &mut out,
+                    0,
+                    y,
+                    cols,
+                    row_bg,
+                    &[
+                        Span::new("  ", p.text),
+                        Span::new(dot, dot_color),
+                        Span::new(" ", p.text),
+                        name,
+                    ],
+                );
+                click_map.push(ClickTarget {
+                    row: y,
+                    index: session_index,
+                });
+                y += 1;
+                session_index += 1;
+            }
         }
     }
 
@@ -630,6 +733,54 @@ mod tests {
         let (done_icon, done_color) = agent_icon(AgentState::Idle, false, 0, &p);
         assert_eq!(done_icon, "●");
         assert_eq!(done_color, p.teal);
+    }
+
+    fn sess(name: &str, root: &str) -> SessionInfo {
+        let mut s = SessionInfo::new(name.to_string());
+        s.workspace_root = std::path::PathBuf::from(root);
+        s
+    }
+
+    #[test]
+    fn group_sessions_buckets_by_workspace_root_with_unknown_last() {
+        let sessions = vec![
+            sess("a", "/home/u/proj"),
+            sess("b", "/home/u/proj"),
+            sess("c", ""),
+            sess("d", "/home/u/other"),
+        ];
+        let groups = group_sessions(&sessions);
+        assert_eq!(groups.len(), 3);
+        // Non-empty keys sort by path; the unknown (empty) group trails.
+        assert_eq!(groups[0].label, "other");
+        assert_eq!(groups[1].label, "proj");
+        let proj_names: Vec<&str> = groups[1].sessions.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(proj_names, vec!["a", "b"]);
+        assert_eq!(groups[2].label, "(no workspace)");
+        assert_eq!(groups[2].key, "");
+    }
+
+    #[test]
+    fn navigable_targets_follow_grouped_session_order() {
+        let sessions = vec![
+            sess("a", "/home/u/proj"),
+            sess("c", ""),
+            sess("d", "/home/u/other"),
+        ];
+        let targets = navigable_targets(
+            &PaneManifest::default(),
+            &[],
+            &BTreeMap::new(),
+            &sessions,
+        );
+        assert_eq!(
+            targets,
+            vec![
+                Target::Session("d".to_string()), // /home/u/other
+                Target::Session("a".to_string()), // /home/u/proj
+                Target::Session("c".to_string()), // unknown, last
+            ]
+        );
     }
 
     #[test]

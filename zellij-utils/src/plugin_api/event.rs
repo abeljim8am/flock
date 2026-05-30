@@ -1212,6 +1212,7 @@ impl TryFrom<SessionInfo> for ProtobufSessionManifest {
                 .map(|p| ProtobufClientPaneHistory::from(p))
                 .collect(),
             creation_time: session_info.creation_time.as_secs(),
+            workspace_root: session_info.workspace_root.display().to_string(),
         })
     }
 }
@@ -1323,6 +1324,7 @@ impl TryFrom<ProtobufSessionManifest> for SessionInfo {
             tab_history,
             pane_history,
             creation_time: Duration::from_secs(protobuf_session_manifest.creation_time),
+            workspace_root: PathBuf::from(protobuf_session_manifest.workspace_root),
         })
     }
 }
@@ -2791,6 +2793,7 @@ fn serialize_session_update_event_with_non_default_values() {
         tab_history,
         pane_history: Default::default(),
         creation_time: Duration::from_secs(100),
+        workspace_root: PathBuf::from("/home/aviram/session-1"),
     };
     let session_info_2 = SessionInfo {
         name: "session 2".to_owned(),
@@ -2825,6 +2828,7 @@ fn serialize_session_update_event_with_non_default_values() {
         tab_history: Default::default(),
         pane_history: Default::default(),
         creation_time: Duration::from_secs(200),
+        workspace_root: PathBuf::from("/home/aviram/session-2"),
     };
     let session_infos = vec![session_info_1, session_info_2];
     let resurrectable_sessions = vec![];

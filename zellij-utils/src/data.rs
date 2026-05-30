@@ -1794,6 +1794,10 @@ pub struct SessionInfo {
     pub tab_history: BTreeMap<ClientId, Vec<usize>>,
     pub pane_history: BTreeMap<ClientId, Vec<PaneId>>,
     pub creation_time: Duration,
+    /// The folder the session was started in (the server's launch cwd). Empty
+    /// when unknown. Used as the session's stable workspace identity so plugins
+    /// can group sessions by the project folder they belong to.
+    pub workspace_root: PathBuf,
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Eq, Deserialize, Serialize)]

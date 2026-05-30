@@ -5647,6 +5647,12 @@ impl SessionInfo {
             .and_then(|e| e.value().as_i64())
             .map(|c| Duration::from_secs(c as u64))
             .unwrap_or_default();
+        let workspace_root = kdl_document
+            .get("workspace_root")
+            .and_then(|n| n.entries().iter().next())
+            .and_then(|e| e.value().as_string())
+            .map(PathBuf::from)
+            .unwrap_or_default();
         Ok(SessionInfo {
             name,
             tabs,
@@ -5660,6 +5666,7 @@ impl SessionInfo {
             tab_history,
             pane_history,
             creation_time,
+            workspace_root,
         })
     }
     pub fn to_string(&self) -> String {
@@ -5766,6 +5773,10 @@ impl SessionInfo {
         let mut creation_time_node = KdlNode::new("creation_time");
         creation_time_node.push(self.creation_time.as_secs() as i64);
         kdl_document.nodes_mut().push(creation_time_node);
+
+        let mut workspace_root_node = KdlNode::new("workspace_root");
+        workspace_root_node.push(self.workspace_root.display().to_string());
+        kdl_document.nodes_mut().push(workspace_root_node);
 
         kdl_document.fmt();
         kdl_document.to_string()
@@ -6347,6 +6358,7 @@ fn serialize_and_deserialize_session_info_with_data() {
         tab_history: Default::default(),
         pane_history: Default::default(),
         creation_time: Duration::from_secs(300),
+        workspace_root: PathBuf::from("/home/aviram/my-project"),
     };
     let serialized = session_info.to_string();
     let deserealized = SessionInfo::from_string(&serialized, "not this session").unwrap();
