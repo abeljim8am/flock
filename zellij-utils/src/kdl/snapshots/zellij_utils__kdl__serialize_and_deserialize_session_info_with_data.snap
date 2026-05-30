@@ -1,5 +1,6 @@
 ---
 source: zellij-utils/src/kdl/mod.rs
+assertion_line: 6466
 expression: serialized
 ---
 name "my session name"
@@ -104,4 +105,8 @@ pane_history {
 }
 creation_time 300
 workspace_root "/home/aviram/my-project"
+agent_states {
+    agent type="terminal" 7 state="working" label="claude" seen=true
+    agent type="plugin" 3 state="blocked" label="codex" seen=false
+}
 

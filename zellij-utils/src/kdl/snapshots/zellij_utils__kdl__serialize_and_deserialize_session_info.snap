@@ -1,5 +1,6 @@
 ---
 source: zellij-utils/src/kdl/mod.rs
+assertion_line: 6318
 expression: serialized
 ---
 name ""
@@ -18,4 +19,6 @@ pane_history {
 }
 creation_time 0
 workspace_root ""
+agent_states {
+}
 

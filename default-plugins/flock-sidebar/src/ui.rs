@@ -4,11 +4,16 @@
 //! The sidebar has two sections, matching herdr's split:
 //!
 //! - **sessions** — one row per zellij session with a single status dot that
-//!   rolls up that session's agents (Blocked > Done-unseen > Working >
-//!   Idle-seen > Unknown). The *current* session's rollup is computed from live
-//!   per-pane state; other sessions can only be seen as metadata (their pane
-//!   commands) until the cross-session bus lands in Phase 7, so they show a
-//!   neutral "agents present" marker rather than a real state.
+//!   rolls its agents up to the most attention-worthy one, by herdr's priority
+//!   (Blocked > Done-unseen > Working > Idle > none): a session waiting on the
+//!   user shows the same red ◉ as a blocked agent, a background completion shows
+//!   teal, a working agent green. The *current* session's rollup is computed
+//!   from live per-pane state; other sessions' rollups come from the state they
+//!   publish to the cross-session bus (Phase 7), carried on
+//!   `SessionInfo.agent_states`, so a blocked or working agent in another
+//!   workspace surfaces here in full fidelity. Sessions with no published state
+//!   fall back to a coarse "agents present" marker derived from their pane
+//!   commands.
 //! - **agents** — one row per agent pane *in the current session*: a state icon
 //!   and a label. The icon alone carries the state (color + glyph), so there is
 //!   no status word.
@@ -26,7 +31,9 @@ use std::collections::BTreeMap;
 use std::path::Path;
 
 use unicode_width::UnicodeWidthStr;
-use zellij_tile::prelude::{PaneId, PaneManifest, PaletteColor, SessionInfo, TabInfo};
+use zellij_tile::prelude::{
+    AgentRunState, PaneAgentStatus, PaneId, PaneManifest, PaletteColor, SessionInfo, TabInfo,
+};
 
 use crate::detect::{identify_agent_from_command, AgentState};
 use crate::git::GitInfo;
@@ -43,43 +50,61 @@ pub fn spinner_frame(tick: u32) -> &'static str {
     SPINNERS[(tick as usize) % SPINNERS.len()]
 }
 
-/// Coarse per-session activity for the sessions-overview dot. The sessions
-/// section deliberately collapses the full per-pane state into three buckets:
-/// no agents → one or more agents stopped → at least one agent running.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Per-session activity for the sessions-overview dot. This rolls the session's
+/// agents up to the single most attention-worthy one, following herdr's
+/// `pane_attention_priority`: Blocked > Done-unseen > Working > Idle(stopped) >
+/// none. Ordered by ascending priority so the highest discriminant wins.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum SessionActivity {
     /// No agents in the session.
     None,
-    /// One or more agents present, but none actively working (idle / blocked /
-    /// done — i.e. stopped, possibly waiting on the user).
+    /// One or more agents present, all idle and already seen — nothing to do.
     Stopped,
     /// At least one agent is actively working.
     Running,
+    /// At least one agent finished in the background and hasn't been looked at
+    /// yet (and none is blocked) — worth a glance.
+    DoneUnseen,
+    /// At least one agent is blocked waiting on the user — the most
+    /// attention-worthy state, so it wins over everything else.
+    Blocked,
+}
+
+/// Roll a set of `(state, seen)` agent signals into the single session dot
+/// bucket by herdr's attention priority. Empty input ⇒ [`SessionActivity::None`].
+fn rollup_activity(agents: impl Iterator<Item = (AgentState, bool)>) -> SessionActivity {
+    let mut activity = SessionActivity::None;
+    for (state, seen) in agents {
+        let this = match state {
+            AgentState::Blocked => SessionActivity::Blocked,
+            AgentState::Working => SessionActivity::Running,
+            AgentState::Idle if !seen => SessionActivity::DoneUnseen,
+            // Idle-seen or Unknown: an agent is present but needs no attention.
+            _ => SessionActivity::Stopped,
+        };
+        activity = activity.max(this);
+    }
+    activity
 }
 
 /// The current session's activity, from its live per-pane state.
 fn current_session_activity(agents: &BTreeMap<PaneId, PaneAgentState>) -> SessionActivity {
-    let mut any = false;
-    for st in agents.values() {
-        if !st.is_agent() {
-            continue;
-        }
-        if st.state == AgentState::Working {
-            return SessionActivity::Running;
-        }
-        any = true;
-    }
-    if any {
-        SessionActivity::Stopped
-    } else {
-        SessionActivity::None
-    }
+    rollup_activity(
+        agents
+            .values()
+            .filter(|st| st.is_agent())
+            .map(|st| (st.state, st.seen)),
+    )
 }
 
-/// The dot glyph + color for a session's activity. Filled green = running,
-/// filled yellow = stopped (worth a glance), dim dot = nothing here.
+/// The dot glyph + color for a session's activity. Blocked is the red ◉ that
+/// also marks a blocked agent in the detail list, so a session waiting on the
+/// user stands out at a glance; done-unseen is teal, running green, idle yellow,
+/// nothing a dim dot.
 fn activity_dot(activity: SessionActivity, p: &Theme) -> (&'static str, PaletteColor) {
     match activity {
+        SessionActivity::Blocked => ("◉", p.red),
+        SessionActivity::DoneUnseen => ("●", p.teal),
         SessionActivity::Running => ("●", p.green),
         SessionActivity::Stopped => ("●", p.yellow),
         SessionActivity::None => ("·", p.muted),
@@ -97,9 +122,33 @@ fn agent_icon(state: AgentState, seen: bool, tick: u32, p: &Theme) -> (&'static 
     }
 }
 
+/// Roll another session's published per-pane agent state (the Phase 7
+/// cross-session bus, carried on `SessionInfo.agent_states`) into the session
+/// dot, using the same attention priority as our own session — so a *blocked*
+/// agent in another workspace shows its red ◉ here, not a generic "stopped" dot.
+fn session_activity_from_states(states: &BTreeMap<PaneId, PaneAgentStatus>) -> SessionActivity {
+    rollup_activity(
+        states
+            .values()
+            .map(|status| (run_state_to_agent_state(status.state), status.seen)),
+    )
+}
+
+/// Map the serializable cross-session [`AgentRunState`] back to the detector's
+/// [`AgentState`] so both rollup paths share one priority function.
+fn run_state_to_agent_state(state: AgentRunState) -> AgentState {
+    match state {
+        AgentRunState::Idle => AgentState::Idle,
+        AgentRunState::Working => AgentState::Working,
+        AgentRunState::Blocked => AgentState::Blocked,
+        AgentRunState::Unknown => AgentState::Unknown,
+    }
+}
+
 /// Count the panes in another session that look like agents, from their command
-/// metadata alone. We can't see those sessions' screens (so no live state until
-/// the Phase 7 bus), but the running command is enough to know an agent is there.
+/// metadata alone. Used as a fallback for sessions whose flock-sidebar isn't
+/// running (so they publish no `agent_states`): the running command is still
+/// enough to know an agent is present, even without live state.
 fn session_agent_count(session: &SessionInfo) -> usize {
     session
         .panes
@@ -494,14 +543,21 @@ pub fn render(input: RenderInput) -> RenderOutput {
                     break;
                 }
                 let activity = if session.is_current_session {
+                    // Our own session: use the live per-pane state, which is
+                    // fresher than the copy we publish to the bus.
                     current_session_activity(input.agents)
-                } else if session_agent_count(session) > 0 {
-                    // Other sessions: we can see agents exist but not whether
-                    // they're running until the cross-session bus (Phase 7), so
-                    // presence maps to the "stopped" bucket.
-                    SessionActivity::Stopped
                 } else {
-                    SessionActivity::None
+                    // Other sessions: roll up the state they published to the
+                    // cross-session bus (Phase 7). If a session published
+                    // nothing (e.g. its flock-sidebar isn't running) but its
+                    // pane commands still look like agents, fall back to the
+                    // coarse "present ⇒ stopped" signal.
+                    let activity = session_activity_from_states(&session.agent_states);
+                    if activity == SessionActivity::None && session_agent_count(session) > 0 {
+                        SessionActivity::Stopped
+                    } else {
+                        activity
+                    }
                 };
                 let (dot, dot_color) = activity_dot(activity, p);
                 let is_selected = session_index == selected;
@@ -783,25 +839,90 @@ mod tests {
         );
     }
 
+    fn agent_pane(agent: crate::detect::Agent, state: AgentState, seen: bool) -> PaneAgentState {
+        let mut pane = PaneAgentState::new();
+        pane.detected_agent = Some(agent);
+        pane.state = state;
+        pane.seen = seen;
+        pane
+    }
+
     #[test]
-    fn current_session_activity_buckets_into_three_states() {
+    fn current_session_activity_rolls_up_by_attention_priority() {
+        use crate::detect::Agent;
         let mut agents: BTreeMap<PaneId, PaneAgentState> = BTreeMap::new();
 
         // No agents → None.
         assert_eq!(current_session_activity(&agents), SessionActivity::None);
 
-        // An idle/blocked agent (not working) → Stopped.
-        let mut blocked = PaneAgentState::new();
-        blocked.detected_agent = Some(crate::detect::Agent::Codex);
-        blocked.state = AgentState::Blocked;
-        agents.insert(PaneId::Terminal(1), blocked);
+        // A single idle, seen agent → Stopped (present, nothing to do).
+        agents.insert(
+            PaneId::Terminal(1),
+            agent_pane(Agent::Codex, AgentState::Idle, true),
+        );
         assert_eq!(current_session_activity(&agents), SessionActivity::Stopped);
 
-        // Any working agent → Running, regardless of the others.
-        let mut working = PaneAgentState::new();
-        working.detected_agent = Some(crate::detect::Agent::Claude);
-        working.state = AgentState::Working;
-        agents.insert(PaneId::Terminal(2), working);
+        // Add a working agent → Running outranks idle.
+        agents.insert(
+            PaneId::Terminal(2),
+            agent_pane(Agent::Claude, AgentState::Working, true),
+        );
         assert_eq!(current_session_activity(&agents), SessionActivity::Running);
+
+        // Add an unseen completion → Done-unseen outranks working.
+        agents.insert(
+            PaneId::Terminal(3),
+            agent_pane(Agent::Pi, AgentState::Idle, false),
+        );
+        assert_eq!(current_session_activity(&agents), SessionActivity::DoneUnseen);
+
+        // Add a blocked agent → Blocked wins over everything.
+        agents.insert(
+            PaneId::Terminal(4),
+            agent_pane(Agent::Codex, AgentState::Blocked, true),
+        );
+        assert_eq!(current_session_activity(&agents), SessionActivity::Blocked);
+    }
+
+    fn status(state: AgentRunState, seen: bool) -> PaneAgentStatus {
+        PaneAgentStatus {
+            state,
+            label: "agent".to_owned(),
+            seen,
+        }
+    }
+
+    #[test]
+    fn session_activity_from_states_buckets_cross_session_state() {
+        let mut states: BTreeMap<PaneId, PaneAgentStatus> = BTreeMap::new();
+
+        // No published agents → None.
+        assert_eq!(session_activity_from_states(&states), SessionActivity::None);
+
+        // An idle, seen agent → Stopped.
+        states.insert(PaneId::Terminal(1), status(AgentRunState::Idle, true));
+        assert_eq!(session_activity_from_states(&states), SessionActivity::Stopped);
+
+        // A working agent in another session → Running (detectable now that the
+        // state crosses the bus).
+        states.insert(PaneId::Terminal(2), status(AgentRunState::Working, true));
+        assert_eq!(session_activity_from_states(&states), SessionActivity::Running);
+
+        // A blocked agent in another session → Blocked wins, so a workspace
+        // waiting on the user shows its red ◉ here. This is the cross-session
+        // win the richer rollup unlocks.
+        states.insert(PaneId::Terminal(3), status(AgentRunState::Blocked, false));
+        assert_eq!(session_activity_from_states(&states), SessionActivity::Blocked);
+    }
+
+    #[test]
+    fn blocked_session_gets_a_distinct_red_dot() {
+        let p = Theme::default();
+        let (blocked_icon, blocked_color) = activity_dot(SessionActivity::Blocked, &p);
+        let (idle_icon, idle_color) = activity_dot(SessionActivity::Stopped, &p);
+        // Blocked is visually distinct from a merely-stopped session.
+        assert_eq!(blocked_icon, "◉");
+        assert_eq!(blocked_color, p.red);
+        assert_ne!((blocked_icon, blocked_color), (idle_icon, idle_color));
     }
 }

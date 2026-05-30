@@ -207,6 +207,7 @@ enum CommandName {
   KillSessionsAndReply = 212;
   DeleteDeadSessionAndReply = 213;
   DeleteAllDeadSessionsAndReply = 214;
+  PublishAgentState = 215;
 }
 
 message PluginCommand {
@@ -361,7 +362,19 @@ message PluginCommand {
     GetSessionListPayload get_session_list_payload = 161;
     KillSessionsPayload kill_sessions_and_reply_payload = 162;
     string delete_dead_session_and_reply_payload = 163;
+    PublishAgentStatePayload publish_agent_state_payload = 164;
   }
+}
+
+message PublishAgentStatePayload {
+  repeated PaneAgentStatus agent_states = 1;
+}
+
+message PaneAgentStatus {
+  PaneId pane_id = 1;
+  uint32 state = 2;
+  string label = 3;
+  bool seen = 4;
 }
 
 message NewTabPayload {

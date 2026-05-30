@@ -441,6 +441,9 @@ fn host_run_plugin_command(mut caller: Caller<'_, PluginEnv>) {
                     PluginCommand::DeleteAllDeadSessionsAndReply => {
                         delete_all_dead_sessions_and_reply(env)
                     },
+                    PluginCommand::PublishAgentState(agent_states) => {
+                        publish_agent_state(env, agent_states)
+                    },
                     PluginCommand::ScanHostFolder(folder_to_scan) => {
                         scan_host_folder(env, folder_to_scan)
                     },
@@ -3273,6 +3276,16 @@ fn disconnect_other_clients(env: &PluginEnv) {
         .context("failed to send disconnect other clients instruction");
 }
 
+fn publish_agent_state(
+    env: &PluginEnv,
+    agent_states: BTreeMap<zellij_utils::data::PaneId, zellij_utils::data::PaneAgentStatus>,
+) {
+    let _ = env
+        .senders
+        .send_to_screen(ScreenInstruction::PublishAgentState(agent_states))
+        .context("failed to publish agent state");
+}
+
 fn kill_sessions(session_names: Vec<String>) {
     for session_name in session_names {
         let path = &*ZELLIJ_SOCK_DIR.join(&session_name);
@@ -5428,6 +5441,7 @@ fn check_command_permission(
         | PluginCommand::ShowFloatingPanes { .. }
         | PluginCommand::HideFloatingPanes { .. }
         | PluginCommand::SetPaneRegexHighlights(..)
+        | PluginCommand::PublishAgentState(..)
         | PluginCommand::ClearPaneHighlights(..) => PermissionType::ChangeApplicationState,
         PluginCommand::UnblockCliPipeInput(..)
         | PluginCommand::BlockCliPipeInput(..)

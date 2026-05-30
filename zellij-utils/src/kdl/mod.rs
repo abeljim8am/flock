@@ -1,9 +1,9 @@
 mod kdl_layout_parser;
 use crate::data::{
-    BareKey, Direction, FloatingPaneCoordinates, InputMode, KeyWithModifier, LayoutInfo,
-    LayoutMetadata, MultiplayerColors, Palette, PaletteColor, PaneId, PaneInfo, PaneManifest,
-    PermissionType, Resize, SessionInfo, StyleDeclaration, Styling, TabInfo, WebSharing,
-    DEFAULT_STYLES,
+    AgentRunState, BareKey, Direction, FloatingPaneCoordinates, InputMode, KeyWithModifier,
+    LayoutInfo, LayoutMetadata, MultiplayerColors, PaletteColor, Palette, PaneAgentStatus, PaneId,
+    PaneInfo, PaneManifest, PermissionType, Resize, SessionInfo, StyleDeclaration, Styling, TabInfo,
+    WebSharing, DEFAULT_STYLES,
 };
 use crate::envs::EnvironmentVariables;
 use crate::home::{find_default_config_dir, get_layout_dir};
@@ -5653,6 +5653,63 @@ impl SessionInfo {
             .and_then(|e| e.value().as_string())
             .map(PathBuf::from)
             .unwrap_or_default();
+        let mut agent_states = BTreeMap::new();
+        if let Some(kdl_agent_states) =
+            kdl_document.get("agent_states").and_then(|p| p.children())
+        {
+            for agent_node in kdl_agent_states.nodes() {
+                if agent_node.name().value() != "agent" {
+                    continue;
+                }
+                let pane_type = agent_node
+                    .entries()
+                    .iter()
+                    .find(|e| e.name().map(|n| n.value()) == Some("type"))
+                    .and_then(|e| e.value().as_string());
+                let id = agent_node
+                    .entries()
+                    .iter()
+                    .find(|e| e.name().is_none())
+                    .and_then(|e| e.value().as_i64())
+                    .map(|i| i as u32);
+                let pane_id = match (pane_type, id) {
+                    (Some("terminal"), Some(id)) => Some(PaneId::Terminal(id)),
+                    (Some("plugin"), Some(id)) => Some(PaneId::Plugin(id)),
+                    _ => None,
+                };
+                let Some(pane_id) = pane_id else {
+                    continue;
+                };
+                let state = agent_node
+                    .entries()
+                    .iter()
+                    .find(|e| e.name().map(|n| n.value()) == Some("state"))
+                    .and_then(|e| e.value().as_string())
+                    .map(AgentRunState::from_wire_str)
+                    .unwrap_or_default();
+                let label = agent_node
+                    .entries()
+                    .iter()
+                    .find(|e| e.name().map(|n| n.value()) == Some("label"))
+                    .and_then(|e| e.value().as_string())
+                    .unwrap_or("")
+                    .to_owned();
+                let seen = agent_node
+                    .entries()
+                    .iter()
+                    .find(|e| e.name().map(|n| n.value()) == Some("seen"))
+                    .and_then(|e| e.value().as_bool())
+                    .unwrap_or(true);
+                agent_states.insert(
+                    pane_id,
+                    PaneAgentStatus {
+                        state,
+                        label,
+                        seen,
+                    },
+                );
+            }
+        }
         Ok(SessionInfo {
             name,
             tabs,
@@ -5667,6 +5724,7 @@ impl SessionInfo {
             pane_history,
             creation_time,
             workspace_root,
+            agent_states,
         })
     }
     pub fn to_string(&self) -> String {
@@ -5777,6 +5835,28 @@ impl SessionInfo {
         let mut workspace_root_node = KdlNode::new("workspace_root");
         workspace_root_node.push(self.workspace_root.display().to_string());
         kdl_document.nodes_mut().push(workspace_root_node);
+
+        let mut agent_states_node = KdlNode::new("agent_states");
+        let mut agent_states_children = KdlDocument::new();
+        for (pane_id, status) in &self.agent_states {
+            let mut agent_node = KdlNode::new("agent");
+            match pane_id {
+                PaneId::Terminal(id) => {
+                    agent_node.push(KdlEntry::new_prop("type", "terminal"));
+                    agent_node.push(*id as i64);
+                },
+                PaneId::Plugin(id) => {
+                    agent_node.push(KdlEntry::new_prop("type", "plugin"));
+                    agent_node.push(*id as i64);
+                },
+            }
+            agent_node.push(KdlEntry::new_prop("state", status.state.as_wire_str()));
+            agent_node.push(KdlEntry::new_prop("label", status.label.clone()));
+            agent_node.push(KdlEntry::new_prop("seen", status.seen));
+            agent_states_children.nodes_mut().push(agent_node);
+        }
+        agent_states_node.set_children(agent_states_children);
+        kdl_document.nodes_mut().push(agent_states_node);
 
         kdl_document.fmt();
         kdl_document.to_string()
@@ -6359,6 +6439,26 @@ fn serialize_and_deserialize_session_info_with_data() {
         pane_history: Default::default(),
         creation_time: Duration::from_secs(300),
         workspace_root: PathBuf::from("/home/aviram/my-project"),
+        agent_states: {
+            let mut agent_states = BTreeMap::new();
+            agent_states.insert(
+                PaneId::Terminal(7),
+                PaneAgentStatus {
+                    state: AgentRunState::Working,
+                    label: "claude".to_owned(),
+                    seen: true,
+                },
+            );
+            agent_states.insert(
+                PaneId::Plugin(3),
+                PaneAgentStatus {
+                    state: AgentRunState::Blocked,
+                    label: "codex".to_owned(),
+                    seen: false,
+                },
+            );
+            agent_states
+        },
     };
     let serialized = session_info.to_string();
     let deserealized = SessionInfo::from_string(&serialized, "not this session").unwrap();

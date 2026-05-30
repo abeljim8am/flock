@@ -334,6 +334,14 @@ message SessionManifest {
   repeated ClientPaneHistory pane_history = 11;
   uint64 creation_time = 12;
   string workspace_root = 13;
+  repeated PaneAgentStatus agent_states = 14;
+}
+
+message PaneAgentStatus {
+  PaneId pane_id = 1;
+  uint32 state = 2;
+  string label = 3;
+  bool seen = 4;
 }
 
 message ClientTabHistory {

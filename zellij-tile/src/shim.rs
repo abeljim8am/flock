@@ -1562,6 +1562,17 @@ pub fn rename_session(name: &str) {
     unsafe { host_run_plugin_command() };
 }
 
+/// Publish this session's per-pane agent status to the server. The server keeps
+/// the latest published map and surfaces it on this session's `SessionInfo`, so
+/// other sessions' sidebars (which poll the cross-session session list) can
+/// render this session's agents in full state fidelity.
+pub fn publish_agent_state(agent_states: BTreeMap<PaneId, PaneAgentStatus>) {
+    let plugin_command = PluginCommand::PublishAgentState(agent_states);
+    let protobuf_plugin_command: ProtobufPluginCommand = plugin_command.try_into().unwrap();
+    object_to_stdout(&protobuf_plugin_command.encode_to_vec());
+    unsafe { host_run_plugin_command() };
+}
+
 /// Unblock the input side of a pipe, requesting the next message be sent if there is one
 pub fn unblock_cli_pipe_input(pipe_name: &str) {
     let plugin_command = PluginCommand::UnblockCliPipeInput(pipe_name.to_owned());

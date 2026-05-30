@@ -18,8 +18,9 @@ pub use super::generated_api::api::{
         LayoutInfo as ProtobufLayoutInfo, LayoutMetadata as ProtobufLayoutMetadata,
         LayoutParsingError as ProtobufLayoutParsingError,
         LayoutWithError as ProtobufLayoutWithError, ModeUpdatePayload as ProtobufModeUpdatePayload,
-        PaneContents as ProtobufPaneContents, PaneContentsEntry as ProtobufPaneContentsEntry,
-        PaneId as ProtobufPaneId, PaneInfo as ProtobufPaneInfo,
+        PaneAgentStatus as ProtobufPaneAgentStatus, PaneContents as ProtobufPaneContents,
+        PaneContentsEntry as ProtobufPaneContentsEntry, PaneId as ProtobufPaneId,
+        PaneInfo as ProtobufPaneInfo,
         PaneManifest as ProtobufPaneManifest, PaneMetadata as ProtobufPaneMetadata,
         PaneRenderReportPayload as ProtobufPaneRenderReportPayload,
         PaneScrollbackResponse as ProtobufPaneScrollbackResponse, PaneType as ProtobufPaneType,
@@ -37,11 +38,11 @@ pub use super::generated_api::api::{
 };
 #[allow(hidden_glob_reexports)]
 use crate::data::{
-    ClientId, ClientInfo, CopyDestination, Event, EventType, FileMetadata, HostTerminalThemeMode,
-    InputMode, KeyWithModifier, LayoutInfo, LayoutMetadata, ModeInfo, Mouse, PaneContents, PaneId,
-    PaneInfo, PaneManifest, PaneMetadata, PaneScrollbackResponse, PermissionStatus,
-    PluginCapabilities, PluginInfo, SelectedText, SessionInfo, Style, TabInfo, TabMetadata,
-    WebServerStatus, WebSharing,
+    AgentRunState, ClientId, ClientInfo, CopyDestination, Event, EventType, FileMetadata,
+    HostTerminalThemeMode, InputMode, KeyWithModifier, LayoutInfo, LayoutMetadata, ModeInfo, Mouse,
+    PaneAgentStatus, PaneContents, PaneId, PaneInfo, PaneManifest, PaneMetadata,
+    PaneScrollbackResponse, PermissionStatus, PluginCapabilities, PluginInfo, SelectedText,
+    SessionInfo, Style, TabInfo, TabMetadata, WebServerStatus, WebSharing,
 };
 
 use crate::errors::prelude::*;
@@ -1213,6 +1214,19 @@ impl TryFrom<SessionInfo> for ProtobufSessionManifest {
                 .collect(),
             creation_time: session_info.creation_time.as_secs(),
             workspace_root: session_info.workspace_root.display().to_string(),
+            agent_states: session_info
+                .agent_states
+                .into_iter()
+                .filter_map(|(pane_id, status)| {
+                    let protobuf_pane_id: ProtobufPaneId = pane_id.try_into().ok()?;
+                    Some(ProtobufPaneAgentStatus {
+                        pane_id: Some(protobuf_pane_id),
+                        state: status.state.as_wire_u32(),
+                        label: status.label,
+                        seen: status.seen,
+                    })
+                })
+                .collect(),
         })
     }
 }
@@ -1303,6 +1317,22 @@ impl TryFrom<ProtobufSessionManifest> for SessionInfo {
                 .collect();
             pane_history.insert(client_id as u16, pane_history_for_client);
         }
+        let mut agent_states = BTreeMap::new();
+        for protobuf_status in protobuf_session_manifest.agent_states.into_iter() {
+            if let Some(pane_id) = protobuf_status
+                .pane_id
+                .and_then(|p| PaneId::try_from(p).ok())
+            {
+                agent_states.insert(
+                    pane_id,
+                    PaneAgentStatus {
+                        state: AgentRunState::from_wire_u32(protobuf_status.state),
+                        label: protobuf_status.label,
+                        seen: protobuf_status.seen,
+                    },
+                );
+            }
+        }
         Ok(SessionInfo {
             name: protobuf_session_manifest.name,
             tabs: protobuf_session_manifest
@@ -1325,6 +1355,7 @@ impl TryFrom<ProtobufSessionManifest> for SessionInfo {
             pane_history,
             creation_time: Duration::from_secs(protobuf_session_manifest.creation_time),
             workspace_root: PathBuf::from(protobuf_session_manifest.workspace_root),
+            agent_states,
         })
     }
 }
@@ -2794,6 +2825,18 @@ fn serialize_session_update_event_with_non_default_values() {
         pane_history: Default::default(),
         creation_time: Duration::from_secs(100),
         workspace_root: PathBuf::from("/home/aviram/session-1"),
+        agent_states: {
+            let mut agent_states = BTreeMap::new();
+            agent_states.insert(
+                PaneId::Terminal(4),
+                PaneAgentStatus {
+                    state: AgentRunState::Working,
+                    label: "claude".to_owned(),
+                    seen: true,
+                },
+            );
+            agent_states
+        },
     };
     let session_info_2 = SessionInfo {
         name: "session 2".to_owned(),
@@ -2829,6 +2872,7 @@ fn serialize_session_update_event_with_non_default_values() {
         pane_history: Default::default(),
         creation_time: Duration::from_secs(200),
         workspace_root: PathBuf::from("/home/aviram/session-2"),
+        agent_states: Default::default(),
     };
     let session_infos = vec![session_info_1, session_info_2];
     let resurrectable_sessions = vec![];

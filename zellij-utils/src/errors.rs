@@ -366,6 +366,7 @@ pub enum ScreenContext {
     BreakPaneRight,
     BreakPaneLeft,
     UpdateSessionInfos,
+    PublishAgentState,
     UpdateAvailableLayouts,
     ReplacePane,
     NewInPlacePluginPane,

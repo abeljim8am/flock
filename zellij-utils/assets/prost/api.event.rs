@@ -401,6 +401,20 @@ pub struct SessionManifest {
     pub creation_time: u64,
     #[prost(string, tag="13")]
     pub workspace_root: ::prost::alloc::string::String,
+    #[prost(message, repeated, tag="14")]
+    pub agent_states: ::prost::alloc::vec::Vec<PaneAgentStatus>,
+}
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct PaneAgentStatus {
+    #[prost(message, optional, tag="1")]
+    pub pane_id: ::core::option::Option<PaneId>,
+    #[prost(uint32, tag="2")]
+    pub state: u32,
+    #[prost(string, tag="3")]
+    pub label: ::prost::alloc::string::String,
+    #[prost(bool, tag="4")]
+    pub seen: bool,
 }
 #[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Clone, PartialEq, ::prost::Message)]

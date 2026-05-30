@@ -87,7 +87,10 @@ use crate::{
     ClientId, ServerInstruction,
 };
 use zellij_utils::{
-    data::{Event, InputMode, ModeInfo, Palette, PaletteColor, PluginCapabilities, Style},
+    data::{
+        Event, InputMode, ModeInfo, PaletteColor, Palette, PaneAgentStatus, PluginCapabilities,
+        Style,
+    },
     errors::{ContextType, ScreenContext},
     input::get_mode_info,
     ipc::{ClientAttributes, PixelDimensions},
@@ -690,6 +693,7 @@ pub enum ScreenInstruction {
         BTreeMap<String, SessionInfo>, // String is the session name
         BTreeMap<String, Duration>,    // resurrectable sessions - <name, created>
     ),
+    PublishAgentState(BTreeMap<zellij_utils::data::PaneId, PaneAgentStatus>),
     ReplacePane(
         PaneId,
         HoldForCommand,
@@ -1067,6 +1071,7 @@ impl From<&ScreenInstruction> for ScreenContext {
             ScreenInstruction::BreakPaneRight(..) => ScreenContext::BreakPaneRight,
             ScreenInstruction::BreakPaneLeft(..) => ScreenContext::BreakPaneLeft,
             ScreenInstruction::UpdateSessionInfos(..) => ScreenContext::UpdateSessionInfos,
+            ScreenInstruction::PublishAgentState(..) => ScreenContext::PublishAgentState,
             ScreenInstruction::ReplacePane(..) => ScreenContext::ReplacePane,
             ScreenInstruction::NewInPlacePluginPane(..) => ScreenContext::NewInPlacePluginPane,
             ScreenInstruction::SerializeLayoutForResurrection => {
@@ -1463,6 +1468,12 @@ pub(crate) struct Screen {
     /// so plugins can group sessions by the project folder they belong to.
     /// Empty until set (in `screen_thread_main`).
     workspace_root: PathBuf,
+    /// The latest per-pane agent status published by this session's
+    /// flock-sidebar plugin (via `PluginCommand::PublishAgentState`). Stored
+    /// here and copied onto every `SessionInfo` we generate, so it rides the
+    /// cross-session metadata transport to other sessions' sidebars. Keyed by
+    /// the plugin-facing `data::PaneId`.
+    published_agent_states: BTreeMap<zellij_utils::data::PaneId, PaneAgentStatus>,
 }
 
 /// A pending forward waiting to be dispatched once the current in-flight
@@ -1617,6 +1628,7 @@ impl Screen {
             host_theme_dark_styling: None,
             host_theme_light_styling: None,
             workspace_root: PathBuf::new(),
+            published_agent_states: BTreeMap::new(),
         }
     }
 
@@ -3391,6 +3403,7 @@ impl Screen {
                 .collect(),
             creation_time,
             workspace_root: self.workspace_root.clone(),
+            agent_states: self.published_agent_states.clone(),
         };
         self.bus
             .senders
@@ -8545,6 +8558,15 @@ pub(crate) fn screen_thread_main(
             ScreenInstruction::UpdateSessionInfos(new_session_infos, resurrectable_sessions) => {
                 screen.update_session_infos(new_session_infos, resurrectable_sessions)?;
             },
+            ScreenInstruction::PublishAgentState(agent_states) => {
+                // Only re-report (and re-serialize to disk) when the published
+                // picture actually changed, so a plugin republishing an
+                // unchanged map doesn't spam the session-metadata writer.
+                if screen.published_agent_states != agent_states {
+                    screen.published_agent_states = agent_states;
+                    screen.log_and_report_session_state()?;
+                }
+            },
             ScreenInstruction::UpdateAvailableLayouts(layouts, errors) => {
                 screen.update_available_layouts(layouts, errors);
             },
@@ -8623,6 +8645,7 @@ pub(crate) fn screen_thread_main(
                         .collect(),
                     creation_time,
                     workspace_root: screen.workspace_root.clone(),
+                    agent_states: screen.published_agent_states.clone(),
                 };
 
                 let session_layout_metadata = if screen.session_serialization {

@@ -92,6 +92,11 @@ struct State {
     last_git_refresh: Option<Instant>,
     /// Per-pane agent detection + arbitrated state, keyed by pane id.
     agents: BTreeMap<PaneId, PaneAgentState>,
+    /// The last per-pane agent status we published to the cross-session bus
+    /// (Phase 7). Diffed against the freshly-built status on each update so we
+    /// only `publish_agent_state` — and thus only re-serialize the session
+    /// metadata to disk — when the published picture actually changes.
+    last_published: BTreeMap<PaneId, PaneAgentStatus>,
     /// Whether the recurring state tick timer has been armed.
     timer_running: bool,
     /// Sidebar colors, resolved from the user's active zellij theme (updated on
@@ -299,6 +304,9 @@ impl ZellijPlugin for State {
             },
             _ => {},
         }
+        // Any handled event may have changed an agent's state; mirror the latest
+        // picture onto the cross-session bus (no-op when unchanged).
+        self.publish_state_if_changed();
         should_render
     }
 
@@ -308,7 +316,7 @@ impl ZellijPlugin for State {
         if pipe_message.name != HOOK_PIPE_NAME {
             return false;
         }
-        match parse_hook_report(&pipe_message.args) {
+        let should_render = match parse_hook_report(&pipe_message.args) {
             Ok(report) => self.apply_hook_report(report),
             Err(reason) => {
                 // A malformed report is dropped, not applied — log for the
@@ -316,7 +324,10 @@ impl ZellijPlugin for State {
                 eprintln!("flock-sidebar: ignoring {HOOK_PIPE_NAME} report: {reason}");
                 false
             },
-        }
+        };
+        // A hook report can change agent state; publish it cross-session.
+        self.publish_state_if_changed();
+        should_render
     }
 
     fn render(&mut self, rows: usize, cols: usize) {
@@ -404,6 +415,34 @@ impl State {
                 Some(entry) => entry.clear_hook_authority(now),
                 None => false,
             },
+        }
+    }
+
+    /// Build this session's per-pane agent status from the live tracked state
+    /// and, if it differs from what we last published, push it to the server's
+    /// cross-session bus (Phase 7). The server stores it on this session's
+    /// `SessionInfo`, where every other session's sidebar reads it (via the
+    /// session-list poll) to render this workspace's agents in full fidelity.
+    /// Only agent panes are published; the diff guard means a republish with no
+    /// change does not re-serialize the session metadata to disk.
+    fn publish_state_if_changed(&mut self) {
+        let mut states = BTreeMap::new();
+        for (pane_id, st) in &self.agents {
+            if !st.is_agent() {
+                continue;
+            }
+            states.insert(
+                *pane_id,
+                PaneAgentStatus {
+                    state: to_run_state(st.state),
+                    label: st.effective_agent_label().unwrap_or_default(),
+                    seen: st.seen,
+                },
+            );
+        }
+        if states != self.last_published {
+            self.last_published = states.clone();
+            publish_agent_state(states);
         }
     }
 
@@ -498,6 +537,17 @@ fn fire_git_probe(root: &str) {
         PathBuf::from(root),
         git_context(root),
     );
+}
+
+/// Map the plugin's internal agent state to the serializable, cross-session
+/// [`AgentRunState`] carried on `SessionInfo` (Phase 7).
+fn to_run_state(state: AgentState) -> AgentRunState {
+    match state {
+        AgentState::Idle => AgentRunState::Idle,
+        AgentState::Working => AgentRunState::Working,
+        AgentState::Blocked => AgentRunState::Blocked,
+        AgentState::Unknown => AgentRunState::Unknown,
+    }
 }
 
 /// Flatten a pane's viewport into a single screen-text snapshot for detection.

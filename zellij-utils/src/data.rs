@@ -1780,6 +1780,85 @@ impl ModeInfo {
     }
 }
 
+/// The run-state of an agent in a pane, as published cross-session for the
+/// flock-sidebar. A serializable, transport-friendly mirror of the sidebar
+/// plugin's internal agent state: it rides `SessionInfo` (and the disk-polled
+/// session metadata that backs cross-session discovery) so every session's
+/// sidebar can render every other session's agents in full state fidelity.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+pub enum AgentRunState {
+    /// No agent, or an unrecognized program.
+    #[default]
+    Unknown,
+    /// Agent finished, prompt visible, nothing happening.
+    Idle,
+    /// Agent is actively working / processing.
+    Working,
+    /// Agent needs human input and is blocked on a response.
+    Blocked,
+}
+
+impl AgentRunState {
+    /// A stable, lower-case wire name used for KDL serialization (the disk
+    /// session-metadata round-trip that crosses the session boundary).
+    pub fn as_wire_str(&self) -> &'static str {
+        match self {
+            AgentRunState::Unknown => "unknown",
+            AgentRunState::Idle => "idle",
+            AgentRunState::Working => "working",
+            AgentRunState::Blocked => "blocked",
+        }
+    }
+
+    /// Parse the wire name produced by [`as_wire_str`](Self::as_wire_str),
+    /// falling back to `Unknown` for anything unrecognized.
+    pub fn from_wire_str(s: &str) -> Self {
+        match s {
+            "idle" => AgentRunState::Idle,
+            "working" => AgentRunState::Working,
+            "blocked" => AgentRunState::Blocked,
+            _ => AgentRunState::Unknown,
+        }
+    }
+
+    /// Numeric wire value used for the protobuf round-trip (server → plugin and
+    /// in the `PublishAgentState` command). Kept in sync with
+    /// [`from_wire_u32`](Self::from_wire_u32).
+    pub fn as_wire_u32(&self) -> u32 {
+        match self {
+            AgentRunState::Unknown => 0,
+            AgentRunState::Idle => 1,
+            AgentRunState::Working => 2,
+            AgentRunState::Blocked => 3,
+        }
+    }
+
+    /// Inverse of [`as_wire_u32`](Self::as_wire_u32); unrecognized values map to
+    /// `Unknown`.
+    pub fn from_wire_u32(v: u32) -> Self {
+        match v {
+            1 => AgentRunState::Idle,
+            2 => AgentRunState::Working,
+            3 => AgentRunState::Blocked,
+            _ => AgentRunState::Unknown,
+        }
+    }
+}
+
+/// A single pane's published agent status, keyed by [`PaneId`] in
+/// [`SessionInfo::agent_states`]. This is the cross-session unit of the
+/// flock-sidebar's "one sidebar, every project, every agent" view.
+#[derive(Debug, Default, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub struct PaneAgentStatus {
+    pub state: AgentRunState,
+    /// Display label for the agent (e.g. "claude", "codex").
+    pub label: String,
+    /// Whether the user has looked at this pane since it last finished in the
+    /// background — drives the sidebar's Done-unseen notification across
+    /// sessions.
+    pub seen: bool,
+}
+
 #[derive(Debug, Default, Clone, PartialEq, Eq, Deserialize, Serialize)]
 pub struct SessionInfo {
     pub name: String,
@@ -1798,6 +1877,11 @@ pub struct SessionInfo {
     /// when unknown. Used as the session's stable workspace identity so plugins
     /// can group sessions by the project folder they belong to.
     pub workspace_root: PathBuf,
+    /// Per-pane agent status published by this session's flock-sidebar plugin
+    /// (via `PublishAgentState`). Carried on `SessionInfo` so it rides the
+    /// existing cross-session metadata transport: another session's sidebar
+    /// reads this to render that session's agents in full state fidelity.
+    pub agent_states: BTreeMap<PaneId, PaneAgentStatus>,
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Eq, Deserialize, Serialize)]
@@ -3614,6 +3698,10 @@ pub enum PluginCommand {
     KillSessionsAndReply(Vec<String>), // one or more session names; sends a response back
     DeleteDeadSessionAndReply(String), // session name; sends a response back
     DeleteAllDeadSessionsAndReply,     // no payload; sends a response back
+    /// Publish this session's per-pane agent status to the server, which stores
+    /// it and surfaces it on `SessionInfo` so other sessions' sidebars can see
+    /// it (the flock-sidebar Phase 7 cross-session agent view).
+    PublishAgentState(BTreeMap<PaneId, PaneAgentStatus>),
 }
 
 // Response type for plugin API methods that open a pane in a new tab
