@@ -11,8 +11,8 @@
 //! best-effort: a missing or corrupt file just yields an empty db, and a failed
 //! write is silently ignored (frecency is an optimization, never load-bearing).
 //!
-//! Phase 8 only *reads* the db to inform ranking; [`FrecencyDb::bump`] is wired
-//! but called on a successful open in Phase 9.
+//! Ranking *reads* the db; a successful open in the selector calls
+//! [`FrecencyDb::bump`] then [`FrecencyDb::save`] to record the usage.
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -53,15 +53,13 @@ impl FrecencyDb {
         }
     }
 
-    /// Persist the db to `/data`, ignoring any write error. (Consumed in Phase 9
-    /// when a successful open bumps + saves the db.)
-    #[allow(dead_code)]
+    /// Persist the db to `/data`, ignoring any write error (frecency is an
+    /// optimization, never load-bearing).
     pub fn save(&self) {
         self.save_to(Path::new(DB_PATH));
     }
 
     /// Persist to an explicit path (testable seam).
-    #[allow(dead_code)]
     pub fn save_to(&self, path: &Path) {
         if let Ok(json) = serde_json::to_string(self) {
             let _ = std::fs::write(path, json);
@@ -69,8 +67,7 @@ impl FrecencyDb {
     }
 
     /// Record an open of `path` at `now` (Unix seconds): increment its count and
-    /// stamp the access time. Called on a successful open in Phase 9.
-    #[allow(dead_code)]
+    /// stamp the access time. Called on a successful open in the selector.
     pub fn bump(&mut self, path: &str, now: u64) {
         let entry = self.entries.entry(path.to_string()).or_default();
         entry.count = entry.count.saturating_add(1);

@@ -21,8 +21,10 @@
 //!   and projects that already have a live session badged (matched against the
 //!   Phase 6 `SessionInfo.workspace_root`).
 //!
-//! Switching/creating sessions on confirm is **not** wired here — that is Phase
-//! 9. For now confirming a project is a no-op that logs the choice.
+//! Phase 9 wires confirmation: pressing `Enter` resolves the chosen project into
+//! a switch-or-create action ([`session`]) — attach to the session already
+//! rooted at that folder, or launch a new one there with the configured
+//! `session_layout` — and bumps the frecency db.
 
 mod config;
 mod discovery;
@@ -30,6 +32,7 @@ mod frecency;
 mod fuzzy;
 mod palette;
 mod ranking;
+mod session;
 mod ui;
 
 use std::collections::{BTreeMap, HashSet};
@@ -39,6 +42,7 @@ use config::SelectorConfig;
 use discovery::{merge_candidates, parse_scan_output, scan_argv, scan_context, Project, SCAN_CONTEXT_KEY};
 use frecency::{now_secs, FrecencyDb};
 use palette::Theme;
+use session::{ExistingSession, OpenAction};
 use zellij_tile::prelude::*;
 
 /// How often to re-scan the root dirs so newly-created project folders surface
@@ -319,16 +323,49 @@ impl State {
         }
     }
 
-    /// Phase 8: confirming a project is a no-op that logs the choice. Phase 9
-    /// wires switch-or-create here.
+    /// Open the selected project: switch to its session if one already roots at
+    /// that folder, otherwise create a new session there with the configured
+    /// `session_layout`. Bumps the frecency db on the open, then closes the
+    /// picker.
     fn confirm_selection(&mut self) {
         let now = now_secs();
         let results = ranking::rank(&self.projects, &self.query, &self.frecency, now);
-        if let Some(chosen) = results.get(self.selected) {
-            eprintln!(
-                "flock-selector: would open project {}",
-                chosen.project.path.display()
-            );
+        // Clone the path so the borrow of `self.projects` (via `results`) ends
+        // before we mutably borrow `self.frecency` below.
+        let Some(path) = results.get(self.selected).map(|r| r.project.path.clone()) else {
+            return;
+        };
+
+        let action = session::resolve_open(&path, &self.existing_sessions());
+
+        // Bump + persist frecency so this open floats the project toward the
+        // input next time. Best-effort: a failed write is silently ignored.
+        self.frecency.bump(&path.to_string_lossy(), now);
+        self.frecency.save();
+
+        match action {
+            OpenAction::Switch { name } => {
+                switch_session_with_cwd(Some(&name), Some(path));
+            },
+            OpenAction::Create { name } => {
+                let layout =
+                    LayoutInfo::File(self.config.session_layout.clone(), LayoutMetadata::default());
+                switch_session_with_layout(Some(&name), layout, Some(path));
+            },
         }
+        close_self();
+    }
+
+    /// The live sessions reduced to the fields [`session::resolve_open`] needs,
+    /// dropping any whose `workspace_root` is unknown (they can't match a folder).
+    fn existing_sessions(&self) -> Vec<ExistingSession> {
+        self.sessions
+            .iter()
+            .filter(|s| !s.workspace_root.as_os_str().is_empty())
+            .map(|s| ExistingSession {
+                name: s.name.clone(),
+                workspace_root: config::normalize(&s.workspace_root),
+            })
+            .collect()
     }
 }
