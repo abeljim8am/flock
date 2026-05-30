@@ -59,6 +59,7 @@ members = [
     "default-plugins/layout-manager",
     "default-plugins/link",
     "default-plugins/flock-sidebar",
+    "default-plugins/flock-selector",
     "zellij-client",
     "zellij-server",
     "zellij-utils",

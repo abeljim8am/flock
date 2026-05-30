@@ -114,6 +114,12 @@ pub const WELCOME_LAYOUT: &[u8] = include_bytes!(concat!(
     "assets/layouts/welcome.kdl"
 ));
 
+pub const FLOCK_SELECTOR_LAYOUT: &[u8] = include_bytes!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/",
+    "assets/layouts/flock-selector.kdl"
+));
+
 pub const FISH_EXTRA_COMPLETION: &[u8] = include_bytes!(concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/",
@@ -172,6 +178,7 @@ pub fn dump_specified_layout(layout: &str) -> std::io::Result<()> {
         "compact" => dump_asset(COMPACT_BAR_LAYOUT),
         "disable-status" => dump_asset(NO_STATUS_LAYOUT),
         "classic" => dump_asset(CLASSIC_LAYOUT),
+        "flock-selector" => dump_asset(FLOCK_SELECTOR_LAYOUT),
         custom => {
             info!("Dump {custom} layout");
             let custom = add_layout_ext(custom);

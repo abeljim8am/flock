@@ -1073,6 +1073,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "flock-selector"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "unicode-width 0.1.10",
+ "zellij-tile",
+]
+
+[[package]]
 name = "flock-sidebar"
 version = "0.1.0"
 dependencies = [
