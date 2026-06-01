@@ -2535,3 +2535,16 @@ fn tiled_pane_still_rejects_zero_percent() {
     let result = SplitSize::from_str("1%");
     assert!(result.is_ok());
 }
+
+#[test]
+fn flock_bundled_layout_with_swap_layouts_parses() {
+    // The bundled flock layout uses two swap_tiled_layouts (slim + expanded) to
+    // toggle the sidebar width; make sure it parses as shipped.
+    let kdl_layout = include_str!("../../../assets/layouts/flock.kdl");
+    let layout = Layout::from_kdl(kdl_layout, Some("flock.kdl".into()), None, None).unwrap();
+    assert_eq!(
+        layout.swap_tiled_layouts.len(),
+        2,
+        "expected slim + expanded swap layouts"
+    );
+}

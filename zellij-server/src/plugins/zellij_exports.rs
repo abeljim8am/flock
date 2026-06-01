@@ -895,8 +895,13 @@ fn show_cursor(env: &PluginEnv, cursor_position: Option<(usize, usize)>) {
 }
 
 fn request_permission(env: &PluginEnv, permissions: Vec<PermissionType>) -> Result<()> {
-    if PermissionCache::from_path_or_default(None)
-        .check_permissions(env.plugin.location.to_string(), &permissions)
+    // Built-in plugins are part of the application itself — `check_command_permission`
+    // already grants them everything ("there's no use to deny them anything"), so the
+    // approval prompt is pure friction with no security value. Auto-grant them, just
+    // like an already-cached grant, instead of showing the permission screen.
+    if env.plugin.is_builtin()
+        || PermissionCache::from_path_or_default(None)
+            .check_permissions(env.plugin.location.to_string(), &permissions)
     {
         return env
             .senders

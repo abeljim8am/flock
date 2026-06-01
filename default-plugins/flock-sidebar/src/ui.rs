@@ -45,6 +45,10 @@ use crate::state::PaneAgentState;
 // (~8/sec) so it indexes the frames directly rather than herdr's /8 at 60fps.
 const SPINNERS: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
+/// Pane width (columns) below which the sidebar renders as a clean icon-only
+/// rail instead of the full text layout. A slim docked strip lands here.
+const THIN_WIDTH: usize = 16;
+
 /// Map the animation tick to a spinner frame.
 pub fn spinner_frame(tick: u32) -> &'static str {
     SPINNERS[(tick as usize) % SPINNERS.len()]
@@ -95,6 +99,25 @@ fn current_session_activity(agents: &BTreeMap<PaneId, PaneAgentState>) -> Sessio
             .filter(|st| st.is_agent())
             .map(|st| (st.state, st.seen)),
     )
+}
+
+/// A session's overview-dot activity: the live per-pane state for our own
+/// session (fresher than what we publish), else the cross-session published
+/// state, falling back to a coarse "agents present" marker from pane commands.
+fn session_activity(
+    session: &SessionInfo,
+    agents: &BTreeMap<PaneId, PaneAgentState>,
+) -> SessionActivity {
+    if session.is_current_session {
+        current_session_activity(agents)
+    } else {
+        let activity = session_activity_from_states(&session.agent_states);
+        if activity == SessionActivity::None && session_agent_count(session) > 0 {
+            SessionActivity::Stopped
+        } else {
+            activity
+        }
+    }
 }
 
 /// The dot glyph + color for a session's activity. Blocked is the red ◉ that
@@ -400,6 +423,23 @@ fn render_row(
     out.push_str(RESET);
 }
 
+/// Render a horizontal divider line inset by one cell on each side, so it
+/// doesn't run flush into the pane edges.
+fn render_divider(out: &mut String, y: usize, cols: usize, p: &Theme) {
+    let inner = cols.saturating_sub(2);
+    render_row(
+        out,
+        0,
+        y,
+        cols,
+        None,
+        &[
+            Span::new(" ", p.text),
+            Span::new("─".repeat(inner), p.separator).dim(),
+        ],
+    );
+}
+
 /// Truncate `text` to `max_width` display columns, with an ellipsis. Ported
 /// from herdr's `sidebar::truncate_text`.
 fn truncate_text(text: &str, max_width: usize) -> String {
@@ -464,6 +504,9 @@ pub struct RenderInput<'a> {
     /// Resolved git branch / ahead-behind per workspace path (the group key).
     pub git: &'a BTreeMap<String, GitInfo>,
     pub palette: &'a Theme,
+    /// Whether the sidebar pane is focused. The selection cursor is only drawn
+    /// when focused, so an unfocused ambient rail shows status without a cursor.
+    pub focused: bool,
     /// Unified selection cursor over sessions-then-agents.
     pub selected: usize,
     /// Scroll offset into the agent list.
@@ -518,6 +561,11 @@ pub fn render(input: RenderInput) -> RenderOutput {
     let total_targets = n_sessions + entries.len();
     let selected = clamp_selection(input.selected, total_targets);
 
+    // A slim docked strip can't fit labels; drop to the clean icon rail.
+    if cols < THIN_WIDTH {
+        return render_thin(out, &input, &entries, selected, n_sessions);
+    }
+
     let mut y = 0usize;
 
     // ---- workspaces section: sessions grouped by their start folder ----
@@ -542,34 +590,19 @@ pub fn render(input: RenderInput) -> RenderOutput {
                 if y >= rows {
                     break;
                 }
-                let activity = if session.is_current_session {
-                    // Our own session: use the live per-pane state, which is
-                    // fresher than the copy we publish to the bus.
-                    current_session_activity(input.agents)
-                } else {
-                    // Other sessions: roll up the state they published to the
-                    // cross-session bus (Phase 7). If a session published
-                    // nothing (e.g. its flock-sidebar isn't running) but its
-                    // pane commands still look like agents, fall back to the
-                    // coarse "present ⇒ stopped" signal.
-                    let activity = session_activity_from_states(&session.agent_states);
-                    if activity == SessionActivity::None && session_agent_count(session) > 0 {
-                        SessionActivity::Stopped
-                    } else {
-                        activity
-                    }
-                };
+                let activity = session_activity(session, input.agents);
                 let (dot, dot_color) = activity_dot(activity, p);
-                let is_selected = session_index == selected;
-                let row_bg = is_selected.then_some(p.selection_bg);
-                let name_color = if is_selected || session.is_current_session {
-                    p.text
-                } else {
-                    p.muted
-                };
+                // The cursor only shows while the sidebar is focused; the current
+                // session stays emphasized regardless (it's not the cursor).
+                let cursor = session_index == selected && input.focused;
+                let row_bg = cursor.then_some(p.selection_bg);
+                let emphasized = cursor || session.is_current_session;
+                let name_color = if emphasized { p.text } else { p.muted };
                 let mut name = Span::new(session.name.clone(), name_color);
-                if is_selected || session.is_current_session {
+                if emphasized {
                     name = name.bold();
+                } else {
+                    name = name.dim();
                 }
                 // Sessions are indented one level under their workspace header.
                 render_row(
@@ -597,7 +630,7 @@ pub fn render(input: RenderInput) -> RenderOutput {
 
     // ---- divider ----
     if y < rows {
-        render_row(&mut out, 0, y, cols, None, &[Span::new("─".repeat(cols), p.separator)]);
+        render_divider(&mut out, y, cols, p);
         y += 1;
     }
 
@@ -663,18 +696,19 @@ pub fn render(input: RenderInput) -> RenderOutput {
             break;
         }
         let index = n_sessions + j;
-        let is_selected = index == selected;
-        let row_bg = is_selected.then_some(p.selection_bg);
+        let cursor = index == selected && input.focused;
+        let row_bg = cursor.then_some(p.selection_bg);
         let (icon, icon_color) = agent_icon(entry.state, entry.seen, input.spinner_tick, p);
-        let name_color = if is_selected || entry.is_active {
-            p.text
-        } else {
-            p.muted
-        };
+        // The active (focused) pane stays emphasized; the cursor only shows while
+        // the sidebar itself is focused.
+        let emphasized = cursor || entry.is_active;
+        let name_color = if emphasized { p.text } else { p.muted };
         let label = truncate_text(&entry.label, content_width.saturating_sub(3));
         let mut name = Span::new(label, name_color);
-        if is_selected || entry.is_active {
+        if emphasized {
             name = name.bold();
+        } else {
+            name = name.dim();
         }
         render_row(
             &mut out,
@@ -690,6 +724,114 @@ pub fn render(input: RenderInput) -> RenderOutput {
 
     if show_scrollbar {
         render_scrollbar(&mut out, cols.saturating_sub(1), body_start, body_height, total, visible, scroll, p);
+    }
+
+    RenderOutput {
+        ansi: out,
+        selected,
+        scroll,
+        click_map,
+    }
+}
+
+/// Render the compact icon rail used when the pane is too narrow for labels: a
+/// centered vertical column of session dots, a thin divider, then the agent
+/// icons — sharing the full layout's selection-index space (sessions first,
+/// then agents) so keyboard and mouse handling are unchanged. Working agents
+/// still animate; the selected glyph gets the selection background.
+fn render_thin(
+    mut out: String,
+    input: &RenderInput,
+    entries: &[AgentEntry],
+    selected: usize,
+    n_sessions: usize,
+) -> RenderOutput {
+    let p = input.palette;
+    let cols = input.cols;
+    let rows = input.rows;
+    let mut click_map = Vec::new();
+
+    // A rail row is either a selectable glyph (tagged with its selection index)
+    // or the non-selectable divider between the sessions and agents groups.
+    enum Rail {
+        Glyph {
+            index: usize,
+            glyph: &'static str,
+            color: PaletteColor,
+        },
+        Divider,
+    }
+    let mut rail: Vec<Rail> = Vec::new();
+
+    // Sessions, in the same flattened group order as `navigable_targets`.
+    let mut session_index = 0usize;
+    for group in group_sessions(input.sessions) {
+        for session in &group.sessions {
+            let (glyph, color) = activity_dot(session_activity(session, input.agents), p);
+            rail.push(Rail::Glyph {
+                index: session_index,
+                glyph,
+                color,
+            });
+            session_index += 1;
+        }
+    }
+    if !rail.is_empty() && !entries.is_empty() {
+        rail.push(Rail::Divider);
+    }
+    for (j, entry) in entries.iter().enumerate() {
+        let (glyph, color) = agent_icon(entry.state, entry.seen, input.spinner_tick, p);
+        rail.push(Rail::Glyph {
+            index: n_sessions + j,
+            glyph,
+            color,
+        });
+    }
+
+    // Scroll the rail so the selected glyph's row stays visible.
+    let selected_row = rail
+        .iter()
+        .position(|r| matches!(r, Rail::Glyph { index, .. } if *index == selected));
+    let mut scroll = input.scroll.min(rail.len().saturating_sub(rows.max(1)));
+    if let Some(sr) = selected_row {
+        if sr < scroll {
+            scroll = sr;
+        } else if rows > 0 && sr >= scroll + rows {
+            scroll = sr + 1 - rows;
+        }
+    }
+
+    // Center the single glyph within the strip width.
+    let pad = cols.saturating_sub(1) / 2;
+    for (k, item) in rail.iter().enumerate().skip(scroll).take(rows) {
+        let y = k - scroll;
+        match item {
+            Rail::Glyph { index, glyph, color } => {
+                let cursor = *index == selected && input.focused;
+                let row_bg = cursor.then_some(p.selection_bg);
+                let mut glyph_span = Span::new(*glyph, *color);
+                if cursor {
+                    glyph_span = glyph_span.bold();
+                }
+                let mut spans = Vec::new();
+                if pad > 0 {
+                    spans.push(Span::new(" ".repeat(pad), p.text));
+                }
+                spans.push(glyph_span);
+                render_row(&mut out, 0, y, cols, row_bg, &spans);
+                click_map.push(ClickTarget { row: y, index: *index });
+            },
+            Rail::Divider => {
+                // A small divider centered on the glyph column, so it stays
+                // proportional to the slim rail instead of spanning its width.
+                let mut spans = Vec::new();
+                if pad > 0 {
+                    spans.push(Span::new(" ".repeat(pad), p.text));
+                }
+                spans.push(Span::new("─", p.separator).dim());
+                render_row(&mut out, 0, y, cols, None, &spans);
+            },
+        }
     }
 
     RenderOutput {
@@ -732,12 +874,14 @@ fn render_scrollbar(
     };
 
     for i in 0..body_height {
-        let (symbol, color) = if i >= thumb_top && i < thumb_top + thumb_len {
-            ("▐", p.accent)
-        } else {
-            ("▕", p.separator)
-        };
-        render_row(out, x, body_start + i, 1, None, &[Span::new(symbol, color)]);
+        let is_thumb = i >= thumb_top && i < thumb_top + thumb_len;
+        let (symbol, color) = if is_thumb { ("▐", p.accent) } else { ("▕", p.separator) };
+        let mut span = Span::new(symbol, color);
+        if !is_thumb {
+            // The track stays subtle; only the thumb is full-strength accent.
+            span = span.dim();
+        }
+        render_row(out, x, body_start + i, 1, None, &[span]);
     }
 }
 

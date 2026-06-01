@@ -113,12 +113,25 @@ struct State {
     /// Plugin pane dimensions from the last render, for mouse hit-testing.
     rows: usize,
     cols: usize,
+    /// Our own plugin id (from `get_plugin_ids`), used to find our pane in the
+    /// manifest so the selection cursor only shows while the sidebar is focused.
+    own_plugin_id: u32,
+    /// Whether our own plugin pane is the focused pane in the active tab. The
+    /// selection cursor is hidden when this is false, so an unfocused ambient
+    /// rail shows only status — no cursor.
+    focused: bool,
 }
 
 register_plugin!(State);
 
 impl ZellijPlugin for State {
     fn load(&mut self, _configuration: BTreeMap<String, String>) {
+        // Exclude the sidebar from focus navigation, like zellij's own tab-bar /
+        // status-bar: Ctrl-h/l skip over it instead of landing on it, and it's a
+        // glance-and-click ambient rail (mouse clicks still work) rather than a
+        // keyboard-focusable pane.
+        set_selectable(false);
+
         // Permissions needed across all phases:
         // - ReadApplicationState: pane/tab/session manifests
         // - ReadPaneContents: PaneRenderReportWithAnsi screen scraping (Phase 2)
@@ -147,6 +160,9 @@ impl ZellijPlugin for State {
             EventType::Timer,
             EventType::RunCommandResult,
         ]);
+
+        // Our own pane id, to detect when the sidebar itself is focused.
+        self.own_plugin_id = get_plugin_ids().plugin_id;
 
         // Drive the time-based stabilization windows. Re-armed on each Timer.
         set_timeout(STATE_TICK_SECS);
@@ -342,6 +358,7 @@ impl ZellijPlugin for State {
             sessions: &self.sessions,
             git: &self.git,
             palette: &self.palette,
+            focused: self.focused,
             selected: self.selected,
             scroll: self.scroll,
             spinner_tick: self.spinner_tick,
@@ -458,6 +475,8 @@ impl State {
             .iter()
             .find(|tab| tab.active)
             .map(|tab| tab.position);
+        let own = self.own_plugin_id;
+        let mut self_focused = false;
         for (tab_idx, panes_in_tab) in &self.panes.panes {
             let tab_is_active = active_tab == Some(*tab_idx);
             for pane in panes_in_tab {
@@ -466,11 +485,16 @@ impl State {
                 } else {
                     PaneId::Terminal(pane.id)
                 };
+                // Our own pane being focused in the active tab enables the cursor.
+                if pane.is_plugin && pane.id == own && tab_is_active && pane.is_focused {
+                    self_focused = true;
+                }
                 if let Some(entry) = self.agents.get_mut(&pane_id) {
                     entry.set_focused(tab_is_active && pane.is_focused);
                 }
             }
         }
+        self.focused = self_focused;
     }
 
     /// Remove tracked agent state for panes that are no longer in the manifest.

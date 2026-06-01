@@ -92,9 +92,14 @@ impl Theme {
             // exactly what the theme intends for body text and selections.
             text: styling.text_unselected.base,
             selection_bg: styling.text_selected.background,
+            // Muted/secondary text and separators are the theme's text color
+            // de-emphasized via the DIM attribute at the call sites — *not*
+            // `named.gray`, which is `list_unselected.background` (a background
+            // color that resolves to near-black on dark themes and is invisible
+            // when used as a foreground).
+            muted: styling.text_unselected.base,
+            separator: styling.text_unselected.base,
             // Named hues, theme-derived.
-            muted: named.gray,
-            separator: named.gray,
             accent: named.blue,
             red: named.red,
             yellow: named.yellow,

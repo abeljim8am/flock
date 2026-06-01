@@ -1,14 +1,54 @@
 layout {
-    pane size=1 borderless=true {
-        plugin location="tab-bar"
-    }
-    pane split_direction="Vertical" {
-        pane size="20%" {
-            plugin location="zellij:flock-sidebar"
+    // Slim sidebar is the default render. A second template carries the wide
+    // sidebar; the two swap_tiled_layouts below let NextSwapLayout (default
+    // Alt ]) toggle the rail slim <-> expanded. The flock-sidebar plugin renders
+    // its icon-only thin mode below 16 cols and the full labeled view above it,
+    // so the same pane just reflows when the swap resizes it.
+    default_tab_template {
+        pane size=1 borderless=true {
+            plugin location="tab-bar"
         }
+        pane split_direction="Vertical" {
+            pane size=5 borderless=true {
+                plugin location="zellij:flock-sidebar"
+            }
+            children
+        }
+        pane size=2 borderless=true {
+            plugin location="status-bar"
+        }
+    }
+    tab_template name="flock_expanded" {
+        pane size=1 borderless=true {
+            plugin location="tab-bar"
+        }
+        pane split_direction="Vertical" {
+            pane size="30%" {
+                plugin location="zellij:flock-sidebar"
+            }
+            children
+        }
+        pane size=2 borderless=true {
+            plugin location="status-bar"
+        }
+    }
+
+    tab {
         pane
     }
-    pane size=2 borderless=true {
-        plugin location="status-bar"
+
+    swap_tiled_layout name="flock-slim" {
+        tab {
+            pane {
+                children
+            }
+        }
+    }
+    swap_tiled_layout name="flock-expanded" {
+        flock_expanded {
+            pane {
+                children
+            }
+        }
     }
 }
