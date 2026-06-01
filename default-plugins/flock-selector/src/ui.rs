@@ -3,10 +3,11 @@
 //! The shape is the fzf/telescope `--layout=reverse-list`: the text input sits on
 //! the **bottom** row and results render **above** it, ordered most-likely
 //! (just above the input) to least-likely (toward the top). The selection cursor
-//! defaults to the best (bottom-most) result. Matched ranges in the name and the
-//! dimmed path are highlighted, and projects that already have a live session
-//! (matched against `SessionInfo.workspace_root`) are badged so the user sees
-//! "switch" vs. "launch" at a glance.
+//! defaults to the best (bottom-most) result. Matched (fuzzy-hit) chars are not
+//! recolored, and the parent path is shown only to disambiguate a name collision.
+//! Projects that already have a live session (matched against
+//! `SessionInfo.workspace_root`) are badged so the user sees "switch" vs. "launch"
+//! at a glance.
 //!
 //! Colors come from the user's active zellij theme (see [`crate::palette`]),
 //! emitted as raw ANSI so the selection background, badges, and highlights stay
@@ -149,6 +150,14 @@ pub fn render(input: RenderInput) -> RenderOutput {
         );
     }
 
+    // A project's parent path is only worth showing to disambiguate a name
+    // collision, so count how many results share each basename; rows whose name
+    // is unique render the name alone.
+    let mut name_counts: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+    for r in results {
+        *name_counts.entry(r.project.name.as_str()).or_insert(0) += 1;
+    }
+
     // Results, best (results[scroll]) just above the input, worse ones higher up.
     let mut row_map = Vec::new();
     let visible_end = (scroll + capacity).min(total);
@@ -157,7 +166,8 @@ pub fn render(input: RenderInput) -> RenderOutput {
         let r = &results[idx];
         let is_selected = idx == selected;
         let is_open = open_paths.contains(&r.project.path.to_string_lossy().to_string());
-        render_result_row(&mut out, y, cols, r, is_selected, is_open, p);
+        let show_path = name_counts.get(r.project.name.as_str()).copied().unwrap_or(0) > 1;
+        render_result_row(&mut out, y, cols, r, is_selected, is_open, show_path, p);
         row_map.push((y, idx));
     }
 
@@ -175,8 +185,10 @@ pub fn render(input: RenderInput) -> RenderOutput {
     }
 }
 
-/// Render one result row: `<badge> <name>  <dim path>`, with matched ranges
-/// highlighted and the selected row filled with the selection background.
+/// Render one result row: `<badge> <name>` plus a `<dim path>` only when
+/// `show_path` (a name collision needs disambiguating). Matched ranges are *not*
+/// recolored — the fuzzy hit isn't tinted — and the selected row is filled with
+/// the selection background.
 fn render_result_row(
     out: &mut String,
     y: usize,
@@ -184,6 +196,7 @@ fn render_result_row(
     r: &Ranked,
     selected: bool,
     is_open: bool,
+    show_path: bool,
     p: &Theme,
 ) {
     let row_bg = if selected { Some(p.selection_bg) } else { None };
@@ -198,47 +211,50 @@ fn render_result_row(
     }
     spans.push(Span::new(" ", p.text));
 
-    // Name, highlighted on match. Budget it to half the width so the path has room.
-    let name_budget = cols.saturating_sub(4).min(cols / 2 + 8).max(4);
+    // Name. When a path follows (collision), keep it to ~half width so the path
+    // has room; otherwise let the name use the full row. Matched chars are not
+    // recolored — base and highlight styles are identical.
+    let name_budget = if show_path {
+        cols.saturating_sub(4).min(cols / 2 + 8).max(4)
+    } else {
+        cols.saturating_sub(4).max(4)
+    };
     let name = truncate_text(&r.project.name, name_budget);
-    let name_color = if selected { p.text } else { p.text };
+    let name_style = Style {
+        fg: p.text,
+        bold: true,
+        dim: false,
+    };
     push_highlighted(
         &mut spans,
         &name,
         &clip_ranges(&r.name_ranges, name.len()),
-        Style {
-            fg: name_color,
-            bold: true,
-            dim: false,
-        },
-        Style {
-            fg: p.accent,
-            bold: true,
-            dim: false,
-        },
+        name_style,
+        name_style,
     );
 
-    // Remaining width for the dimmed path.
-    let used: usize = spans.iter().map(|s| s.text.width()).sum();
-    let path_budget = cols.saturating_sub(used + 2);
-    if path_budget > 1 {
-        spans.push(Span::new("  ", p.muted).dim());
-        let path = truncate_text(&r.project.display_path, path_budget);
-        push_highlighted(
-            &mut spans,
-            &path,
-            &clip_ranges(&r.path_ranges, path.len()),
-            Style {
-                fg: p.muted,
+    // The dimmed parent path, shown only to disambiguate a name collision.
+    // Colored with the theme's text color (dimmed) rather than the muted/gray
+    // slot, which can resolve to black on dark themes.
+    if show_path {
+        let used: usize = spans.iter().map(|s| s.text.width()).sum();
+        let path_budget = cols.saturating_sub(used + 2);
+        if path_budget > 1 {
+            let path_style = Style {
+                fg: p.text,
                 bold: false,
                 dim: true,
-            },
-            Style {
-                fg: p.accent,
-                bold: false,
-                dim: false,
-            },
-        );
+            };
+            spans.push(styled("  ", path_style));
+            let path = truncate_text(&r.project.display_path, path_budget);
+            push_highlighted(
+                &mut spans,
+                &path,
+                &clip_ranges(&r.path_ranges, path.len()),
+                path_style,
+                path_style,
+            );
+        }
     }
 
     render_row(out, 0, y, cols, row_bg, &spans);
