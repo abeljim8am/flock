@@ -1,54 +1,19 @@
 layout {
-    // Slim sidebar is the default render. A second template carries the wide
-    // sidebar; the two swap_tiled_layouts below let NextSwapLayout (default
-    // Alt ]) toggle the rail slim <-> expanded. The flock-sidebar plugin renders
-    // its icon-only thin mode below 16 cols and the full labeled view above it,
-    // so the same pane just reflows when the swap resizes it.
-    default_tab_template {
-        pane size=1 borderless=true {
-            plugin location="tab-bar"
-        }
-        pane split_direction="Vertical" {
-            pane size=5 borderless=true {
-                plugin location="zellij:flock-sidebar"
-            }
-            children
-        }
-        pane size=2 borderless=true {
-            plugin location="status-bar"
-        }
+    pane size=1 borderless=true {
+        plugin location="tab-bar"
     }
-    tab_template name="flock_expanded" {
-        pane size=1 borderless=true {
-            plugin location="tab-bar"
+    pane split_direction="Vertical" {
+        // Slim docked rail. A small percent (not a fixed cell count) keeps it
+        // resizable — zellij won't resize fixed-size panes — so Super b (a
+        // MessagePlugin "flock-toggle-width") can expand it in place, leaving the
+        // content panes' arrangement intact. The plugin drives it to fixed column
+        // targets (slim ~5, expanded ~40).
+        pane size="5%" borderless=true {
+            plugin location="zellij:flock-sidebar"
         }
-        pane split_direction="Vertical" {
-            pane size="30%" {
-                plugin location="zellij:flock-sidebar"
-            }
-            children
-        }
-        pane size=2 borderless=true {
-            plugin location="status-bar"
-        }
-    }
-
-    tab {
         pane
     }
-
-    swap_tiled_layout name="flock-slim" {
-        tab {
-            pane {
-                children
-            }
-        }
-    }
-    swap_tiled_layout name="flock-expanded" {
-        flock_expanded {
-            pane {
-                children
-            }
-        }
+    pane size=2 borderless=true {
+        plugin location="status-bar"
     }
 }

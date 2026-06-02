@@ -5628,6 +5628,13 @@ impl Tab {
                 .tiled_panes
                 .resize_pane_with_id(strategy, pane_id, None)
             {
+                Ok(successfully_resized) if successfully_resized => {
+                    // Pane resizes move split boundaries. Clear the host
+                    // viewport before the next full redraw so cells vacated by
+                    // a shrinking pane do not survive under the new layout.
+                    self.set_force_render();
+                    self.set_should_clear_display_before_rendering();
+                },
                 Ok(_) => {},
                 Err(err) => match err.downcast_ref::<ZellijError>() {
                     Some(ZellijError::CantResizeFixedPanes { pane_ids }) => {

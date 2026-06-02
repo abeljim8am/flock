@@ -8809,7 +8809,10 @@ pub(crate) fn screen_thread_main(
                 screen.rerun_command_pane_with_id(terminal_pane_id, completion_tx)
             },
             ScreenInstruction::ResizePaneWithId(resize, pane_id) => {
-                screen.resize_pane_with_id(resize, pane_id)
+                screen.resize_pane_with_id(resize, pane_id);
+                // Repaint so the resize is reflected and a shrunk pane's vacated
+                // cells are cleared rather than left as garbage.
+                screen.render(None)?;
             },
             ScreenInstruction::EditScrollbackForPaneWithId(pane_id, completion_tx) => {
                 let all_tabs = screen.get_tabs_mut();

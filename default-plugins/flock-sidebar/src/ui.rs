@@ -459,8 +459,15 @@ pub fn render(input: RenderInput) -> RenderOutput {
     let mut out = String::new();
     let mut click_map = Vec::new();
 
-    // Clear the pane so stale rows from a taller previous frame don't linger.
+    // Clear the pane explicitly by painting every row blank. A bare `\u{1b}[2J`
+    // proved unreliable when the pane shrinks (e.g. collapsing from the full
+    // labeled view to the thin rail): rows the new frame no longer draws kept
+    // their stale content. Blanking the full height up front guarantees a clean
+    // canvas regardless of how few rows the frame then draws over it.
     out.push_str("\u{1b}[2J");
+    for y in 0..rows {
+        render_row(&mut out, 0, y, cols, None, &[]);
+    }
 
     if !input.permissions_granted {
         render_row(

@@ -61,6 +61,21 @@ const STATE_TICK_SECS: f64 = 0.5;
 /// animates smoothly (~8 frames/sec).
 const SPINNER_TICK_SECS: f64 = 0.12;
 
+/// Pipe message name (sent by a `MessagePlugin` keybind, e.g. Super b) that
+/// toggles the sidebar between its slim rail and an expanded width. We resize
+/// our *own* pane rather than swap the layout, so the user's content panes keep
+/// their arrangement — only the sidebar/content split ratio changes.
+const WIDTH_TOGGLE_PIPE: &str = "flock-toggle-width";
+/// Width (cols) below which we treat the sidebar as collapsed and expand on
+/// toggle; at or above it we collapse back to the rail. Sits between the slim
+/// rail (~5) and the full-view threshold (16).
+const WIDTH_EXPAND_THRESHOLD: usize = 14;
+/// Target widths (cols) for the toggle. Fixed column counts — not a screen
+/// relative percent — so the expanded sidebar is the same size on a laptop and
+/// on an ultrawide rather than stretching to fill.
+const SIDEBAR_SLIM_COLS: usize = 5;
+const SIDEBAR_EXPANDED_COLS: usize = 40;
+
 #[derive(Default)]
 struct State {
     /// Whether our permission request has been granted yet. Until it is, we
@@ -279,8 +294,13 @@ impl ZellijPlugin for State {
     }
 
     fn pipe(&mut self, pipe_message: PipeMessage) -> bool {
-        // Only the agent self-report channel concerns us; ignore everything else
-        // so we don't claim pipes meant for other plugins.
+        // The width-toggle channel (Super b → MessagePlugin) resizes our pane.
+        if pipe_message.name == WIDTH_TOGGLE_PIPE {
+            self.toggle_width();
+            return false; // the resize itself triggers a re-render
+        }
+        // Only the agent self-report channel concerns us otherwise; ignore the
+        // rest so we don't claim pipes meant for other plugins.
         if pipe_message.name != HOOK_PIPE_NAME {
             return false;
         }
@@ -336,6 +356,70 @@ impl State {
     /// the same ordering drives the render, so indices line up.
     fn targets(&self) -> Vec<Target> {
         ui::navigable_targets(&self.panes, &self.tabs, &self.agents, &self.sessions)
+    }
+
+    /// Toggle the sidebar between its slim rail and an expanded width by
+    /// resizing our *own* pane. Resizing only shifts the split between the
+    /// sidebar and the content area beside it — content panes keep their
+    /// arrangement (unlike a swap layout, which re-fits everything). Direction
+    /// is chosen from the current width so it self-corrects rather than relying
+    /// on a stored flag.
+    fn toggle_width(&self) {
+        let own = PaneId::Plugin(self.own_plugin_id);
+        let (_, total) = self.sidebar_and_tab_cols();
+        // Decide purely from the sidebar's *actual* current width. Use our own
+        // last-rendered width (`self.cols`) rather than the pane manifest: the
+        // plugin re-renders at the new size right after a resize, so this is
+        // fresh, whereas the manifest can still report the previous width.
+        // Narrower than the midpoint between slim and expanded ⇒ expand;
+        // otherwise collapse. No stored flag to get out of sync.
+        let current = self.cols.max(1);
+        let midpoint = (SIDEBAR_SLIM_COLS + SIDEBAR_EXPANDED_COLS) / 2;
+        let expanding = current < midpoint;
+        // Toward a fixed target column count (capped to half the tab on small
+        // terminals so it never crowds out the content) — a fixed width, not a
+        // screen-relative percent, so it's the same on a laptop and an ultrawide.
+        let target = if expanding {
+            SIDEBAR_EXPANDED_COLS.min(total / 2).max(WIDTH_EXPAND_THRESHOLD)
+        } else {
+            SIDEBAR_SLIM_COLS
+        };
+        // Each resize step is ~RESIZE_PERCENT (5%) of the tab width; convert the
+        // column delta into a step count to land near the target. At least one
+        // step so a toggle always moves.
+        let step_cols = ((total as f64) * 0.05).max(1.0);
+        let delta = (target as i64 - current as i64).unsigned_abs() as f64;
+        let steps = ((delta / step_cols).round() as usize).max(1);
+        let resize = if expanding {
+            Resize::Increase
+        } else {
+            Resize::Decrease
+        };
+        let strategy = ResizeStrategy::new(resize, Some(Direction::Right));
+        for _ in 0..steps {
+            resize_pane_with_id(strategy, own);
+        }
+    }
+
+    /// The sidebar's current width and the active tab's total width (cols), read
+    /// from the pane manifest. Falls back to the last render width if the
+    /// manifest geometry isn't available yet.
+    fn sidebar_and_tab_cols(&self) -> (usize, usize) {
+        let active = self.tabs.iter().find(|tab| tab.active).map(|tab| tab.position);
+        let mut current = self.cols.max(1);
+        let mut total = self.cols.max(1);
+        if let Some(panes) = active.and_then(|idx| self.panes.panes.get(&idx)) {
+            for pane in panes {
+                let right = pane.pane_x + pane.pane_columns;
+                if right > total {
+                    total = right;
+                }
+                if pane.is_plugin && pane.id == self.own_plugin_id {
+                    current = pane.pane_columns;
+                }
+            }
+        }
+        (current, total)
     }
 
     /// Move the selection cursor up by `n`, clamped at the top.
