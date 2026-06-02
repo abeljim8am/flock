@@ -5586,6 +5586,10 @@ pub(crate) fn screen_thread_main(
     config: Config,
     debug: bool,
     default_layout: Box<Layout>,
+    // The cwd this session was created with (e.g. the folder a
+    // `switch_session_with_layout(.., cwd)` opened it in). Used as the session's
+    // workspace identity; `None` falls back to the server process cwd.
+    session_cwd: Option<PathBuf>,
 ) -> Result<()> {
     // Resolve `theme_dark` / `theme_light` to concrete `Styling` from the
     // bundled themes BEFORE `config.options` is moved out below. These
@@ -5715,10 +5719,13 @@ pub(crate) fn screen_thread_main(
     );
     screen.host_theme_dark_styling = host_theme_dark_styling;
     screen.host_theme_light_styling = host_theme_light_styling;
-    // The server process inherits (and, post-daemonization, retains) the cwd it
-    // was launched from — that folder is the session's workspace identity.
-    screen.workspace_root =
-        std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+    // The session's workspace identity is the cwd it was created with (the folder
+    // a `switch_session_with_layout(.., cwd)` opened it in), so each project is
+    // its own workspace even when several sessions are spawned from one launcher.
+    // Fall back to the server process cwd for the initial launch.
+    screen.workspace_root = session_cwd
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")));
 
     let mut pending_tab_ids: HashSet<usize> = HashSet::new();
     let mut pending_tab_switches: HashSet<(usize, ClientId)> = HashSet::new(); // usize is the

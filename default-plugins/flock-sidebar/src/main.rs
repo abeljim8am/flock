@@ -34,24 +34,18 @@
 //! Phase 6 gives each session a stable workspace identity. The forked server
 //! records the folder it was launched in as `SessionInfo.workspace_root`, and
 //! the sidebar groups sessions under that folder (see [`ui::group_sessions`])
-//! instead of guessing from pane cwds. Each workspace header shows its git
-//! branch and ahead/behind, probed with a non-blocking `git status` per folder
-//! ([`git`]) and refreshed on a slow cadence — the herdr per-workspace git
-//! readout, retargeted onto the plugin host's `run_command`.
+//! instead of guessing from pane cwds.
 
 mod detect;
-mod git;
 mod hook;
 mod palette;
 mod state;
 mod ui;
 
-use std::collections::{BTreeMap, BTreeSet, HashSet};
-use std::path::PathBuf;
+use std::collections::{BTreeMap, HashSet};
 use std::time::Instant;
 
 use detect::{detect_agent, identify_agent_from_command, AgentState};
-use git::{git_context, parse_status_branch, GitInfo, GIT_CONTEXT_KEY, GIT_STATUS_ARGS};
 use hook::{parse_hook_report, HookReport, HOOK_PIPE_NAME};
 use palette::Theme;
 use state::PaneAgentState;
@@ -66,9 +60,6 @@ const STATE_TICK_SECS: f64 = 0.5;
 /// Faster cadence used while at least one agent is working, so the spinner
 /// animates smoothly (~8 frames/sec).
 const SPINNER_TICK_SECS: f64 = 0.12;
-/// How often to re-probe each workspace's git branch / ahead-behind. Cheap
-/// enough to keep current without spamming `git` on every spinner tick.
-const GIT_REFRESH_SECS: f64 = 5.0;
 
 #[derive(Default)]
 struct State {
@@ -81,15 +72,6 @@ struct State {
     tabs: Vec<TabInfo>,
     /// Latest cross-session list, grouped by `workspace_root` in the sidebar.
     sessions: Vec<SessionInfo>,
-    /// Resolved git branch / ahead-behind per workspace path (the group key),
-    /// populated from `RunCommandResult` replies to our `git status` probes.
-    git: BTreeMap<String, GitInfo>,
-    /// Workspace paths we've already fired a git probe for, so a `SessionUpdate`
-    /// only probes folders we haven't seen yet (the timer re-probes the rest).
-    probed_roots: BTreeSet<String>,
-    /// When we last did a full git re-probe of every workspace. `None` until the
-    /// first probe; drives the [`GIT_REFRESH_SECS`] refresh cadence.
-    last_git_refresh: Option<Instant>,
     /// Per-pane agent detection + arbitrated state, keyed by pane id.
     agents: BTreeMap<PaneId, PaneAgentState>,
     /// The last per-pane agent status we published to the cross-session bus
@@ -137,13 +119,11 @@ impl ZellijPlugin for State {
         // - ReadPaneContents: PaneRenderReportWithAnsi screen scraping (Phase 2)
         // - ChangeApplicationState: switch session / focus pane on activation
         // - ReadCliPipes: agent hook reports via `zellij pipe` (Phase 5)
-        // - RunCommands: git branch / ahead-behind (Phase 6)
         request_permission(&[
             PermissionType::ReadApplicationState,
             PermissionType::ReadPaneContents,
             PermissionType::ChangeApplicationState,
             PermissionType::ReadCliPipes,
-            PermissionType::RunCommands,
         ]);
 
         subscribe(&[
@@ -158,7 +138,6 @@ impl ZellijPlugin for State {
             EventType::PermissionRequestResult,
             EventType::Visible,
             EventType::Timer,
-            EventType::RunCommandResult,
         ]);
 
         // Our own pane id, to detect when the sidebar itself is focused.
@@ -197,9 +176,6 @@ impl ZellijPlugin for State {
             },
             Event::SessionUpdate(sessions, _resurrectable) => {
                 self.sessions = sessions;
-                // Probe git for any workspace we haven't seen yet, and forget
-                // git state for workspaces whose sessions have all closed.
-                self.sync_git_roots();
                 should_render = true;
             },
             Event::CommandChanged(pane_id, command, is_foreground, _focused_clients) => {
@@ -232,14 +208,6 @@ impl ZellijPlugin for State {
                     if entry.tick(now) {
                         should_render = true;
                     }
-                }
-                // Re-probe every workspace's git position on a slow cadence so
-                // branch / ahead-behind stays current without per-tick spawning.
-                let due = self
-                    .last_git_refresh
-                    .map_or(true, |last| now.duration_since(last).as_secs_f64() >= GIT_REFRESH_SECS);
-                if due {
-                    self.refresh_all_git(now);
                 }
                 // While anything is working, animate the spinner and tick faster;
                 // otherwise fall back to the slow hold/grace cadence.
@@ -275,22 +243,6 @@ impl ZellijPlugin for State {
                     }
                 },
                 _ => {},
-            },
-            Event::RunCommandResult(exit_code, stdout, _stderr, context) => {
-                if let Some(path) = context.get(GIT_CONTEXT_KEY) {
-                    let info = if exit_code == Some(0) {
-                        // A repo: parse the `## ` header for branch + ahead/behind.
-                        parse_status_branch(&String::from_utf8_lossy(&stdout))
-                            .unwrap_or_default()
-                    } else {
-                        // Non-zero exit (not a repo, git missing, …): no badge.
-                        GitInfo::default()
-                    };
-                    if self.git.get(path) != Some(&info) {
-                        self.git.insert(path.clone(), info);
-                        should_render = true;
-                    }
-                }
             },
             // Reports the *plugin's* own pane visibility, not an agent pane's,
             // so it doesn't bear on seen-tracking (that follows the focused
@@ -356,7 +308,6 @@ impl ZellijPlugin for State {
             tabs: &self.tabs,
             agents: &self.agents,
             sessions: &self.sessions,
-            git: &self.git,
             palette: &self.palette,
             focused: self.focused,
             selected: self.selected,
@@ -514,53 +465,6 @@ impl State {
             .collect();
         self.agents.retain(|pane_id, _| live.contains(pane_id));
     }
-
-    /// The set of distinct, non-empty workspace roots across all known sessions.
-    /// Empty roots (sessions whose server didn't report one) have no folder to
-    /// probe, so they're skipped.
-    fn workspace_roots(&self) -> BTreeSet<String> {
-        self.sessions
-            .iter()
-            .map(|s| s.workspace_root.display().to_string())
-            .filter(|root| !root.is_empty())
-            .collect()
-    }
-
-    /// React to a session-list change: probe git for any workspace we haven't
-    /// probed before, and drop cached git / probe state for workspaces whose
-    /// sessions have all closed.
-    fn sync_git_roots(&mut self) {
-        let roots = self.workspace_roots();
-        for root in &roots {
-            if self.probed_roots.insert(root.clone()) {
-                fire_git_probe(root);
-            }
-        }
-        // Forget workspaces that no longer have any session.
-        self.git.retain(|root, _| roots.contains(root));
-        self.probed_roots.retain(|root| roots.contains(root));
-    }
-
-    /// Re-probe git for every current workspace (the periodic refresh).
-    fn refresh_all_git(&mut self, now: Instant) {
-        for root in self.workspace_roots() {
-            self.probed_roots.insert(root.clone());
-            fire_git_probe(&root);
-        }
-        self.last_git_refresh = Some(now);
-    }
-}
-
-/// Fire a single non-blocking `git status` probe against `root`. Its reply
-/// arrives as a `RunCommandResult` tagged (via [`git_context`]) with the path,
-/// which [`State::update`] parses into the workspace's [`GitInfo`].
-fn fire_git_probe(root: &str) {
-    run_command_with_env_variables_and_cwd(
-        GIT_STATUS_ARGS,
-        BTreeMap::new(),
-        PathBuf::from(root),
-        git_context(root),
-    );
 }
 
 /// Map the plugin's internal agent state to the serializable, cross-session

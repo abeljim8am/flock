@@ -378,6 +378,7 @@ impl MockScreen {
                     config,
                     debug,
                     Box::new(Layout::default()),
+                    None,
                 )
                 .expect("TEST")
             })
@@ -464,6 +465,7 @@ impl MockScreen {
                     config,
                     debug,
                     Box::new(Layout::default()),
+                    None,
                 )
                 .expect("TEST")
             })

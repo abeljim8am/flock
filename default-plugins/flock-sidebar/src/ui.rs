@@ -28,7 +28,6 @@
 //! precise while still matching whatever theme is configured.
 
 use std::collections::BTreeMap;
-use std::path::Path;
 
 use unicode_width::UnicodeWidthStr;
 use zellij_tile::prelude::{
@@ -36,7 +35,6 @@ use zellij_tile::prelude::{
 };
 
 use crate::detect::{identify_agent_from_command, AgentState};
-use crate::git::GitInfo;
 use crate::palette::{bg, fg, goto, Theme, BOLD, DIM, NORMAL_INTENSITY, RESET};
 use crate::state::PaneAgentState;
 
@@ -130,7 +128,7 @@ fn activity_dot(activity: SessionActivity, p: &Theme) -> (&'static str, PaletteC
         SessionActivity::DoneUnseen => ("●", p.teal),
         SessionActivity::Running => ("●", p.green),
         SessionActivity::Stopped => ("●", p.yellow),
-        SessionActivity::None => ("·", p.muted),
+        SessionActivity::None => ("○", p.muted),
     }
 }
 
@@ -276,58 +274,23 @@ pub fn build_entries(
     entries
 }
 
-/// A folder grouping of sessions: every session started in the same
-/// `workspace_root` (the Phase 6 fork field) is collected under one header. The
-/// key is the workspace path (empty for sessions whose server didn't supply
-/// one); the label is that path's basename, shown in the header.
-pub struct WorkspaceGroup<'a> {
-    /// The workspace path string — the grouping key. Empty when unknown.
-    pub key: String,
-    /// Display label: the path's final component, or a placeholder.
-    pub label: String,
-    /// Sessions in this workspace, in their original list order.
-    pub sessions: Vec<&'a SessionInfo>,
+/// Sessions in a stable display order: one row per session (each session is its
+/// own workspace). Ordered by `workspace_root` path so the layout is stable
+/// frame to frame — sessions sharing a path keep their original order, and those
+/// whose server reported no workspace root (empty path) sort last.
+pub fn ordered_sessions(sessions: &[SessionInfo]) -> Vec<&SessionInfo> {
+    let mut ordered: Vec<&SessionInfo> = sessions.iter().collect();
+    // sort_by is stable, so equal keys preserve the original list order.
+    ordered.sort_by(|a, b| {
+        let ka = a.workspace_root.display().to_string();
+        let kb = b.workspace_root.display().to_string();
+        ka.is_empty().cmp(&kb.is_empty()).then(ka.cmp(&kb))
+    });
+    ordered
 }
 
-/// Group sessions by their `workspace_root` folder. Groups are ordered by path
-/// so the layout is stable frame to frame; sessions whose server didn't report
-/// a workspace root collect under a single trailing "(no workspace)" group.
-pub fn group_sessions(sessions: &[SessionInfo]) -> Vec<WorkspaceGroup<'_>> {
-    let mut by_key: BTreeMap<String, Vec<&SessionInfo>> = BTreeMap::new();
-    for session in sessions {
-        let key = session.workspace_root.display().to_string();
-        by_key.entry(key).or_default().push(session);
-    }
-    let mut groups: Vec<WorkspaceGroup> = by_key
-        .into_iter()
-        .map(|(key, sessions)| {
-            let label = workspace_label(&key);
-            WorkspaceGroup {
-                key,
-                label,
-                sessions,
-            }
-        })
-        .collect();
-    // Keep the unknown-workspace group (empty key) last.
-    groups.sort_by(|a, b| a.key.is_empty().cmp(&b.key.is_empty()).then(a.key.cmp(&b.key)));
-    groups
-}
-
-/// Display label for a workspace path: its final component, or "(no workspace)"
-/// when the path is empty.
-fn workspace_label(key: &str) -> String {
-    if key.is_empty() {
-        return "(no workspace)".to_string();
-    }
-    Path::new(key)
-        .file_name()
-        .map(|n| n.to_string_lossy().to_string())
-        .unwrap_or_else(|| key.to_string())
-}
-
-/// The ordered list of navigable targets: every session (grouped by workspace,
-/// in [`group_sessions`] order) then every agent in the current session (in
+/// The ordered list of navigable targets: every session (in
+/// [`ordered_sessions`] order) then every agent in the current session (in
 /// [`build_entries`] order). The same ordering is used by [`render`], so a
 /// selection index maps consistently whether it came from a keypress or a click.
 pub fn navigable_targets(
@@ -336,9 +299,8 @@ pub fn navigable_targets(
     agents: &BTreeMap<PaneId, PaneAgentState>,
     sessions: &[SessionInfo],
 ) -> Vec<Target> {
-    let mut targets: Vec<Target> = group_sessions(sessions)
+    let mut targets: Vec<Target> = ordered_sessions(sessions)
         .iter()
-        .flat_map(|group| group.sessions.iter())
         .map(|s| Target::Session(s.name.clone()))
         .collect();
     targets.extend(
@@ -423,21 +385,11 @@ fn render_row(
     out.push_str(RESET);
 }
 
-/// Render a horizontal divider line inset by one cell on each side, so it
-/// doesn't run flush into the pane edges.
+/// Render a horizontal divider line, flush left with a one-cell inset on the
+/// right only (so it doesn't run into the right edge).
 fn render_divider(out: &mut String, y: usize, cols: usize, p: &Theme) {
-    let inner = cols.saturating_sub(2);
-    render_row(
-        out,
-        0,
-        y,
-        cols,
-        None,
-        &[
-            Span::new(" ", p.text),
-            Span::new("─".repeat(inner), p.separator).dim(),
-        ],
-    );
+    let inner = cols.saturating_sub(1);
+    render_row(out, 0, y, cols, None, &[Span::new("─".repeat(inner), p.separator).dim()]);
 }
 
 /// Truncate `text` to `max_width` display columns, with an ellipsis. Ported
@@ -467,33 +419,6 @@ fn truncate_text(text: &str, max_width: usize) -> String {
     out
 }
 
-/// Render a workspace group header: the folder name, followed by its git branch
-/// and ahead/behind counts when the folder is a repo. Non-selectable — it is a
-/// label, not a navigable row, so it gets no click target.
-fn render_workspace_header(
-    out: &mut String,
-    y: usize,
-    cols: usize,
-    group: &WorkspaceGroup,
-    git: &BTreeMap<String, GitInfo>,
-    p: &Theme,
-) {
-    let label = truncate_text(&group.label, cols.saturating_sub(1));
-    let mut spans = vec![Span::new(" ", p.text), Span::new(label, p.text).bold()];
-    if let Some(info) = git.get(&group.key) {
-        if info.is_repo && !info.branch.is_empty() {
-            spans.push(Span::new(format!("  {}", info.branch), p.muted).dim());
-            if info.ahead > 0 {
-                spans.push(Span::new(format!(" ↑{}", info.ahead), p.green));
-            }
-            if info.behind > 0 {
-                spans.push(Span::new(format!(" ↓{}", info.behind), p.yellow));
-            }
-        }
-    }
-    render_row(out, 0, y, cols, None, &spans);
-}
-
 /// The full sidebar render input.
 pub struct RenderInput<'a> {
     pub permissions_granted: bool,
@@ -501,8 +426,6 @@ pub struct RenderInput<'a> {
     pub tabs: &'a [TabInfo],
     pub agents: &'a BTreeMap<PaneId, PaneAgentState>,
     pub sessions: &'a [SessionInfo],
-    /// Resolved git branch / ahead-behind per workspace path (the group key).
-    pub git: &'a BTreeMap<String, GitInfo>,
     pub palette: &'a Theme,
     /// Whether the sidebar pane is focused. The selection cursor is only drawn
     /// when focused, so an unfocused ambient rail shows status without a cursor.
@@ -568,63 +491,48 @@ pub fn render(input: RenderInput) -> RenderOutput {
 
     let mut y = 0usize;
 
-    // ---- workspaces section: sessions grouped by their start folder ----
+    // ---- workspaces section: one row per session (each session is a workspace) ----
     render_row(&mut out, 0, y, cols, None, &[Span::new(" workspaces", p.muted).bold()]);
     y += 1;
 
-    let groups = group_sessions(input.sessions);
-    if groups.is_empty() {
+    let ordered = ordered_sessions(input.sessions);
+    if ordered.is_empty() {
         render_row(&mut out, 0, y, cols, None, &[Span::new(" (none)", p.muted).dim()]);
         y += 1;
     } else {
-        // Running index into the flattened grouped session order — must match
-        // `navigable_targets`, which walks the groups the same way.
-        let mut session_index = 0usize;
-        for group in &groups {
+        for (session_index, session) in ordered.iter().enumerate() {
             if y >= rows {
                 break;
             }
-            render_workspace_header(&mut out, y, cols, group, input.git, p);
-            y += 1;
-            for session in &group.sessions {
-                if y >= rows {
-                    break;
-                }
-                let activity = session_activity(session, input.agents);
-                let (dot, dot_color) = activity_dot(activity, p);
-                // The cursor only shows while the sidebar is focused; the current
-                // session stays emphasized regardless (it's not the cursor).
-                let cursor = session_index == selected && input.focused;
-                let row_bg = cursor.then_some(p.selection_bg);
-                let emphasized = cursor || session.is_current_session;
-                let name_color = if emphasized { p.text } else { p.muted };
-                let mut name = Span::new(session.name.clone(), name_color);
-                if emphasized {
-                    name = name.bold();
-                } else {
-                    name = name.dim();
-                }
-                // Sessions are indented one level under their workspace header.
-                render_row(
-                    &mut out,
-                    0,
-                    y,
-                    cols,
-                    row_bg,
-                    &[
-                        Span::new("  ", p.text),
-                        Span::new(dot, dot_color),
-                        Span::new(" ", p.text),
-                        name,
-                    ],
-                );
-                click_map.push(ClickTarget {
-                    row: y,
-                    index: session_index,
-                });
-                y += 1;
-                session_index += 1;
+            let activity = session_activity(session, input.agents);
+            let (dot, dot_color) = activity_dot(activity, p);
+            // The cursor only shows while the sidebar is focused; the current
+            // session stays emphasized regardless (it's not the cursor).
+            let cursor = session_index == selected && input.focused;
+            let row_bg = cursor.then_some(p.selection_bg);
+            let emphasized = cursor || session.is_current_session;
+            let name_color = if emphasized { p.text } else { p.muted };
+            let mut name = Span::new(session.name.clone(), name_color);
+            if emphasized {
+                name = name.bold();
+            } else {
+                name = name.dim();
             }
+            render_row(
+                &mut out,
+                0,
+                y,
+                cols,
+                row_bg,
+                &[
+                    Span::new(" ", p.text),
+                    Span::new(dot, dot_color),
+                    Span::new(" ", p.text),
+                    name,
+                ],
+            );
+            click_map.push(ClickTarget { row: y, index: session_index });
+            y += 1;
         }
     }
 
@@ -763,18 +671,14 @@ fn render_thin(
     }
     let mut rail: Vec<Rail> = Vec::new();
 
-    // Sessions, in the same flattened group order as `navigable_targets`.
-    let mut session_index = 0usize;
-    for group in group_sessions(input.sessions) {
-        for session in &group.sessions {
-            let (glyph, color) = activity_dot(session_activity(session, input.agents), p);
-            rail.push(Rail::Glyph {
-                index: session_index,
-                glyph,
-                color,
-            });
-            session_index += 1;
-        }
+    // One dot per session, in the same order as `navigable_targets`.
+    for (session_index, session) in ordered_sessions(input.sessions).iter().enumerate() {
+        let (glyph, color) = activity_dot(session_activity(session, input.agents), p);
+        rail.push(Rail::Glyph {
+            index: session_index,
+            glyph,
+            color,
+        });
     }
     if !rail.is_empty() && !entries.is_empty() {
         rail.push(Rail::Divider);
@@ -942,22 +846,18 @@ mod tests {
     }
 
     #[test]
-    fn group_sessions_buckets_by_workspace_root_with_unknown_last() {
+    fn ordered_sessions_sort_by_workspace_root_with_unknown_last() {
         let sessions = vec![
             sess("a", "/home/u/proj"),
             sess("b", "/home/u/proj"),
             sess("c", ""),
             sess("d", "/home/u/other"),
         ];
-        let groups = group_sessions(&sessions);
-        assert_eq!(groups.len(), 3);
-        // Non-empty keys sort by path; the unknown (empty) group trails.
-        assert_eq!(groups[0].label, "other");
-        assert_eq!(groups[1].label, "proj");
-        let proj_names: Vec<&str> = groups[1].sessions.iter().map(|s| s.name.as_str()).collect();
-        assert_eq!(proj_names, vec!["a", "b"]);
-        assert_eq!(groups[2].label, "(no workspace)");
-        assert_eq!(groups[2].key, "");
+        let ordered = ordered_sessions(&sessions);
+        // Non-empty paths sort lexically; same-path keeps original order; the
+        // unknown (empty) workspace trails.
+        let names: Vec<&str> = ordered.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(names, vec!["d", "a", "b", "c"]);
     }
 
     #[test]

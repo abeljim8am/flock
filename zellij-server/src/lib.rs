@@ -2051,6 +2051,8 @@ fn init_session(
             let debug = cli_assets.is_debug;
             let layout = layout.clone();
             let config = config.clone();
+            // The cwd this session was created with — its workspace identity.
+            let session_cwd = cli_assets.cwd.clone();
             move || {
                 screen_thread_main(
                     screen_bus,
@@ -2059,6 +2061,7 @@ fn init_session(
                     config,
                     debug,
                     layout,
+                    session_cwd,
                 )
                 .fatal();
             }
