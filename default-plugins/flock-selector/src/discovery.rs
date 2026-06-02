@@ -53,7 +53,8 @@ impl Project {
 
 /// The argv for scanning one root one level deep. `-mindepth 1 -maxdepth 1
 /// -type d` lists immediate subdirectories only; `-L` follows symlinked dirs the
-/// way a user expects a project root to behave.
+/// way a user expects a project root to behave. Hidden dot-directories are not
+/// surfaced as projects when scanning a root.
 pub fn scan_argv(root: &str) -> Vec<String> {
     vec![
         "find".to_string(),
@@ -65,6 +66,9 @@ pub fn scan_argv(root: &str) -> Vec<String> {
         "1".to_string(),
         "-type".to_string(),
         "d".to_string(),
+        "!".to_string(),
+        "-name".to_string(),
+        ".*".to_string(),
     ]
 }
 
@@ -82,6 +86,7 @@ pub fn parse_scan_output(stdout: &str) -> Vec<PathBuf> {
         .map(str::trim)
         .filter(|l| !l.is_empty())
         .map(|l| normalize(Path::new(l)))
+        .filter(|p| !is_hidden_entry(p))
         .collect()
 }
 
@@ -105,7 +110,12 @@ pub fn merge_candidates(
 
     // Scanned subdirs: flatten across roots, then sort by basename so the list is
     // stable regardless of filesystem iteration order.
-    let mut subdirs: Vec<PathBuf> = scanned.values().flatten().map(|p| normalize(p)).collect();
+    let mut subdirs: Vec<PathBuf> = scanned
+        .values()
+        .flatten()
+        .map(|p| normalize(p))
+        .filter(|p| !is_hidden_entry(p))
+        .collect();
     subdirs.sort_by(|a, b| {
         let an = a.file_name().map(|n| n.to_os_string()).unwrap_or_default();
         let bn = b.file_name().map(|n| n.to_os_string()).unwrap_or_default();
@@ -137,6 +147,13 @@ fn shorten_home(path: &Path) -> String {
     full
 }
 
+fn is_hidden_entry(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .map(|name| name.starts_with('.'))
+        .unwrap_or(false)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -164,12 +181,25 @@ mod tests {
     }
 
     #[test]
+    fn parse_scan_output_skips_hidden_dot_directories() {
+        let out = "/work/app\n/work/.git\n/work/.config\n/work/lib\n";
+        assert_eq!(
+            parse_scan_output(out),
+            vec![PathBuf::from("/work/app"), PathBuf::from("/work/lib")]
+        );
+    }
+
+    #[test]
     fn merge_dedupes_and_orders() {
         let individual = vec![PathBuf::from("/solo/proj")];
         let mut scanned = BTreeMap::new();
         scanned.insert(
             "/work".to_string(),
-            vec![PathBuf::from("/work/zeta"), PathBuf::from("/work/alpha")],
+            vec![
+                PathBuf::from("/work/zeta"),
+                PathBuf::from("/work/.hidden"),
+                PathBuf::from("/work/alpha"),
+            ],
         );
         // A duplicate of the individual dir surfaced by a scan is dropped.
         scanned.insert("/solo".to_string(), vec![PathBuf::from("/solo/proj")]);
@@ -183,7 +213,20 @@ mod tests {
     fn scan_argv_lists_one_level_deep() {
         assert_eq!(
             scan_argv("/work"),
-            vec!["find", "-L", "/work", "-mindepth", "1", "-maxdepth", "1", "-type", "d"]
+            vec![
+                "find",
+                "-L",
+                "/work",
+                "-mindepth",
+                "1",
+                "-maxdepth",
+                "1",
+                "-type",
+                "d",
+                "!",
+                "-name",
+                ".*",
+            ]
         );
     }
 }
