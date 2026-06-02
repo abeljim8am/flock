@@ -39,6 +39,7 @@
 mod detect;
 mod hook;
 mod palette;
+mod sessionizer;
 mod state;
 mod ui;
 
@@ -48,6 +49,7 @@ use std::time::Instant;
 use detect::{detect_agent, identify_agent_from_command, AgentState};
 use hook::{parse_hook_report, HookReport, HOOK_PIPE_NAME};
 use palette::Theme;
+use sessionizer::SessionizerConfig;
 use state::PaneAgentState;
 use ui::{ClickTarget, Target};
 use zellij_tile::prelude::*;
@@ -60,6 +62,11 @@ const STATE_TICK_SECS: f64 = 0.5;
 /// Faster cadence used while at least one agent is working, so the spinner
 /// animates smoothly (~8 frames/sec).
 const SPINNER_TICK_SECS: f64 = 0.12;
+/// How often the sidebar asks the host to rescan live sessions. `SessionUpdate`
+/// events only reflect the server's cached view; this command refreshes that
+/// cache from the live socket/session-metadata files so the workspace section
+/// contains every running session.
+const SESSION_REFRESH_SECS: f64 = 1.0;
 
 /// Pipe message name (sent by a `MessagePlugin` keybind, e.g. Super b) that
 /// toggles the sidebar between its slim rail and an expanded width. We resize
@@ -87,6 +94,13 @@ struct State {
     tabs: Vec<TabInfo>,
     /// Latest cross-session list, grouped by `workspace_root` in the sidebar.
     sessions: Vec<SessionInfo>,
+    /// Optional sessionizer-style filter. When configured with the same
+    /// `individual_dirs` / `root_dirs` args as flock-selector, the workspace
+    /// list only shows sessions that belong to those projects.
+    sessionizer: SessionizerConfig,
+    /// Last time we explicitly refreshed the cross-session list via
+    /// `get_session_list`.
+    last_session_refresh: Option<Instant>,
     /// Per-pane agent detection + arbitrated state, keyed by pane id.
     agents: BTreeMap<PaneId, PaneAgentState>,
     /// The last per-pane agent status we published to the cross-session bus
@@ -122,7 +136,9 @@ struct State {
 register_plugin!(State);
 
 impl ZellijPlugin for State {
-    fn load(&mut self, _configuration: BTreeMap<String, String>) {
+    fn load(&mut self, configuration: BTreeMap<String, String>) {
+        self.sessionizer = SessionizerConfig::from_args(&configuration);
+
         // Exclude the sidebar from focus navigation, like zellij's own tab-bar /
         // status-bar: Ctrl-h/l skip over it instead of landing on it, and it's a
         // glance-and-click ambient rail (mouse clicks still work) rather than a
@@ -168,6 +184,9 @@ impl ZellijPlugin for State {
         match event {
             Event::PermissionRequestResult(result) => {
                 self.permissions_granted = matches!(result, PermissionStatus::Granted);
+                if self.permissions_granted {
+                    self.refresh_session_list(Instant::now());
+                }
                 should_render = true;
             },
             Event::ModeUpdate(mode_info) => {
@@ -230,6 +249,9 @@ impl ZellijPlugin for State {
                 if working {
                     self.spinner_tick = self.spinner_tick.wrapping_add(1);
                     should_render = true;
+                }
+                if self.should_refresh_session_list(now) {
+                    should_render |= self.refresh_session_list(now);
                 }
                 set_timeout(if working {
                     SPINNER_TICK_SECS
@@ -321,13 +343,14 @@ impl ZellijPlugin for State {
     fn render(&mut self, rows: usize, cols: usize) {
         self.rows = rows;
         self.cols = cols;
+        let sessions = self.visible_sessions();
 
         let output = ui::render(ui::RenderInput {
             permissions_granted: self.permissions_granted,
             panes: &self.panes,
             tabs: &self.tabs,
             agents: &self.agents,
-            sessions: &self.sessions,
+            sessions: &sessions,
             palette: &self.palette,
             focused: self.focused,
             selected: self.selected,
@@ -352,10 +375,55 @@ impl State {
             .any(|st| st.is_agent() && st.state == AgentState::Working)
     }
 
+    /// Whether enough time has elapsed to refresh the cross-session list. Kept
+    /// separate from the animation cadence so a working spinner doesn't turn
+    /// into an aggressive disk/socket poll.
+    fn should_refresh_session_list(&self, now: Instant) -> bool {
+        self.permissions_granted
+            && self
+                .last_session_refresh
+                .is_none_or(|last| now.duration_since(last).as_secs_f64() >= SESSION_REFRESH_SECS)
+    }
+
+    /// Ask the host for a fresh live-session snapshot. The host also feeds the
+    /// result back into the server's `SessionUpdate` cache, but updating our
+    /// local copy here avoids waiting for the round trip.
+    fn refresh_session_list(&mut self, now: Instant) -> bool {
+        self.last_session_refresh = Some(now);
+        match get_session_list() {
+            Ok(snapshot) => {
+                if self.sessions == snapshot.live_sessions {
+                    false
+                } else {
+                    self.sessions = snapshot.live_sessions;
+                    true
+                }
+            },
+            Err(reason) => {
+                eprintln!("flock-sidebar: failed to refresh session list: {reason}");
+                false
+            },
+        }
+    }
+
     /// The ordered navigable targets (sessions then agents). Rebuilt on demand;
     /// the same ordering drives the render, so indices line up.
     fn targets(&self) -> Vec<Target> {
-        ui::navigable_targets(&self.panes, &self.tabs, &self.agents, &self.sessions)
+        let sessions = self.visible_sessions();
+        ui::navigable_targets(&self.panes, &self.tabs, &self.agents, &sessions)
+    }
+
+    /// Sessions visible in the workspace section. With no sessionizer config, all
+    /// live sessions remain visible for backwards-compatible default behavior.
+    fn visible_sessions(&self) -> Vec<SessionInfo> {
+        if !self.sessionizer.is_configured() {
+            return self.sessions.clone();
+        }
+        self.sessions
+            .iter()
+            .filter(|session| self.sessionizer.contains_workspace(&session.workspace_root))
+            .cloned()
+            .collect()
     }
 
     /// Toggle the sidebar between its slim rail and an expanded width by
