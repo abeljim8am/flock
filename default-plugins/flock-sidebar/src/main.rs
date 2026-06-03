@@ -131,12 +131,12 @@ struct State {
     /// selection cursor is hidden when this is false, so an unfocused ambient
     /// rail shows only status — no cursor.
     focused: bool,
-    /// Whether we've performed the one-time collapse to the slim rail after the
-    /// layout first reports our geometry. The flock layout starts the sidebar at
-    /// a resizable percent (so Super b can expand it later); on a wide terminal
-    /// that percent is many columns, so once we know the real geometry we shrink
-    /// to the fixed slim target — otherwise the icon rail floats in a wide pane.
-    collapsed_to_slim: bool,
+    /// Whether we've applied the one-time default width after the layout first
+    /// reports our geometry. The flock layout opens the sidebar at a resizable
+    /// percent (so Super b can toggle it in place); once we know the real
+    /// geometry we resize to the fixed expanded width so the sidebar starts in
+    /// the full labeled view rather than at whatever the percent happens to be.
+    default_width_applied: bool,
 }
 
 register_plugin!(State);
@@ -206,8 +206,8 @@ impl ZellijPlugin for State {
                 self.prune_closed_panes();
                 // A focus change here may clear a Done-unseen notification.
                 self.sync_focus();
-                // First time we see the real geometry, collapse to the slim rail.
-                self.maybe_collapse_to_slim();
+                // First time we see the real geometry, size to the default view.
+                self.maybe_set_default_width();
                 should_render = true;
             },
             Event::TabUpdate(tabs) => {
@@ -261,9 +261,9 @@ impl ZellijPlugin for State {
                 if self.should_refresh_session_list(now) {
                     should_render |= self.refresh_session_list(now);
                 }
-                // Catch the collapse if permissions/geometry weren't ready when
+                // Catch the resize if permissions/geometry weren't ready when
                 // the first PaneUpdate arrived (runs once, gated by the flag).
-                self.maybe_collapse_to_slim();
+                self.maybe_set_default_width();
                 set_timeout(if working {
                     SPINNER_TICK_SECS
                 } else {
@@ -465,14 +465,14 @@ impl State {
         self.resize_toward(target, current, total);
     }
 
-    /// Once we know the real layout geometry, shrink an over-wide sidebar to the
-    /// fixed slim target. The flock layout opens the rail at a resizable percent
-    /// (kept a percent so Super b can later expand it in place); on a wide
-    /// terminal that percent is many columns, so the first time we see a content
-    /// pane beside us we collapse to the slim rail. Runs once — it must not fight
-    /// a later Super b expansion.
-    fn maybe_collapse_to_slim(&mut self) {
-        if self.collapsed_to_slim || !self.permissions_granted {
+    /// Once we know the real layout geometry, resize the sidebar to its default
+    /// expanded width so it starts in the full labeled view. The flock layout
+    /// opens the rail at a resizable percent (kept a percent so Super b can
+    /// later toggle it in place); the first time we see a content pane beside us
+    /// we resize to the fixed expanded target — the same width Super b expands
+    /// to. Runs once — it must not fight a later Super b toggle.
+    fn maybe_set_default_width(&mut self) {
+        if self.default_width_applied || !self.permissions_granted {
             return;
         }
         let (current, total) = self.sidebar_and_tab_cols();
@@ -481,9 +481,12 @@ impl State {
         if total <= current {
             return;
         }
-        self.collapsed_to_slim = true;
-        if current > SIDEBAR_SLIM_COLS {
-            self.resize_toward(SIDEBAR_SLIM_COLS, current, total);
+        self.default_width_applied = true;
+        // Cap to half the tab on small terminals so the sidebar never crowds out
+        // the content — matching the expand branch of `toggle_width`.
+        let target = SIDEBAR_EXPANDED_COLS.min(total / 2).max(WIDTH_EXPAND_THRESHOLD);
+        if target != current {
+            self.resize_toward(target, current, total);
         }
     }
 

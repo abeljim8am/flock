@@ -3,13 +3,13 @@ layout {
         plugin location="tab-bar"
     }
     pane split_direction="Vertical" {
-        // Slim docked rail. A small percent (not a fixed cell count) keeps it
-        // resizable — zellij won't resize fixed-size panes — so Super b (a
-        // MessagePlugin "flock-toggle-width") can expand it in place, leaving the
-        // content panes' arrangement intact. The plugin drives it to fixed column
-        // targets (slim ~3, expanded ~40) — on load it collapses this percent to
-        // the slim rail so the icon strip stays narrow on a wide terminal.
-        pane size="5%" borderless=true {
+        // Docked sidebar. A percent (not a fixed cell count) keeps it resizable
+        // — zellij won't resize fixed-size panes — so Super b (a MessagePlugin
+        // "flock-toggle-width") can toggle it in place, leaving the content
+        // panes' arrangement intact. The plugin drives it to fixed column
+        // targets (slim ~3, expanded ~40) and on load resizes this percent to
+        // the expanded width, so the sidebar starts in the full labeled view.
+        pane size="25%" borderless=true {
             plugin location="zellij:flock-sidebar"
         }
         pane
