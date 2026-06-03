@@ -47,6 +47,11 @@ const SPINNERS: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "�
 /// rail instead of the full text layout. A slim docked strip lands here.
 const THIN_WIDTH: usize = 16;
 
+/// Blank rows kept above and below the sidebar content (both the thin/mini rail
+/// and the full labeled view), so it gets a little breathing room from the
+/// pane's top and bottom edges and the two views line up.
+const RAIL_VPAD: usize = 1;
+
 /// Map the animation tick to a spinner frame.
 pub fn spinner_frame(tick: u32) -> &'static str {
     SPINNERS[(tick as usize) % SPINNERS.len()]
@@ -496,7 +501,11 @@ pub fn render(input: RenderInput) -> RenderOutput {
         return render_thin(out, &input, &entries, selected, n_sessions);
     }
 
-    let mut y = 0usize;
+    // Match the thin rail's breathing room: keep RAIL_VPAD blank rows above and
+    // below the content, so the full view and the rail line up at the same top
+    // offset and neither sits flush against the pane edges.
+    let bottom_limit = rows.saturating_sub(RAIL_VPAD);
+    let mut y = RAIL_VPAD.min(rows);
 
     // ---- workspaces section: one row per session (each session is a workspace) ----
     render_row(&mut out, 0, y, cols, None, &[Span::new(" workspaces", p.muted).bold()]);
@@ -508,7 +517,7 @@ pub fn render(input: RenderInput) -> RenderOutput {
         y += 1;
     } else {
         for (session_index, session) in ordered.iter().enumerate() {
-            if y >= rows {
+            if y >= bottom_limit {
                 break;
             }
             let activity = session_activity(session, input.agents);
@@ -544,13 +553,13 @@ pub fn render(input: RenderInput) -> RenderOutput {
     }
 
     // ---- divider ----
-    if y < rows {
+    if y < bottom_limit {
         render_divider(&mut out, y, cols, p);
         y += 1;
     }
 
     // ---- agents header ----
-    if y < rows {
+    if y < bottom_limit {
         render_row(
             &mut out,
             0,
@@ -566,10 +575,10 @@ pub fn render(input: RenderInput) -> RenderOutput {
     }
 
     let body_start = y;
-    let body_height = rows.saturating_sub(body_start);
+    let body_height = bottom_limit.saturating_sub(body_start);
 
     if entries.is_empty() {
-        if body_start < rows {
+        if body_start < bottom_limit {
             render_row(
                 &mut out,
                 0,
@@ -666,6 +675,13 @@ fn render_thin(
     let rows = input.rows;
     let mut click_map = Vec::new();
 
+    // Reserve the rightmost column for a vertical divider that separates the
+    // rail from the content pane beside it; the glyphs live in the columns to
+    // its left. With a one-cell divider a 3-col strip still leaves room for a
+    // centered dot.
+    let divider_x = cols.saturating_sub(1);
+    let rail_width = divider_x.max(1);
+
     // A rail row is either a selectable glyph (tagged with its selection index)
     // or the non-selectable divider between the sessions and agents groups.
     enum Rail {
@@ -699,23 +715,28 @@ fn render_thin(
         });
     }
 
-    // Scroll the rail so the selected glyph's row stays visible.
+    // Keep a little breathing room above and below the glyphs so they don't sit
+    // flush against the pane's top and bottom edges.
+    let top = RAIL_VPAD.min(rows);
+    let body_height = rows.saturating_sub(RAIL_VPAD * 2);
+
+    // Scroll the rail so the selected glyph's row stays within the padded body.
     let selected_row = rail
         .iter()
         .position(|r| matches!(r, Rail::Glyph { index, .. } if *index == selected));
-    let mut scroll = input.scroll.min(rail.len().saturating_sub(rows.max(1)));
+    let mut scroll = input.scroll.min(rail.len().saturating_sub(body_height.max(1)));
     if let Some(sr) = selected_row {
         if sr < scroll {
             scroll = sr;
-        } else if rows > 0 && sr >= scroll + rows {
-            scroll = sr + 1 - rows;
+        } else if body_height > 0 && sr >= scroll + body_height {
+            scroll = sr + 1 - body_height;
         }
     }
 
-    // Center the single glyph within the strip width.
-    let pad = cols.saturating_sub(1) / 2;
-    for (k, item) in rail.iter().enumerate().skip(scroll).take(rows) {
-        let y = k - scroll;
+    // Center the single glyph within the rail (the columns left of the divider).
+    let pad = rail_width.saturating_sub(1) / 2;
+    for (k, item) in rail.iter().enumerate().skip(scroll).take(body_height) {
+        let y = top + (k - scroll);
         match item {
             Rail::Glyph { index, glyph, color } => {
                 let cursor = *index == selected && input.focused;
@@ -729,7 +750,7 @@ fn render_thin(
                     spans.push(Span::new(" ".repeat(pad), p.text));
                 }
                 spans.push(glyph_span);
-                render_row(&mut out, 0, y, cols, row_bg, &spans);
+                render_row(&mut out, 0, y, rail_width, row_bg, &spans);
                 click_map.push(ClickTarget { row: y, index: *index });
             },
             Rail::Divider => {
@@ -740,8 +761,16 @@ fn render_thin(
                     spans.push(Span::new(" ".repeat(pad), p.text));
                 }
                 spans.push(Span::new("─", p.separator).dim());
-                render_row(&mut out, 0, y, cols, None, &spans);
+                render_row(&mut out, 0, y, rail_width, None, &spans);
             },
+        }
+    }
+
+    // A continuous vertical divider down the right edge, drawn over every row
+    // (including the top/bottom padding) so it reads as one clean line.
+    if cols > 1 {
+        for y in 0..rows {
+            render_row(&mut out, divider_x, y, 1, None, &[Span::new("│", p.separator).dim()]);
         }
     }
 

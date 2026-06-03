@@ -80,7 +80,7 @@ const WIDTH_EXPAND_THRESHOLD: usize = 14;
 /// Target widths (cols) for the toggle. Fixed column counts — not a screen
 /// relative percent — so the expanded sidebar is the same size on a laptop and
 /// on an ultrawide rather than stretching to fill.
-const SIDEBAR_SLIM_COLS: usize = 5;
+const SIDEBAR_SLIM_COLS: usize = 3;
 const SIDEBAR_EXPANDED_COLS: usize = 40;
 
 #[derive(Default)]
@@ -131,6 +131,12 @@ struct State {
     /// selection cursor is hidden when this is false, so an unfocused ambient
     /// rail shows only status — no cursor.
     focused: bool,
+    /// Whether we've performed the one-time collapse to the slim rail after the
+    /// layout first reports our geometry. The flock layout starts the sidebar at
+    /// a resizable percent (so Super b can expand it later); on a wide terminal
+    /// that percent is many columns, so once we know the real geometry we shrink
+    /// to the fixed slim target — otherwise the icon rail floats in a wide pane.
+    collapsed_to_slim: bool,
 }
 
 register_plugin!(State);
@@ -200,6 +206,8 @@ impl ZellijPlugin for State {
                 self.prune_closed_panes();
                 // A focus change here may clear a Done-unseen notification.
                 self.sync_focus();
+                // First time we see the real geometry, collapse to the slim rail.
+                self.maybe_collapse_to_slim();
                 should_render = true;
             },
             Event::TabUpdate(tabs) => {
@@ -253,6 +261,9 @@ impl ZellijPlugin for State {
                 if self.should_refresh_session_list(now) {
                     should_render |= self.refresh_session_list(now);
                 }
+                // Catch the collapse if permissions/geometry weren't ready when
+                // the first PaneUpdate arrived (runs once, gated by the flag).
+                self.maybe_collapse_to_slim();
                 set_timeout(if working {
                     SPINNER_TICK_SECS
                 } else {
@@ -433,7 +444,6 @@ impl State {
     /// is chosen from the current width so it self-corrects rather than relying
     /// on a stored flag.
     fn toggle_width(&self) {
-        let own = PaneId::Plugin(self.own_plugin_id);
         let (_, total) = self.sidebar_and_tab_cols();
         // Decide purely from the sidebar's *actual* current width. Use our own
         // last-rendered width (`self.cols`) rather than the pane manifest: the
@@ -452,9 +462,38 @@ impl State {
         } else {
             SIDEBAR_SLIM_COLS
         };
-        // Each resize step is ~RESIZE_PERCENT (5%) of the tab width; convert the
-        // column delta into a step count to land near the target. At least one
-        // step so a toggle always moves.
+        self.resize_toward(target, current, total);
+    }
+
+    /// Once we know the real layout geometry, shrink an over-wide sidebar to the
+    /// fixed slim target. The flock layout opens the rail at a resizable percent
+    /// (kept a percent so Super b can later expand it in place); on a wide
+    /// terminal that percent is many columns, so the first time we see a content
+    /// pane beside us we collapse to the slim rail. Runs once — it must not fight
+    /// a later Super b expansion.
+    fn maybe_collapse_to_slim(&mut self) {
+        if self.collapsed_to_slim || !self.permissions_granted {
+            return;
+        }
+        let (current, total) = self.sidebar_and_tab_cols();
+        // Wait until the manifest reports a content pane beside us (total wider
+        // than our own width) before trusting the geometry.
+        if total <= current {
+            return;
+        }
+        self.collapsed_to_slim = true;
+        if current > SIDEBAR_SLIM_COLS {
+            self.resize_toward(SIDEBAR_SLIM_COLS, current, total);
+        }
+    }
+
+    /// Resize our own pane toward `target` columns, given the sidebar's
+    /// `current` width and the tab `total`. Each resize step is ~5% of the tab
+    /// width; the column delta is converted into a step count so we land near
+    /// the target. At least one step so a toggle always moves.
+    fn resize_toward(&self, target: usize, current: usize, total: usize) {
+        let own = PaneId::Plugin(self.own_plugin_id);
+        let expanding = target > current;
         let step_cols = ((total as f64) * 0.05).max(1.0);
         let delta = (target as i64 - current as i64).unsigned_abs() as f64;
         let steps = ((delta / step_cols).round() as usize).max(1);

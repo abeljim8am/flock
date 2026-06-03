@@ -7,7 +7,8 @@ layout {
         // resizable — zellij won't resize fixed-size panes — so Super b (a
         // MessagePlugin "flock-toggle-width") can expand it in place, leaving the
         // content panes' arrangement intact. The plugin drives it to fixed column
-        // targets (slim ~5, expanded ~40).
+        // targets (slim ~3, expanded ~40) — on load it collapses this percent to
+        // the slim rail so the icon strip stays narrow on a wide terminal.
         pane size="5%" borderless=true {
             plugin location="zellij:flock-sidebar"
         }
