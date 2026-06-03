@@ -12,6 +12,10 @@ layout {
         pane {
             plugin location="zellij:flock-selector" {
                 cwd "/"
+                // Rename this cold-shell entry session to a fixed name so it is
+                // always the same session (and the sidebar hides it) instead of
+                // a random throwaway name accumulating in the workspace list.
+                session_name "flock-selector"
                 // individual_dirs "/path/to/project;/another/project"
                 // root_dirs "/path/to/projects;/path/to/work"
                 // session_layout "default"

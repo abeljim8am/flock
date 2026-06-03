@@ -33,6 +33,12 @@ pub struct SelectorConfig {
     pub session_layout: String,
     /// Base for resolving relative `individual_dirs` / `root_dirs` entries.
     pub cwd: PathBuf,
+    /// Fixed name to rename our own session to on load. Set by the cold-shell
+    /// `flock-selector` layout so the picker's throwaway entry session always
+    /// has the same stable name (which the sidebar hides) instead of a random
+    /// one. Left `None` for a keybind launch, where renaming the user's working
+    /// session would be wrong.
+    pub session_name: Option<String>,
 }
 
 impl Default for SelectorConfig {
@@ -42,6 +48,7 @@ impl Default for SelectorConfig {
             root_dirs: Vec::new(),
             session_layout: DEFAULT_SESSION_LAYOUT.to_string(),
             cwd: PathBuf::from("/"),
+            session_name: None,
         }
     }
 }
@@ -59,11 +66,16 @@ impl SelectorConfig {
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty())
             .unwrap_or_else(|| DEFAULT_SESSION_LAYOUT.to_string());
+        let session_name = config
+            .get("session_name")
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
         SelectorConfig {
             individual_dirs: split_paths(config.get("individual_dirs"), &cwd),
             root_dirs: split_paths(config.get("root_dirs"), &cwd),
             session_layout,
             cwd,
+            session_name,
         }
     }
 }
@@ -140,6 +152,15 @@ mod tests {
         assert!(c.root_dirs.is_empty());
         assert_eq!(c.session_layout, DEFAULT_SESSION_LAYOUT);
         assert_eq!(c.cwd, PathBuf::from("/"));
+        assert_eq!(c.session_name, None);
+    }
+
+    #[test]
+    fn session_name_parsed_when_set_and_none_when_blank() {
+        let c = SelectorConfig::from_args(&args(&[("session_name", "  flock-selector ")]));
+        assert_eq!(c.session_name.as_deref(), Some("flock-selector"));
+        let blank = SelectorConfig::from_args(&args(&[("session_name", "   ")]));
+        assert_eq!(blank.session_name, None);
     }
 
     #[test]

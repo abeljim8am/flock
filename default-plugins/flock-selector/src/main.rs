@@ -84,6 +84,13 @@ register_plugin!(State);
 impl ZellijPlugin for State {
     fn load(&mut self, configuration: BTreeMap<String, String>) {
         self.config = SelectorConfig::from_args(&configuration);
+        // When launched as the cold-shell entry point, the layout passes a fixed
+        // `session_name` so the picker's throwaway session always carries the
+        // same stable name (which the sidebar hides) rather than a random one. A
+        // keybind launch omits it, so we never rename the user's working session.
+        if let Some(name) = &self.config.session_name {
+            rename_session(name);
+        }
         self.frecency = FrecencyDb::load();
         // Individual dirs are projects directly, so show them immediately; a
         // root scan fills in the subdirectories once permissions land.

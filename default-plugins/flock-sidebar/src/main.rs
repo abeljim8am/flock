@@ -83,6 +83,12 @@ const WIDTH_EXPAND_THRESHOLD: usize = 14;
 const SIDEBAR_SLIM_COLS: usize = 3;
 const SIDEBAR_EXPANDED_COLS: usize = 40;
 
+/// Session name used by the flock-selector cold-shell entry point (set via its
+/// `session_name` layout arg). It's the picker's throwaway host session, not a
+/// workspace, so the sidebar always hides it from the workspace list. Must match
+/// the `session_name` value in the bundled `flock-selector` layout.
+const HIDDEN_SESSION_NAME: &str = "flock-selector";
+
 #[derive(Default)]
 struct State {
     /// Whether our permission request has been granted yet. Until it is, we
@@ -424,15 +430,19 @@ impl State {
         ui::navigable_targets(&self.panes, &self.tabs, &self.agents, &sessions)
     }
 
-    /// Sessions visible in the workspace section. With no sessionizer config, all
-    /// live sessions remain visible for backwards-compatible default behavior.
+    /// Sessions visible in the workspace section. The flock-selector's cold-shell
+    /// entry session (named [`HIDDEN_SESSION_NAME`]) is always hidden — it's the
+    /// picker's throwaway host, not a workspace. With no sessionizer config, every
+    /// other live session remains visible for backwards-compatible default
+    /// behavior; otherwise only sessions whose workspace is in the configured set.
     fn visible_sessions(&self) -> Vec<SessionInfo> {
-        if !self.sessionizer.is_configured() {
-            return self.sessions.clone();
-        }
         self.sessions
             .iter()
-            .filter(|session| self.sessionizer.contains_workspace(&session.workspace_root))
+            .filter(|session| session.name != HIDDEN_SESSION_NAME)
+            .filter(|session| {
+                !self.sessionizer.is_configured()
+                    || self.sessionizer.contains_workspace(&session.workspace_root)
+            })
             .cloned()
             .collect()
     }
