@@ -80,7 +80,7 @@ const WIDTH_EXPAND_THRESHOLD: usize = 14;
 /// Target widths (cols) for the toggle. Fixed column counts — not a screen
 /// relative percent — so the expanded sidebar is the same size on a laptop and
 /// on an ultrawide rather than stretching to fill.
-const SIDEBAR_SLIM_COLS: usize = 3;
+const SIDEBAR_SLIM_COLS: usize = 5;
 const SIDEBAR_EXPANDED_COLS: usize = 40;
 
 /// Session name used by the flock-selector cold-shell entry point (set via its

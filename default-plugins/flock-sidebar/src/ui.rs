@@ -52,6 +52,11 @@ const THIN_WIDTH: usize = 16;
 /// pane's top and bottom edges and the two views line up.
 const RAIL_VPAD: usize = 1;
 
+/// Blank columns kept to the right of the mini rail's divider, so the divider
+/// doesn't sit flush against the content pane beside it. With the slim rail at 5
+/// cols this leaves a centered dot, a gap, the divider, then this padding.
+const RAIL_HPAD: usize = 1;
+
 /// Map the animation tick to a spinner frame.
 pub fn spinner_frame(tick: u32) -> &'static str {
     SPINNERS[(tick as usize) % SPINNERS.len()]
@@ -675,11 +680,11 @@ fn render_thin(
     let rows = input.rows;
     let mut click_map = Vec::new();
 
-    // Reserve the rightmost column for a vertical divider that separates the
-    // rail from the content pane beside it; the glyphs live in the columns to
-    // its left. With a one-cell divider a 3-col strip still leaves room for a
-    // centered dot.
-    let divider_x = cols.saturating_sub(1);
+    // Lay the rail out as: glyphs | divider | right padding. The divider sits
+    // `RAIL_HPAD` columns in from the right edge so it gets a little breathing
+    // room from the content pane rather than butting against it; the glyphs live
+    // in the columns to its left.
+    let divider_x = cols.saturating_sub(1 + RAIL_HPAD);
     let rail_width = divider_x.max(1);
 
     // A rail row is either a selectable glyph (tagged with its selection index)
@@ -766,9 +771,10 @@ fn render_thin(
         }
     }
 
-    // A continuous vertical divider down the right edge, drawn over every row
-    // (including the top/bottom padding) so it reads as one clean line.
-    if cols > 1 {
+    // A continuous vertical divider down the right edge (inset by RAIL_HPAD),
+    // drawn over every row (including the top/bottom padding) so it reads as one
+    // clean line. Skipped if the strip is too narrow to hold a glyph beside it.
+    if divider_x >= 1 {
         for y in 0..rows {
             render_row(&mut out, divider_x, y, 1, None, &[Span::new("│", p.separator).dim()]);
         }
