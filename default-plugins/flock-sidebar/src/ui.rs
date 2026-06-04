@@ -67,7 +67,7 @@ pub fn spinner_frame(tick: u32) -> &'static str {
 /// `pane_attention_priority`: Blocked > Done-unseen > Working > Idle(stopped) >
 /// none. Ordered by ascending priority so the highest discriminant wins.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-enum SessionActivity {
+pub(crate) enum SessionActivity {
     /// No agents in the session.
     None,
     /// One or more agents present, all idle and already seen — nothing to do.
@@ -210,6 +210,26 @@ pub struct AgentEntry {
     pub seen: bool,
     /// Whether this is the focused pane in the focused tab.
     pub is_active: bool,
+    /// Whether this agent lives in the *current* session. A current-session agent
+    /// can be focused directly; an agent in another session is reached by
+    /// switching to that session first (its pane isn't focusable from here).
+    pub is_current: bool,
+    /// The name of the session this agent belongs to (the switch target for a
+    /// non-current agent).
+    pub session_name: String,
+}
+
+/// One entry in the unified sidebar list: a workspace (session) header, or an
+/// agent that belongs to the session listed above it. The list interleaves each
+/// session with its own agents so every agent is visible regardless of which
+/// session is currently focused.
+pub(crate) enum Row {
+    Session {
+        name: String,
+        activity: SessionActivity,
+        is_current: bool,
+    },
+    Agent(AgentEntry),
 }
 
 /// What a navigable row points at — used for keyboard Enter and mouse clicks.
@@ -229,12 +249,13 @@ pub struct ClickTarget {
     pub index: usize,
 }
 
-/// Build the agent list from the session's panes, in tab then pane order, one
-/// entry per pane that detection has tagged as an agent.
+/// Build the agent list for the *current* session from its live panes, in tab
+/// then pane order, one entry per pane that detection has tagged as an agent.
 pub fn build_entries(
     panes: &PaneManifest,
     tabs: &[TabInfo],
     agents: &BTreeMap<PaneId, PaneAgentState>,
+    session_name: &str,
 ) -> Vec<AgentEntry> {
     let multi_tab = tabs.len() > 1;
     let tab_active: BTreeMap<usize, bool> =
@@ -278,10 +299,81 @@ pub fn build_entries(
                 state: st.state,
                 seen: st.seen,
                 is_active,
+                is_current: true,
+                session_name: session_name.to_string(),
             });
         }
     }
     entries
+}
+
+/// Build the agent list for *another* session from the per-pane status it
+/// published to the cross-session bus ([`SessionInfo.agent_states`]). We can't
+/// observe its panes directly, so state/label/seen come from what its own
+/// flock-sidebar published; the pane isn't focusable from here, so activating
+/// one switches to that session.
+fn published_entries(session: &SessionInfo) -> Vec<AgentEntry> {
+    session
+        .agent_states
+        .iter()
+        .map(|(pane_id, status)| AgentEntry {
+            pane_id: *pane_id,
+            label: if status.label.is_empty() {
+                "agent".to_string()
+            } else {
+                status.label.clone()
+            },
+            state: run_state_to_agent_state(status.state),
+            seen: status.seen,
+            is_active: false,
+            is_current: false,
+            session_name: session.name.clone(),
+        })
+        .collect()
+}
+
+/// The unified, ordered sidebar list: each session (in [`ordered_sessions`]
+/// order) immediately followed by its agents — live for the current session,
+/// from the published cross-session state for the others. [`render`],
+/// [`render_thin`] and [`navigable_targets`] all derive from this, so a
+/// selection index maps consistently across the full view, the rail, keypresses
+/// and clicks.
+pub(crate) fn build_rows(
+    panes: &PaneManifest,
+    tabs: &[TabInfo],
+    agents: &BTreeMap<PaneId, PaneAgentState>,
+    sessions: &[SessionInfo],
+) -> Vec<Row> {
+    let mut rows = Vec::new();
+    for session in ordered_sessions(sessions) {
+        rows.push(Row::Session {
+            name: session.name.clone(),
+            activity: session_activity(session, agents),
+            is_current: session.is_current_session,
+        });
+        let entries = if session.is_current_session {
+            build_entries(panes, tabs, agents, &session.name)
+        } else {
+            published_entries(session)
+        };
+        rows.extend(entries.into_iter().map(Row::Agent));
+    }
+    rows
+}
+
+/// The activation target for a row: switch to a session, focus a current-session
+/// agent pane, or switch to the session owning a non-current agent.
+fn row_target(row: &Row) -> Target {
+    match row {
+        Row::Session { name, .. } => Target::Session(name.clone()),
+        Row::Agent(entry) => {
+            if entry.is_current {
+                Target::Pane(entry.pane_id)
+            } else {
+                Target::Session(entry.session_name.clone())
+            }
+        },
+    }
 }
 
 /// Sessions in a stable display order: one row per session (each session is its
@@ -299,26 +391,20 @@ pub fn ordered_sessions(sessions: &[SessionInfo]) -> Vec<&SessionInfo> {
     ordered
 }
 
-/// The ordered list of navigable targets: every session (in
-/// [`ordered_sessions`] order) then every agent in the current session (in
-/// [`build_entries`] order). The same ordering is used by [`render`], so a
-/// selection index maps consistently whether it came from a keypress or a click.
+/// The ordered list of navigable targets, one per [`build_rows`] entry (each
+/// session followed by its agents). The same ordering drives [`render`] and
+/// [`render_thin`], so a selection index maps consistently whether it came from
+/// a keypress or a click.
 pub fn navigable_targets(
     panes: &PaneManifest,
     tabs: &[TabInfo],
     agents: &BTreeMap<PaneId, PaneAgentState>,
     sessions: &[SessionInfo],
 ) -> Vec<Target> {
-    let mut targets: Vec<Target> = ordered_sessions(sessions)
+    build_rows(panes, tabs, agents, sessions)
         .iter()
-        .map(|s| Target::Session(s.name.clone()))
-        .collect();
-    targets.extend(
-        build_entries(panes, tabs, agents)
-            .into_iter()
-            .map(|e| Target::Pane(e.pane_id)),
-    );
-    targets
+        .map(row_target)
+        .collect()
 }
 
 /// Clamp a selection index to the navigable target count.
@@ -393,13 +479,6 @@ fn render_row(
         out.push_str(&" ".repeat(width - used));
     }
     out.push_str(RESET);
-}
-
-/// Render a horizontal divider line, flush left with a one-cell inset on the
-/// right only (so it doesn't run into the right edge).
-fn render_divider(out: &mut String, y: usize, cols: usize, p: &Theme) {
-    let inner = cols.saturating_sub(1);
-    render_row(out, 0, y, cols, None, &[Span::new("─".repeat(inner), p.separator).dim()]);
 }
 
 /// Truncate `text` to `max_width` display columns, with an ellipsis. Ported
@@ -496,102 +575,31 @@ pub fn render(input: RenderInput) -> RenderOutput {
         };
     }
 
-    let entries = build_entries(input.panes, input.tabs, input.agents);
-    let n_sessions = input.sessions.len();
-    let total_targets = n_sessions + entries.len();
-    let selected = clamp_selection(input.selected, total_targets);
+    let rows_data = build_rows(input.panes, input.tabs, input.agents, input.sessions);
+    let selected = clamp_selection(input.selected, rows_data.len());
 
     // A slim docked strip can't fit labels; drop to the clean icon rail.
     if cols < THIN_WIDTH {
-        return render_thin(out, &input, &entries, selected, n_sessions);
+        return render_thin(out, &input, &rows_data, selected);
     }
 
     // Match the thin rail's breathing room: keep RAIL_VPAD blank rows above and
     // below the content, so the full view and the rail line up at the same top
     // offset and neither sits flush against the pane edges.
     let bottom_limit = rows.saturating_sub(RAIL_VPAD);
-    let mut y = RAIL_VPAD.min(rows);
+    let top = RAIL_VPAD.min(rows);
 
-    // ---- workspaces section: one row per session (each session is a workspace) ----
-    render_row(&mut out, 0, y, cols, None, &[Span::new(" workspaces", p.muted).bold()]);
-    y += 1;
-
-    let ordered = ordered_sessions(input.sessions);
-    if ordered.is_empty() {
-        render_row(&mut out, 0, y, cols, None, &[Span::new(" (none)", p.muted).dim()]);
-        y += 1;
-    } else {
-        for (session_index, session) in ordered.iter().enumerate() {
-            if y >= bottom_limit {
-                break;
-            }
-            let activity = session_activity(session, input.agents);
-            let (dot, dot_color) = activity_dot(activity, p);
-            // The cursor only shows while the sidebar is focused; the current
-            // session stays emphasized regardless (it's not the cursor).
-            let cursor = session_index == selected && input.focused;
-            let row_bg = cursor.then_some(p.selection_bg);
-            let emphasized = cursor || session.is_current_session;
-            let name_color = if emphasized { p.text } else { p.muted };
-            let mut name = Span::new(session.name.clone(), name_color);
-            if emphasized {
-                name = name.bold();
-            } else {
-                name = name.dim();
-            }
-            render_row(
-                &mut out,
-                0,
-                y,
-                cols,
-                row_bg,
-                &[
-                    Span::new(" ", p.text),
-                    Span::new(dot, dot_color),
-                    Span::new(" ", p.text),
-                    name,
-                ],
-            );
-            click_map.push(ClickTarget { row: y, index: session_index });
-            y += 1;
-        }
+    // ---- header ----
+    if top < bottom_limit {
+        render_row(&mut out, 0, top, cols, None, &[Span::new(" workspaces", p.muted).bold()]);
     }
 
-    // ---- divider ----
-    if y < bottom_limit {
-        render_divider(&mut out, y, cols, p);
-        y += 1;
-    }
-
-    // ---- agents header ----
-    if y < bottom_limit {
-        render_row(
-            &mut out,
-            0,
-            y,
-            cols,
-            None,
-            &[
-                Span::new(" agents", p.muted).bold(),
-                Span::new(format!("  {}", entries.len()), p.muted).dim(),
-            ],
-        );
-        y += 1;
-    }
-
-    let body_start = y;
+    let body_start = top + 1;
     let body_height = bottom_limit.saturating_sub(body_start);
 
-    if entries.is_empty() {
+    if rows_data.is_empty() {
         if body_start < bottom_limit {
-            render_row(
-                &mut out,
-                0,
-                body_start,
-                cols,
-                None,
-                &[Span::new(" no agents in this session", p.muted).dim()],
-            );
+            render_row(&mut out, 0, body_start, cols, None, &[Span::new(" (none)", p.muted).dim()]);
         }
         return RenderOutput {
             ansi: out,
@@ -601,18 +609,15 @@ pub fn render(input: RenderInput) -> RenderOutput {
         };
     }
 
-    // One row per agent. Keep the selected agent (if the cursor is in this
-    // section) within the visible window.
-    let total = entries.len();
+    // One unified scrollable list (each session followed by its agents). Keep the
+    // selection within the visible window.
+    let total = rows_data.len();
     let visible = body_height;
     let mut scroll = input.scroll.min(total.saturating_sub(visible));
-    if selected >= n_sessions {
-        let agent_idx = selected - n_sessions;
-        if agent_idx < scroll {
-            scroll = agent_idx;
-        } else if visible > 0 && agent_idx >= scroll + visible {
-            scroll = agent_idx + 1 - visible;
-        }
+    if selected < scroll {
+        scroll = selected;
+    } else if visible > 0 && selected >= scroll + visible {
+        scroll = selected + 1 - visible;
     }
 
     let show_scrollbar = total > visible && body_height > 0;
@@ -620,33 +625,60 @@ pub fn render(input: RenderInput) -> RenderOutput {
 
     let mut row_y = body_start;
     let body_bottom = body_start + body_height;
-    for (j, entry) in entries.iter().enumerate().skip(scroll) {
+    for (index, row) in rows_data.iter().enumerate().skip(scroll) {
         if row_y >= body_bottom {
             break;
         }
-        let index = n_sessions + j;
+        // The cursor only shows while the sidebar is focused.
         let cursor = index == selected && input.focused;
         let row_bg = cursor.then_some(p.selection_bg);
-        let (icon, icon_color) = agent_icon(entry.state, entry.seen, input.spinner_tick, p);
-        // The active (focused) pane stays emphasized; the cursor only shows while
-        // the sidebar itself is focused.
-        let emphasized = cursor || entry.is_active;
-        let name_color = if emphasized { p.text } else { p.muted };
-        let label = truncate_text(&entry.label, content_width.saturating_sub(3));
-        let mut name = Span::new(label, name_color);
-        if emphasized {
-            name = name.bold();
-        } else {
-            name = name.dim();
+        match row {
+            Row::Session { name, activity, is_current } => {
+                let (dot, dot_color) = activity_dot(*activity, p);
+                // The current session stays emphasized regardless of the cursor.
+                let emphasized = cursor || *is_current;
+                let name_color = if emphasized { p.text } else { p.muted };
+                let label = truncate_text(name, content_width.saturating_sub(3));
+                let mut name_span = Span::new(label, name_color);
+                name_span = if emphasized { name_span.bold() } else { name_span.dim() };
+                render_row(
+                    &mut out,
+                    0,
+                    row_y,
+                    content_width,
+                    row_bg,
+                    &[
+                        Span::new(" ", p.text),
+                        Span::new(dot, dot_color),
+                        Span::new(" ", p.text),
+                        name_span,
+                    ],
+                );
+            },
+            Row::Agent(entry) => {
+                let (icon, icon_color) = agent_icon(entry.state, entry.seen, input.spinner_tick, p);
+                // The active (focused) pane stays emphasized regardless of cursor.
+                let emphasized = cursor || entry.is_active;
+                let name_color = if emphasized { p.text } else { p.muted };
+                // Indent agents one level under their session header.
+                let label = truncate_text(&entry.label, content_width.saturating_sub(5));
+                let mut name_span = Span::new(label, name_color);
+                name_span = if emphasized { name_span.bold() } else { name_span.dim() };
+                render_row(
+                    &mut out,
+                    0,
+                    row_y,
+                    content_width,
+                    row_bg,
+                    &[
+                        Span::new("   ", p.text),
+                        Span::new(icon, icon_color),
+                        Span::new(" ", p.text),
+                        name_span,
+                    ],
+                );
+            },
         }
-        render_row(
-            &mut out,
-            0,
-            row_y,
-            content_width,
-            row_bg,
-            &[Span::new(" ", p.text), Span::new(icon, icon_color), Span::new(" ", p.text), name],
-        );
         click_map.push(ClickTarget { row: row_y, index });
         row_y += 1;
     }
@@ -664,61 +696,37 @@ pub fn render(input: RenderInput) -> RenderOutput {
 }
 
 /// Render the compact icon rail used when the pane is too narrow for labels: a
-/// centered vertical column of session dots, a thin divider, then the agent
-/// icons — sharing the full layout's selection-index space (sessions first,
-/// then agents) so keyboard and mouse handling are unchanged. Working agents
+/// centered vertical column of glyphs — one per [`build_rows`] entry, a session's
+/// activity dot or an agent's state icon — sharing the full view's selection
+/// index space so keyboard and mouse handling are unchanged. Working agents
 /// still animate; the selected glyph gets the selection background.
 fn render_thin(
     mut out: String,
     input: &RenderInput,
-    entries: &[AgentEntry],
+    rows_data: &[Row],
     selected: usize,
-    n_sessions: usize,
 ) -> RenderOutput {
     let p = input.palette;
     let cols = input.cols;
     let rows = input.rows;
     let mut click_map = Vec::new();
 
-    // Lay the rail out as: glyphs | divider | right padding. The divider sits
+    // Lay the rail out as: glyph | divider | right padding. The divider sits
     // `RAIL_HPAD` columns in from the right edge so it gets a little breathing
-    // room from the content pane rather than butting against it; the glyphs live
+    // room from the content pane rather than butting against it; the glyph lives
     // in the columns to its left.
     let divider_x = cols.saturating_sub(1 + RAIL_HPAD);
     let rail_width = divider_x.max(1);
 
-    // A rail row is either a selectable glyph (tagged with its selection index)
-    // or the non-selectable divider between the sessions and agents groups.
-    enum Rail {
-        Glyph {
-            index: usize,
-            glyph: &'static str,
-            color: PaletteColor,
-        },
-        Divider,
-    }
-    let mut rail: Vec<Rail> = Vec::new();
-
-    // One dot per session, in the same order as `navigable_targets`.
-    for (session_index, session) in ordered_sessions(input.sessions).iter().enumerate() {
-        let (glyph, color) = activity_dot(session_activity(session, input.agents), p);
-        rail.push(Rail::Glyph {
-            index: session_index,
-            glyph,
-            color,
-        });
-    }
-    if !rail.is_empty() && !entries.is_empty() {
-        rail.push(Rail::Divider);
-    }
-    for (j, entry) in entries.iter().enumerate() {
-        let (glyph, color) = agent_icon(entry.state, entry.seen, input.spinner_tick, p);
-        rail.push(Rail::Glyph {
-            index: n_sessions + j,
-            glyph,
-            color,
-        });
-    }
+    // One glyph per row, in the same order (and selection index) as the full
+    // view and `navigable_targets`.
+    let glyphs: Vec<(&'static str, PaletteColor)> = rows_data
+        .iter()
+        .map(|row| match row {
+            Row::Session { activity, .. } => activity_dot(*activity, p),
+            Row::Agent(entry) => agent_icon(entry.state, entry.seen, input.spinner_tick, p),
+        })
+        .collect();
 
     // Keep a little breathing room above and below the glyphs so they don't sit
     // flush against the pane's top and bottom edges.
@@ -726,49 +734,30 @@ fn render_thin(
     let body_height = rows.saturating_sub(RAIL_VPAD * 2);
 
     // Scroll the rail so the selected glyph's row stays within the padded body.
-    let selected_row = rail
-        .iter()
-        .position(|r| matches!(r, Rail::Glyph { index, .. } if *index == selected));
-    let mut scroll = input.scroll.min(rail.len().saturating_sub(body_height.max(1)));
-    if let Some(sr) = selected_row {
-        if sr < scroll {
-            scroll = sr;
-        } else if body_height > 0 && sr >= scroll + body_height {
-            scroll = sr + 1 - body_height;
-        }
+    let mut scroll = input.scroll.min(glyphs.len().saturating_sub(body_height.max(1)));
+    if selected < scroll {
+        scroll = selected;
+    } else if body_height > 0 && selected >= scroll + body_height {
+        scroll = selected + 1 - body_height;
     }
 
     // Center the single glyph within the rail (the columns left of the divider).
     let pad = rail_width.saturating_sub(1) / 2;
-    for (k, item) in rail.iter().enumerate().skip(scroll).take(body_height) {
-        let y = top + (k - scroll);
-        match item {
-            Rail::Glyph { index, glyph, color } => {
-                let cursor = *index == selected && input.focused;
-                let row_bg = cursor.then_some(p.selection_bg);
-                let mut glyph_span = Span::new(*glyph, *color);
-                if cursor {
-                    glyph_span = glyph_span.bold();
-                }
-                let mut spans = Vec::new();
-                if pad > 0 {
-                    spans.push(Span::new(" ".repeat(pad), p.text));
-                }
-                spans.push(glyph_span);
-                render_row(&mut out, 0, y, rail_width, row_bg, &spans);
-                click_map.push(ClickTarget { row: y, index: *index });
-            },
-            Rail::Divider => {
-                // A small divider centered on the glyph column, so it stays
-                // proportional to the slim rail instead of spanning its width.
-                let mut spans = Vec::new();
-                if pad > 0 {
-                    spans.push(Span::new(" ".repeat(pad), p.text));
-                }
-                spans.push(Span::new("─", p.separator).dim());
-                render_row(&mut out, 0, y, rail_width, None, &spans);
-            },
+    for (index, &(glyph, color)) in glyphs.iter().enumerate().skip(scroll).take(body_height) {
+        let y = top + (index - scroll);
+        let cursor = index == selected && input.focused;
+        let row_bg = cursor.then_some(p.selection_bg);
+        let mut glyph_span = Span::new(glyph, color);
+        if cursor {
+            glyph_span = glyph_span.bold();
         }
+        let mut spans = Vec::new();
+        if pad > 0 {
+            spans.push(Span::new(" ".repeat(pad), p.text));
+        }
+        spans.push(glyph_span);
+        render_row(&mut out, 0, y, rail_width, row_bg, &spans);
+        click_map.push(ClickTarget { row: y, index });
     }
 
     // A continuous vertical divider down the right edge (inset by RAIL_HPAD),

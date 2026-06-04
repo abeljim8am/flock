@@ -62,6 +62,11 @@ const STATE_TICK_SECS: f64 = 0.5;
 /// Faster cadence used while at least one agent is working, so the spinner
 /// animates smoothly (~8 frames/sec).
 const SPINNER_TICK_SECS: f64 = 0.12;
+/// How long without a pushed render report before we treat our session as
+/// backgrounded (no client attached) and start pulling agent pane contents on
+/// the timer instead. Comfortably above the slow `STATE_TICK_SECS` cadence so a
+/// merely-idle foreground session keeps using the cheaper pushed reports.
+const RENDER_REPORT_STALE_SECS: f64 = 1.5;
 /// How often the sidebar asks the host to rescan live sessions. `SessionUpdate`
 /// events only reflect the server's cached view; this command refreshes that
 /// cache from the live socket/session-metadata files so the workspace section
@@ -137,6 +142,12 @@ struct State {
     /// selection cursor is hidden when this is false, so an unfocused ambient
     /// rail shows only status — no cursor.
     focused: bool,
+    /// When we last received a pushed `PaneRenderReportWithAnsi`. The host only
+    /// emits those while a client is attached to our session, so once they go
+    /// stale (we've been switched away from) we fall back to *pulling* each
+    /// agent pane's contents on the timer — see [`State::pull_agent_screens`] —
+    /// keeping a backgrounded session's agent state live cross-session.
+    last_render_report_at: Option<Instant>,
     /// Whether we've applied the one-time default width after the layout first
     /// reports our geometry. The flock layout opens the sidebar at a resizable
     /// percent (so Super b can toggle it in place); once we know the real
@@ -240,6 +251,7 @@ impl ZellijPlugin for State {
             },
             Event::PaneRenderReportWithAnsi(pane_contents) => {
                 let now = Instant::now();
+                self.last_render_report_at = Some(now);
                 for (pane_id, contents) in pane_contents {
                     let screen = screen_text(&contents);
                     let entry = self.agents.entry(pane_id).or_default();
@@ -256,6 +268,13 @@ impl ZellijPlugin for State {
                     if entry.tick(now) {
                         should_render = true;
                     }
+                }
+                // When pushed render reports have gone stale — i.e. no client is
+                // attached because we've been switched away from — pull each
+                // agent pane's screen ourselves so detection keeps running and we
+                // keep publishing live state for the cross-session view.
+                if self.render_reports_are_stale(now) {
+                    should_render |= self.pull_agent_screens(now);
                 }
                 // While anything is working, animate the spinner and tick faster;
                 // otherwise fall back to the slow hold/grace cadence.
@@ -384,12 +403,58 @@ impl ZellijPlugin for State {
 }
 
 impl State {
-    /// Whether any tracked agent is currently in the Working state (drives the
-    /// faster spinner-animation timer cadence).
+    /// Whether any agent — in this session or any other — is currently Working.
+    /// Drives the faster spinner-animation cadence; the cross-session check keeps
+    /// the spinner animating for working agents shown from the published bus, not
+    /// just our own panes.
     fn any_working(&self) -> bool {
         self.agents
             .values()
             .any(|st| st.is_agent() && st.state == AgentState::Working)
+            || self.sessions.iter().any(|session| {
+                session
+                    .agent_states
+                    .values()
+                    .any(|status| matches!(status.state, AgentRunState::Working))
+            })
+    }
+
+    /// Whether pushed render reports have gone stale (no client attached). When
+    /// true we drive detection by pulling instead — see [`pull_agent_screens`].
+    fn render_reports_are_stale(&self, now: Instant) -> bool {
+        self.last_render_report_at
+            .is_none_or(|last| now.duration_since(last).as_secs_f64() >= RENDER_REPORT_STALE_SECS)
+    }
+
+    /// Pull each tracked agent pane's on-screen contents and re-run detection.
+    /// The host serves `get_pane_scrollback` straight from the pane's grid, which
+    /// it maintains regardless of whether a client is attached — so this keeps a
+    /// backgrounded session's agent state live when the pushed
+    /// `PaneRenderReportWithAnsi` events have dried up. Returns whether any
+    /// agent's state changed. Panes that have since closed return an error and
+    /// are skipped (pruning removes them on the next `PaneUpdate`).
+    fn pull_agent_screens(&mut self, now: Instant) -> bool {
+        let pane_ids: Vec<PaneId> = self
+            .agents
+            .iter()
+            .filter(|(_, st)| st.is_agent())
+            .map(|(pane_id, _)| *pane_id)
+            .collect();
+        let mut changed = false;
+        for pane_id in pane_ids {
+            let Ok(contents) = get_pane_scrollback(pane_id, false) else {
+                continue;
+            };
+            let screen = screen_text(&contents);
+            if let Some(entry) = self.agents.get_mut(&pane_id) {
+                let agent = entry.detected_agent;
+                let detection = detect_agent(agent, &screen);
+                if entry.observe_screen(agent, detection, now) {
+                    changed = true;
+                }
+            }
+        }
+        changed
     }
 
     /// Whether enough time has elapsed to refresh the cross-session list. Kept
