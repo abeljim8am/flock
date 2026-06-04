@@ -35,7 +35,8 @@ use std::collections::BTreeMap;
 
 use unicode_width::UnicodeWidthStr;
 use zellij_tile::prelude::{
-    AgentRunState, PaneAgentStatus, PaneId, PaneManifest, PaletteColor, SessionInfo, TabInfo,
+    AgentRunState, FlockSidebarMode, PaneAgentStatus, PaneId, PaneManifest, PaletteColor,
+    SessionInfo, TabInfo,
 };
 
 use crate::detect::{identify_agent_from_command, AgentState};
@@ -60,6 +61,50 @@ const RAIL_VPAD: usize = 1;
 /// doesn't sit flush against the content pane beside it. With the slim rail at 5
 /// cols this leaves a centered dot, a gap, the divider, then this padding.
 const RAIL_HPAD: usize = 1;
+
+/// The user's requested sidebar presentation, shared by every rendered section.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SidebarMode {
+    Open,
+    Closed,
+}
+
+impl Default for SidebarMode {
+    fn default() -> Self {
+        Self::Open
+    }
+}
+
+impl SidebarMode {
+    pub fn toggled(self) -> Self {
+        match self {
+            Self::Open => Self::Closed,
+            Self::Closed => Self::Open,
+        }
+    }
+
+    pub fn is_open(self) -> bool {
+        matches!(self, Self::Open)
+    }
+}
+
+impl From<FlockSidebarMode> for SidebarMode {
+    fn from(mode: FlockSidebarMode) -> Self {
+        match mode {
+            FlockSidebarMode::Open => Self::Open,
+            FlockSidebarMode::Closed => Self::Closed,
+        }
+    }
+}
+
+impl From<SidebarMode> for FlockSidebarMode {
+    fn from(mode: SidebarMode) -> Self {
+        match mode {
+            SidebarMode::Open => Self::Open,
+            SidebarMode::Closed => Self::Closed,
+        }
+    }
+}
 
 /// Map the animation tick to a spinner frame.
 pub fn spinner_frame(tick: u32) -> &'static str {
@@ -500,6 +545,8 @@ pub struct RenderInput<'a> {
     pub agents: &'a BTreeMap<PaneId, PaneAgentState>,
     pub sessions: &'a [SessionInfo],
     pub palette: &'a Theme,
+    /// Shared open/closed state for both sidebar sections.
+    pub sidebar_mode: SidebarMode,
     /// Whether the sidebar pane is focused. The selection cursor is only drawn
     /// when focused, so an unfocused ambient rail shows status without a cursor.
     pub focused: bool,
@@ -567,8 +614,10 @@ pub fn render(input: RenderInput) -> RenderOutput {
     let rows_data = build_rows(input.panes, input.tabs, input.agents, input.sessions);
     let selected = clamp_selection(input.selected, rows_data.len());
 
-    // A slim docked strip can't fit labels; drop to the clean icon rail.
-    if cols < THIN_WIDTH {
+    // Closed mode uses the icon rail even if the pane has enough room for labels.
+    // A physically narrow pane also falls back to the rail so open mode never
+    // tries to draw labels into too few columns.
+    if !input.sidebar_mode.is_open() || cols < THIN_WIDTH {
         return render_thin(out, &input, &rows_data, selected);
     }
 
@@ -972,6 +1021,13 @@ mod tests {
         assert_eq!(done_color, p.teal);
     }
 
+    #[test]
+    fn sidebar_mode_toggles_between_open_and_closed() {
+        assert_eq!(SidebarMode::default(), SidebarMode::Open);
+        assert_eq!(SidebarMode::Open.toggled(), SidebarMode::Closed);
+        assert_eq!(SidebarMode::Closed.toggled(), SidebarMode::Open);
+    }
+
     fn sess(name: &str, root: &str) -> SessionInfo {
         let mut s = SessionInfo::new(name.to_string());
         s.workspace_root = std::path::PathBuf::from(root);
@@ -991,6 +1047,36 @@ mod tests {
         // unknown (empty) workspace trails.
         let names: Vec<&str> = ordered.iter().map(|s| s.name.as_str()).collect();
         assert_eq!(names, vec!["d", "a", "b", "c"]);
+    }
+
+    #[test]
+    fn closed_sidebar_mode_uses_rail_even_when_wide() {
+        let panes = PaneManifest::default();
+        let tabs = Vec::new();
+        let agents = BTreeMap::new();
+        let sessions = vec![sess("workspace-a", "/home/u/proj")];
+        let palette = Theme::default();
+
+        let output = render(RenderInput {
+            permissions_granted: true,
+            panes: &panes,
+            tabs: &tabs,
+            agents: &agents,
+            sessions: &sessions,
+            palette: &palette,
+            sidebar_mode: SidebarMode::Closed,
+            focused: false,
+            selected: 0,
+            scroll_sessions: 0,
+            scroll_agents: 0,
+            spinner_tick: 0,
+            rows: 8,
+            cols: 40,
+        });
+
+        assert!(!output.ansi.contains("workspaces"));
+        assert!(!output.ansi.contains("workspace-a"));
+        assert!(output.click_map.iter().any(|hit| hit.index == 0));
     }
 
     #[test]

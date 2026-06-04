@@ -44,14 +44,14 @@ mod state;
 mod ui;
 
 use std::collections::{BTreeMap, HashSet};
-use std::time::Instant;
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use detect::{detect_agent, identify_agent_from_command, AgentState};
 use hook::{parse_hook_report, HookReport, HOOK_PIPE_NAME};
 use palette::Theme;
 use sessionizer::SessionizerConfig;
 use state::PaneAgentState;
-use ui::{ClickTarget, Target};
+use ui::{ClickTarget, SidebarMode, Target};
 use zellij_tile::prelude::*;
 
 /// How often we re-evaluate time-based holds/grace windows when nothing is
@@ -124,6 +124,15 @@ struct State {
     /// Sidebar colors, resolved from the user's active zellij theme (updated on
     /// each `ModeUpdate`).
     palette: Theme,
+    /// User-requested sidebar presentation. Width follows this state, and the
+    /// renderer uses it for both the workspaces and agents sections.
+    sidebar_mode: SidebarMode,
+    /// Timestamp attached to the last local/adopted sidebar mode. Cross-session
+    /// sync uses this so every live sidebar converges on the newest toggle.
+    sidebar_state_updated_at_millis: u64,
+    /// The last sidebar mode state we published to the cross-session metadata
+    /// bus. Diffed to avoid rewriting session metadata on every event.
+    last_published_sidebar_state: Option<FlockSidebarState>,
     /// Unified keyboard selection cursor over the sessions then the agents.
     selected: usize,
     /// Scroll offset into the workspaces (sessions) section.
@@ -173,7 +182,8 @@ impl ZellijPlugin for State {
         // Permissions needed across all phases:
         // - ReadApplicationState: pane/tab/session manifests
         // - ReadPaneContents: PaneRenderReportWithAnsi screen scraping (Phase 2)
-        // - ChangeApplicationState: switch session / focus pane on activation
+        // - ChangeApplicationState: switch session / focus pane on activation,
+        //   resize our pane, and publish cross-session sidebar state
         // - ReadCliPipes: agent hook reports via `zellij pipe` (Phase 5)
         request_permission(&[
             PermissionType::ReadApplicationState,
@@ -237,6 +247,7 @@ impl ZellijPlugin for State {
             },
             Event::SessionUpdate(sessions, _resurrectable) => {
                 self.sessions = sessions;
+                self.sync_sidebar_mode_from_sessions();
                 should_render = true;
             },
             Event::CommandChanged(pane_id, command, is_foreground, _focused_clients) => {
@@ -350,6 +361,7 @@ impl ZellijPlugin for State {
         // Any handled event may have changed an agent's state; mirror the latest
         // picture onto the cross-session bus (no-op when unchanged).
         self.publish_state_if_changed();
+        self.publish_sidebar_state_if_changed();
         should_render
     }
 
@@ -357,6 +369,7 @@ impl ZellijPlugin for State {
         // The width-toggle channel (Super b → MessagePlugin) resizes our pane.
         if pipe_message.name == WIDTH_TOGGLE_PIPE {
             self.toggle_width();
+            self.publish_sidebar_state_if_changed();
             return false; // the resize itself triggers a re-render
         }
         // Only the agent self-report channel concerns us otherwise; ignore the
@@ -390,6 +403,7 @@ impl ZellijPlugin for State {
             agents: &self.agents,
             sessions: &sessions,
             palette: &self.palette,
+            sidebar_mode: self.sidebar_mode,
             focused: self.focused,
             selected: self.selected,
             scroll_sessions: self.scroll_sessions,
@@ -482,6 +496,7 @@ impl State {
                     false
                 } else {
                     self.sessions = snapshot.live_sessions;
+                    self.sync_sidebar_mode_from_sessions();
                     true
                 }
             },
@@ -520,26 +535,54 @@ impl State {
     /// resizing our *own* pane. Resizing only shifts the split between the
     /// sidebar and the content area beside it — content panes keep their
     /// arrangement (unlike a swap layout, which re-fits everything). Direction
-    /// is chosen from the current width so it self-corrects rather than relying
-    /// on a stored flag.
-    fn toggle_width(&self) {
+    /// follows the stored sidebar mode so every render section shares the same
+    /// open/closed state.
+    fn toggle_width(&mut self) {
+        self.sidebar_mode = self.sidebar_mode.toggled();
+        self.sidebar_state_updated_at_millis = now_millis();
+        self.default_width_applied = true;
         let (_, total) = self.sidebar_and_tab_cols();
-        // Decide purely from the sidebar's *actual* current width. Use our own
-        // last-rendered width (`self.cols`) rather than the pane manifest: the
-        // plugin re-renders at the new size right after a resize, so this is
-        // fresh, whereas the manifest can still report the previous width.
-        // Narrower than the midpoint between slim and expanded ⇒ expand;
-        // otherwise collapse. No stored flag to get out of sync.
-        let current = self.cols.max(1);
-        let midpoint = (SIDEBAR_SLIM_COLS + SIDEBAR_EXPANDED_COLS) / 2;
-        let expanding = current < midpoint;
         // Toward a fixed target column count (capped to half the tab on small
         // terminals so it never crowds out the content) — a fixed width, not a
         // screen-relative percent, so it's the same on a laptop and an ultrawide.
-        let target = if expanding {
-            SIDEBAR_EXPANDED_COLS.min(total / 2).max(WIDTH_EXPAND_THRESHOLD)
-        } else {
-            SIDEBAR_SLIM_COLS
+        let target = match self.sidebar_mode {
+            SidebarMode::Open => SIDEBAR_EXPANDED_COLS.min(total / 2).max(WIDTH_EXPAND_THRESHOLD),
+            SidebarMode::Closed => SIDEBAR_SLIM_COLS,
+        };
+        self.set_width(target);
+    }
+
+    /// Adopt the newest sidebar mode published by any live session. Sessions
+    /// republish adopted states, so a single toggle eventually propagates to
+    /// every flock sidebar through the existing session-list refresh loop.
+    fn sync_sidebar_mode_from_sessions(&mut self) -> bool {
+        let Some(sidebar_state) = self
+            .sessions
+            .iter()
+            .filter_map(|session| session.flock_sidebar_state)
+            .max_by_key(|state| state.updated_at_millis)
+        else {
+            return false;
+        };
+        if sidebar_state.updated_at_millis <= self.sidebar_state_updated_at_millis {
+            return false;
+        }
+        self.sidebar_state_updated_at_millis = sidebar_state.updated_at_millis;
+        let mode = SidebarMode::from(sidebar_state.mode);
+        if mode == self.sidebar_mode {
+            return false;
+        }
+        self.sidebar_mode = mode;
+        self.default_width_applied = true;
+        self.set_width_for_mode(mode);
+        true
+    }
+
+    fn set_width_for_mode(&self, mode: SidebarMode) {
+        let (_, total) = self.sidebar_and_tab_cols();
+        let target = match mode {
+            SidebarMode::Open => SIDEBAR_EXPANDED_COLS.min(total / 2).max(WIDTH_EXPAND_THRESHOLD),
+            SidebarMode::Closed => SIDEBAR_SLIM_COLS,
         };
         self.set_width(target);
     }
@@ -561,6 +604,7 @@ impl State {
             return;
         }
         self.default_width_applied = true;
+        self.sidebar_mode = SidebarMode::Open;
         // Cap to half the tab on small terminals so the sidebar never crowds out
         // the content — matching the expand branch of `toggle_width`.
         let target = SIDEBAR_EXPANDED_COLS.min(total / 2).max(WIDTH_EXPAND_THRESHOLD);
@@ -674,6 +718,22 @@ impl State {
         }
     }
 
+    /// Publish this session's sidebar presentation state when it changes, so
+    /// other sessions' sidebars can adopt the newest toggle.
+    fn publish_sidebar_state_if_changed(&mut self) {
+        if !self.permissions_granted {
+            return;
+        }
+        let state = FlockSidebarState {
+            mode: self.sidebar_mode.into(),
+            updated_at_millis: self.sidebar_state_updated_at_millis,
+        };
+        if Some(state) != self.last_published_sidebar_state {
+            self.last_published_sidebar_state = Some(state);
+            publish_flock_sidebar_state(state);
+        }
+    }
+
     /// Push the current focus picture into each tracked pane's state: a pane is
     /// "viewed" when it is the focused pane in the active tab. Focusing a pane
     /// clears its Done-unseen notification (see [`PaneAgentState::set_focused`]),
@@ -736,6 +796,13 @@ fn to_run_state(state: AgentState) -> AgentRunState {
         AgentState::Blocked => AgentRunState::Blocked,
         AgentState::Unknown => AgentRunState::Unknown,
     }
+}
+
+fn now_millis() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as u64)
+        .unwrap_or_default()
 }
 
 /// Flatten a pane's viewport into a single screen-text snapshot for detection.

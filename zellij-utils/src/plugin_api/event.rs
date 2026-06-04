@@ -11,6 +11,7 @@ pub use super::generated_api::api::{
         CopyDestination as ProtobufCopyDestination, CwdChangedPayload as ProtobufCwdChangedPayload,
         Event as ProtobufEvent, EventNameList as ProtobufEventNameList,
         EventType as ProtobufEventType, FileMetadata as ProtobufFileMetadata,
+        FlockSidebarState as ProtobufFlockSidebarState,
         HostTerminalThemeChangedPayload as ProtobufHostTerminalThemeChangedPayload,
         HostTerminalThemeIndication as ProtobufHostTerminalThemeIndication,
         InputModeKeybinds as ProtobufInputModeKeybinds, KdlError as ProtobufKdlError,
@@ -39,10 +40,10 @@ pub use super::generated_api::api::{
 #[allow(hidden_glob_reexports)]
 use crate::data::{
     AgentRunState, ClientId, ClientInfo, CopyDestination, Event, EventType, FileMetadata,
-    HostTerminalThemeMode, InputMode, KeyWithModifier, LayoutInfo, LayoutMetadata, ModeInfo, Mouse,
-    PaneAgentStatus, PaneContents, PaneId, PaneInfo, PaneManifest, PaneMetadata,
-    PaneScrollbackResponse, PermissionStatus, PluginCapabilities, PluginInfo, SelectedText,
-    SessionInfo, Style, TabInfo, TabMetadata, WebServerStatus, WebSharing,
+    FlockSidebarMode, FlockSidebarState, HostTerminalThemeMode, InputMode, KeyWithModifier,
+    LayoutInfo, LayoutMetadata, ModeInfo, Mouse, PaneAgentStatus, PaneContents, PaneId, PaneInfo,
+    PaneManifest, PaneMetadata, PaneScrollbackResponse, PermissionStatus, PluginCapabilities,
+    PluginInfo, SelectedText, SessionInfo, Style, TabInfo, TabMetadata, WebServerStatus, WebSharing,
 };
 
 use crate::errors::prelude::*;
@@ -1227,6 +1228,12 @@ impl TryFrom<SessionInfo> for ProtobufSessionManifest {
                     })
                 })
                 .collect(),
+            flock_sidebar_state: session_info
+                .flock_sidebar_state
+                .map(|state| ProtobufFlockSidebarState {
+                    mode: state.mode.as_wire_u32(),
+                    updated_at_millis: state.updated_at_millis,
+                }),
         })
     }
 }
@@ -1356,6 +1363,12 @@ impl TryFrom<ProtobufSessionManifest> for SessionInfo {
             creation_time: Duration::from_secs(protobuf_session_manifest.creation_time),
             workspace_root: PathBuf::from(protobuf_session_manifest.workspace_root),
             agent_states,
+            flock_sidebar_state: protobuf_session_manifest
+                .flock_sidebar_state
+                .map(|state| FlockSidebarState {
+                    mode: FlockSidebarMode::from_wire_u32(state.mode),
+                    updated_at_millis: state.updated_at_millis,
+                }),
         })
     }
 }
@@ -2837,6 +2850,10 @@ fn serialize_session_update_event_with_non_default_values() {
             );
             agent_states
         },
+        flock_sidebar_state: Some(FlockSidebarState {
+            mode: FlockSidebarMode::Closed,
+            updated_at_millis: 42,
+        }),
     };
     let session_info_2 = SessionInfo {
         name: "session 2".to_owned(),
@@ -2873,6 +2890,7 @@ fn serialize_session_update_event_with_non_default_values() {
         creation_time: Duration::from_secs(200),
         workspace_root: PathBuf::from("/home/aviram/session-2"),
         agent_states: Default::default(),
+        flock_sidebar_state: None,
     };
     let session_infos = vec![session_info_1, session_info_2];
     let resurrectable_sessions = vec![];

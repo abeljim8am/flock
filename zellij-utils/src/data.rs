@@ -1859,6 +1859,59 @@ pub struct PaneAgentStatus {
     pub seen: bool,
 }
 
+/// The flock-sidebar presentation mode, shared across live sessions through
+/// `SessionInfo`.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+pub enum FlockSidebarMode {
+    #[default]
+    Open,
+    Closed,
+}
+
+impl FlockSidebarMode {
+    /// A stable, lower-case wire name used for KDL serialization.
+    pub fn as_wire_str(&self) -> &'static str {
+        match self {
+            FlockSidebarMode::Open => "open",
+            FlockSidebarMode::Closed => "closed",
+        }
+    }
+
+    /// Parse the wire name produced by [`as_wire_str`](Self::as_wire_str),
+    /// falling back to `Open` for anything unrecognized.
+    pub fn from_wire_str(s: &str) -> Self {
+        match s {
+            "closed" => FlockSidebarMode::Closed,
+            _ => FlockSidebarMode::Open,
+        }
+    }
+
+    /// Numeric wire value used for protobuf round-trips.
+    pub fn as_wire_u32(&self) -> u32 {
+        match self {
+            FlockSidebarMode::Open => 0,
+            FlockSidebarMode::Closed => 1,
+        }
+    }
+
+    /// Inverse of [`as_wire_u32`](Self::as_wire_u32); unrecognized values map to
+    /// `Open`.
+    pub fn from_wire_u32(v: u32) -> Self {
+        match v {
+            1 => FlockSidebarMode::Closed,
+            _ => FlockSidebarMode::Open,
+        }
+    }
+}
+
+/// Latest flock-sidebar mode update published by a session. The timestamp lets
+/// sidebars converge on the most recent toggle when multiple sessions are live.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+pub struct FlockSidebarState {
+    pub mode: FlockSidebarMode,
+    pub updated_at_millis: u64,
+}
+
 #[derive(Debug, Default, Clone, PartialEq, Eq, Deserialize, Serialize)]
 pub struct SessionInfo {
     pub name: String,
@@ -1882,6 +1935,10 @@ pub struct SessionInfo {
     /// existing cross-session metadata transport: another session's sidebar
     /// reads this to render that session's agents in full state fidelity.
     pub agent_states: BTreeMap<PaneId, PaneAgentStatus>,
+    /// The latest open/closed sidebar mode published by this session's
+    /// flock-sidebar plugin. Other sessions adopt the newest published mode so
+    /// the sidebar presentation follows the user across sessions.
+    pub flock_sidebar_state: Option<FlockSidebarState>,
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Eq, Deserialize, Serialize)]
@@ -3707,6 +3764,10 @@ pub enum PluginCommand {
     /// it and surfaces it on `SessionInfo` so other sessions' sidebars can see
     /// it (the flock-sidebar Phase 7 cross-session agent view).
     PublishAgentState(BTreeMap<PaneId, PaneAgentStatus>),
+    /// Publish this session's flock-sidebar open/closed state to the server,
+    /// which stores it and surfaces it on `SessionInfo` so other sessions'
+    /// sidebars can follow the same presentation mode.
+    PublishFlockSidebarState(FlockSidebarState),
 }
 
 // Response type for plugin API methods that open a pane in a new tab

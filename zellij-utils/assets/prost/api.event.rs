@@ -403,6 +403,8 @@ pub struct SessionManifest {
     pub workspace_root: ::prost::alloc::string::String,
     #[prost(message, repeated, tag="14")]
     pub agent_states: ::prost::alloc::vec::Vec<PaneAgentStatus>,
+    #[prost(message, optional, tag="15")]
+    pub flock_sidebar_state: ::core::option::Option<FlockSidebarState>,
 }
 #[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -415,6 +417,14 @@ pub struct PaneAgentStatus {
     pub label: ::prost::alloc::string::String,
     #[prost(bool, tag="4")]
     pub seen: bool,
+}
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct FlockSidebarState {
+    #[prost(uint32, tag="1")]
+    pub mode: u32,
+    #[prost(uint64, tag="2")]
+    pub updated_at_millis: u64,
 }
 #[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Clone, PartialEq, ::prost::Message)]

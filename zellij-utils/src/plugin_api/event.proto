@@ -335,6 +335,7 @@ message SessionManifest {
   uint64 creation_time = 12;
   string workspace_root = 13;
   repeated PaneAgentStatus agent_states = 14;
+  optional FlockSidebarState flock_sidebar_state = 15;
 }
 
 message PaneAgentStatus {
@@ -342,6 +343,11 @@ message PaneAgentStatus {
   uint32 state = 2;
   string label = 3;
   bool seen = 4;
+}
+
+message FlockSidebarState {
+  uint32 mode = 1;
+  uint64 updated_at_millis = 2;
 }
 
 message ClientTabHistory {

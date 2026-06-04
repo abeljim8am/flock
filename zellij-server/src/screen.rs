@@ -694,6 +694,7 @@ pub enum ScreenInstruction {
         BTreeMap<String, Duration>,    // resurrectable sessions - <name, created>
     ),
     PublishAgentState(BTreeMap<zellij_utils::data::PaneId, PaneAgentStatus>),
+    PublishFlockSidebarState(zellij_utils::data::FlockSidebarState),
     ReplacePane(
         PaneId,
         HoldForCommand,
@@ -1073,6 +1074,9 @@ impl From<&ScreenInstruction> for ScreenContext {
             ScreenInstruction::BreakPaneLeft(..) => ScreenContext::BreakPaneLeft,
             ScreenInstruction::UpdateSessionInfos(..) => ScreenContext::UpdateSessionInfos,
             ScreenInstruction::PublishAgentState(..) => ScreenContext::PublishAgentState,
+            ScreenInstruction::PublishFlockSidebarState(..) => {
+                ScreenContext::PublishFlockSidebarState
+            },
             ScreenInstruction::ReplacePane(..) => ScreenContext::ReplacePane,
             ScreenInstruction::NewInPlacePluginPane(..) => ScreenContext::NewInPlacePluginPane,
             ScreenInstruction::SerializeLayoutForResurrection => {
@@ -1478,6 +1482,10 @@ pub(crate) struct Screen {
     /// cross-session metadata transport to other sessions' sidebars. Keyed by
     /// the plugin-facing `data::PaneId`.
     published_agent_states: BTreeMap<zellij_utils::data::PaneId, PaneAgentStatus>,
+    /// The latest flock-sidebar open/closed state published by this session's
+    /// flock-sidebar plugin. Stored here and copied onto every `SessionInfo` we
+    /// generate, so other sessions' sidebars can follow the same presentation.
+    published_flock_sidebar_state: Option<zellij_utils::data::FlockSidebarState>,
 }
 
 /// A pending forward waiting to be dispatched once the current in-flight
@@ -1633,6 +1641,7 @@ impl Screen {
             host_theme_light_styling: None,
             workspace_root: PathBuf::new(),
             published_agent_states: BTreeMap::new(),
+            published_flock_sidebar_state: None,
         }
     }
 
@@ -3408,6 +3417,7 @@ impl Screen {
             creation_time,
             workspace_root: self.workspace_root.clone(),
             agent_states: self.published_agent_states.clone(),
+            flock_sidebar_state: self.published_flock_sidebar_state,
         };
         self.bus
             .senders
@@ -8594,6 +8604,15 @@ pub(crate) fn screen_thread_main(
                     screen.log_and_report_session_state()?;
                 }
             },
+            ScreenInstruction::PublishFlockSidebarState(sidebar_state) => {
+                // Same diff guard as agent state: sidebars may republish adopted
+                // state while converging, but unchanged values shouldn't rewrite
+                // session metadata.
+                if screen.published_flock_sidebar_state != Some(sidebar_state) {
+                    screen.published_flock_sidebar_state = Some(sidebar_state);
+                    screen.log_and_report_session_state()?;
+                }
+            },
             ScreenInstruction::UpdateAvailableLayouts(layouts, errors) => {
                 screen.update_available_layouts(layouts, errors);
             },
@@ -8673,6 +8692,7 @@ pub(crate) fn screen_thread_main(
                     creation_time,
                     workspace_root: screen.workspace_root.clone(),
                     agent_states: screen.published_agent_states.clone(),
+                    flock_sidebar_state: screen.published_flock_sidebar_state,
                 };
 
                 let session_layout_metadata = if screen.session_serialization {
