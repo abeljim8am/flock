@@ -18,6 +18,10 @@
 //!   and a label. The icon alone carries the state (color + glyph), so there is
 //!   no status word.
 //!
+//! The two sections are stacked vertically: the workspaces overview fills the
+//! top half and the agents section is pinned at the vertical midpoint, so the
+//! split stays put as sessions come and go. Each half scrolls independently.
+//!
 //! Navigation is keyboard-first: a single selection cursor moves over the
 //! sessions then the agents (Up/Down or k/j), and Enter activates the selected
 //! row (switch session / focus pane). Mouse click and scroll mirror the same
@@ -307,37 +311,13 @@ pub fn build_entries(
     entries
 }
 
-/// Build the agent list for *another* session from the per-pane status it
-/// published to the cross-session bus ([`SessionInfo.agent_states`]). We can't
-/// observe its panes directly, so state/label/seen come from what its own
-/// flock-sidebar published; the pane isn't focusable from here, so activating
-/// one switches to that session.
-fn published_entries(session: &SessionInfo) -> Vec<AgentEntry> {
-    session
-        .agent_states
-        .iter()
-        .map(|(pane_id, status)| AgentEntry {
-            pane_id: *pane_id,
-            label: if status.label.is_empty() {
-                "agent".to_string()
-            } else {
-                status.label.clone()
-            },
-            state: run_state_to_agent_state(status.state),
-            seen: status.seen,
-            is_active: false,
-            is_current: false,
-            session_name: session.name.clone(),
-        })
-        .collect()
-}
-
-/// The unified, ordered sidebar list: each session (in [`ordered_sessions`]
-/// order) immediately followed by its agents — live for the current session,
-/// from the published cross-session state for the others. [`render`],
-/// [`render_thin`] and [`navigable_targets`] all derive from this, so a
+/// The unified, ordered sidebar list: every session (in [`ordered_sessions`]
+/// order) as a dot-only overview row, followed by the *current* session's own
+/// agent rows. The two runs map onto the two stacked render sections — sessions
+/// up top, agents at the midpoint — while staying a single flat list so a
 /// selection index maps consistently across the full view, the rail, keypresses
-/// and clicks.
+/// and clicks. [`render`], [`render_thin`] and [`navigable_targets`] all derive
+/// from this.
 pub(crate) fn build_rows(
     panes: &PaneManifest,
     tabs: &[TabInfo],
@@ -345,17 +325,21 @@ pub(crate) fn build_rows(
     sessions: &[SessionInfo],
 ) -> Vec<Row> {
     let mut rows = Vec::new();
+    // Top section: the workspaces overview — one dot-only row per session, no
+    // per-agent rows. Cross-session agent detail is carried entirely by each
+    // session's rollup dot.
     for session in ordered_sessions(sessions) {
         rows.push(Row::Session {
             name: session.name.clone(),
             activity: session_activity(session, agents),
             is_current: session.is_current_session,
         });
-        let entries = if session.is_current_session {
-            build_entries(panes, tabs, agents, &session.name)
-        } else {
-            published_entries(session)
-        };
+    }
+    // Bottom section: the current session's own agents, one row each. Only the
+    // current session's panes are observable from here, so this is the live
+    // detail view for the workspace you're in.
+    if let Some(current) = sessions.iter().find(|s| s.is_current_session) {
+        let entries = build_entries(panes, tabs, agents, &current.name);
         rows.extend(entries.into_iter().map(Row::Agent));
     }
     rows
@@ -521,8 +505,10 @@ pub struct RenderInput<'a> {
     pub focused: bool,
     /// Unified selection cursor over sessions-then-agents.
     pub selected: usize,
-    /// Scroll offset into the agent list.
-    pub scroll: usize,
+    /// Scroll offset into the workspaces (sessions) section.
+    pub scroll_sessions: usize,
+    /// Scroll offset into the agents section.
+    pub scroll_agents: usize,
     pub spinner_tick: u32,
     pub rows: usize,
     pub cols: usize,
@@ -534,8 +520,10 @@ pub struct RenderOutput {
     pub ansi: String,
     /// Selection index after clamping to the target count.
     pub selected: usize,
-    /// Agent-list scroll offset after clamping / keeping the selection visible.
-    pub scroll: usize,
+    /// Workspaces-section scroll offset after clamping to keep the selection visible.
+    pub scroll_sessions: usize,
+    /// Agents-section scroll offset after clamping to keep the selection visible.
+    pub scroll_agents: usize,
     /// Click targets for the rows drawn this frame.
     pub click_map: Vec<ClickTarget>,
 }
@@ -570,7 +558,8 @@ pub fn render(input: RenderInput) -> RenderOutput {
         return RenderOutput {
             ansi: out,
             selected: 0,
-            scroll: 0,
+            scroll_sessions: 0,
+            scroll_agents: 0,
             click_map,
         };
     }
@@ -586,112 +575,222 @@ pub fn render(input: RenderInput) -> RenderOutput {
     // Match the thin rail's breathing room: keep RAIL_VPAD blank rows above and
     // below the content, so the full view and the rail line up at the same top
     // offset and neither sits flush against the pane edges.
-    let bottom_limit = rows.saturating_sub(RAIL_VPAD);
     let top = RAIL_VPAD.min(rows);
+    let bottom_limit = rows.saturating_sub(RAIL_VPAD);
+    // The agents header sits on the vertical midpoint so the split between the
+    // two sections stays put as sessions come and go. On a pane too short to
+    // hold both halves it collapses toward the bottom and the bodies empty out.
+    let mid = if bottom_limit > top + 1 {
+        (rows / 2).clamp(top + 1, bottom_limit)
+    } else {
+        bottom_limit
+    };
 
-    // ---- header ----
+    // Every session row sorts ahead of every agent row in `rows_data`, so the
+    // leading run of sessions is the top section and the rest are the agents.
+    let session_count = rows_data
+        .iter()
+        .take_while(|row| matches!(row, Row::Session { .. }))
+        .count();
+    let agent_count = rows_data.len() - session_count;
+
+    // ---- top section: workspaces overview ----
+    let sessions_body_start = top + 1;
+    let sessions_body_height = mid.saturating_sub(sessions_body_start);
+    let sessions_sel = (selected < session_count).then_some(selected);
+    let scroll_sessions = keep_visible(
+        input.scroll_sessions,
+        sessions_sel,
+        session_count,
+        sessions_body_height,
+    );
     if top < bottom_limit {
         render_row(&mut out, 0, top, cols, None, &[Span::new(" workspaces", p.muted).bold()]);
     }
-
-    let body_start = top + 1;
-    let body_height = bottom_limit.saturating_sub(body_start);
-
-    if rows_data.is_empty() {
-        if body_start < bottom_limit {
-            render_row(&mut out, 0, body_start, cols, None, &[Span::new(" (none)", p.muted).dim()]);
-        }
-        return RenderOutput {
-            ansi: out,
+    render_section(
+        &mut out,
+        &mut click_map,
+        SectionInput {
+            rows: &rows_data[..session_count],
+            index_offset: 0,
+            body_start: sessions_body_start,
+            body_height: sessions_body_height,
+            scroll: scroll_sessions,
             selected,
-            scroll: 0,
-            click_map,
-        };
-    }
+            focused: input.focused,
+            spinner_tick: input.spinner_tick,
+            cols,
+            p,
+        },
+    );
 
-    // One unified scrollable list (each session followed by its agents). Keep the
-    // selection within the visible window.
-    let total = rows_data.len();
-    let visible = body_height;
-    let mut scroll = input.scroll.min(total.saturating_sub(visible));
-    if selected < scroll {
-        scroll = selected;
-    } else if visible > 0 && selected >= scroll + visible {
-        scroll = selected + 1 - visible;
+    // ---- bottom section: current session's agents ----
+    let agents_body_start = mid + 1;
+    let agents_body_height = bottom_limit.saturating_sub(agents_body_start);
+    let agents_sel = (selected >= session_count).then(|| selected - session_count);
+    let scroll_agents = keep_visible(
+        input.scroll_agents,
+        agents_sel,
+        agent_count,
+        agents_body_height,
+    );
+    if mid < bottom_limit {
+        render_row(&mut out, 0, mid, cols, None, &[Span::new(" agents", p.muted).bold()]);
     }
-
-    let show_scrollbar = total > visible && body_height > 0;
-    let content_width = cols.saturating_sub(usize::from(show_scrollbar));
-
-    let mut row_y = body_start;
-    let body_bottom = body_start + body_height;
-    for (index, row) in rows_data.iter().enumerate().skip(scroll) {
-        if row_y >= body_bottom {
-            break;
-        }
-        // The cursor only shows while the sidebar is focused.
-        let cursor = index == selected && input.focused;
-        let row_bg = cursor.then_some(p.selection_bg);
-        match row {
-            Row::Session { name, activity, is_current } => {
-                let (dot, dot_color) = activity_dot(*activity, p);
-                // The current session stays emphasized regardless of the cursor.
-                let emphasized = cursor || *is_current;
-                let name_color = if emphasized { p.text } else { p.muted };
-                let label = truncate_text(name, content_width.saturating_sub(3));
-                let mut name_span = Span::new(label, name_color);
-                name_span = if emphasized { name_span.bold() } else { name_span.dim() };
-                render_row(
-                    &mut out,
-                    0,
-                    row_y,
-                    content_width,
-                    row_bg,
-                    &[
-                        Span::new(" ", p.text),
-                        Span::new(dot, dot_color),
-                        Span::new(" ", p.text),
-                        name_span,
-                    ],
-                );
-            },
-            Row::Agent(entry) => {
-                let (icon, icon_color) = agent_icon(entry.state, entry.seen, input.spinner_tick, p);
-                // The active (focused) pane stays emphasized regardless of cursor.
-                let emphasized = cursor || entry.is_active;
-                let name_color = if emphasized { p.text } else { p.muted };
-                // Indent agents one level under their session header.
-                let label = truncate_text(&entry.label, content_width.saturating_sub(5));
-                let mut name_span = Span::new(label, name_color);
-                name_span = if emphasized { name_span.bold() } else { name_span.dim() };
-                render_row(
-                    &mut out,
-                    0,
-                    row_y,
-                    content_width,
-                    row_bg,
-                    &[
-                        Span::new("   ", p.text),
-                        Span::new(icon, icon_color),
-                        Span::new(" ", p.text),
-                        name_span,
-                    ],
-                );
-            },
-        }
-        click_map.push(ClickTarget { row: row_y, index });
-        row_y += 1;
-    }
-
-    if show_scrollbar {
-        render_scrollbar(&mut out, cols.saturating_sub(1), body_start, body_height, total, visible, scroll, p);
-    }
+    render_section(
+        &mut out,
+        &mut click_map,
+        SectionInput {
+            rows: &rows_data[session_count..],
+            index_offset: session_count,
+            body_start: agents_body_start,
+            body_height: agents_body_height,
+            scroll: scroll_agents,
+            selected,
+            focused: input.focused,
+            spinner_tick: input.spinner_tick,
+            cols,
+            p,
+        },
+    );
 
     RenderOutput {
         ansi: out,
         selected,
-        scroll,
+        scroll_sessions,
+        scroll_agents,
         click_map,
+    }
+}
+
+/// Clamp a section's scroll offset, then — if its selection cursor lives in this
+/// section — nudge the offset so the selected row stays within the visible
+/// window. `selected` is the row's index *within the section* (None when the
+/// cursor is in the other section, so only the clamp applies).
+fn keep_visible(scroll: usize, selected: Option<usize>, total: usize, visible: usize) -> usize {
+    let mut scroll = scroll.min(total.saturating_sub(visible));
+    if let Some(sel) = selected {
+        if sel < scroll {
+            scroll = sel;
+        } else if visible > 0 && sel >= scroll + visible {
+            scroll = sel + 1 - visible;
+        }
+    }
+    scroll
+}
+
+/// Inputs to [`render_section`] — one stacked section's slice of rows and the
+/// geometry it draws into.
+struct SectionInput<'a> {
+    /// This section's rows (a contiguous slice of `rows_data`).
+    rows: &'a [Row],
+    /// Flat selection index of `rows[0]`: 0 for the sessions section, the
+    /// session count for the agents section. Added to each row's local index so
+    /// the cursor and click map line up with [`navigable_targets`].
+    index_offset: usize,
+    body_start: usize,
+    body_height: usize,
+    scroll: usize,
+    /// The global selection cursor (already clamped).
+    selected: usize,
+    focused: bool,
+    spinner_tick: u32,
+    cols: usize,
+    p: &'a Theme,
+}
+
+/// Render one stacked section's body: its rows from `scroll` down, an empty
+/// `(none)` line when it has none, and a scrollbar when they overflow.
+fn render_section(out: &mut String, click_map: &mut Vec<ClickTarget>, s: SectionInput) {
+    let p = s.p;
+    let total = s.rows.len();
+    let body_bottom = s.body_start + s.body_height;
+    let scrollbar = total > s.body_height && s.body_height > 0;
+    let content_width = s.cols.saturating_sub(usize::from(scrollbar));
+
+    if total == 0 {
+        if s.body_start < body_bottom {
+            render_row(out, 0, s.body_start, content_width, None, &[Span::new(" (none)", p.muted).dim()]);
+        }
+        return;
+    }
+
+    let mut row_y = s.body_start;
+    for (local, row) in s.rows.iter().enumerate().skip(s.scroll) {
+        if row_y >= body_bottom {
+            break;
+        }
+        let index = s.index_offset + local;
+        // The cursor only shows while the sidebar is focused.
+        let cursor = index == s.selected && s.focused;
+        draw_row(out, row, row_y, content_width, cursor, s.spinner_tick, p);
+        click_map.push(ClickTarget { row: row_y, index });
+        row_y += 1;
+    }
+
+    if scrollbar {
+        render_scrollbar(out, s.cols.saturating_sub(1), s.body_start, s.body_height, total, s.body_height, s.scroll, p);
+    }
+}
+
+/// Draw one sidebar row — a session overview dot or an agent state icon — at
+/// `row_y`. A current session and the focused agent pane stay emphasized even
+/// without the cursor; the selected row also gets the selection background.
+fn draw_row(
+    out: &mut String,
+    row: &Row,
+    row_y: usize,
+    content_width: usize,
+    cursor: bool,
+    spinner_tick: u32,
+    p: &Theme,
+) {
+    let row_bg = cursor.then_some(p.selection_bg);
+    match row {
+        Row::Session { name, activity, is_current } => {
+            let (dot, dot_color) = activity_dot(*activity, p);
+            let emphasized = cursor || *is_current;
+            let name_color = if emphasized { p.text } else { p.muted };
+            let label = truncate_text(name, content_width.saturating_sub(3));
+            let mut name_span = Span::new(label, name_color);
+            name_span = if emphasized { name_span.bold() } else { name_span.dim() };
+            render_row(
+                out,
+                0,
+                row_y,
+                content_width,
+                row_bg,
+                &[
+                    Span::new(" ", p.text),
+                    Span::new(dot, dot_color),
+                    Span::new(" ", p.text),
+                    name_span,
+                ],
+            );
+        },
+        Row::Agent(entry) => {
+            let (icon, icon_color) = agent_icon(entry.state, entry.seen, spinner_tick, p);
+            let emphasized = cursor || entry.is_active;
+            let name_color = if emphasized { p.text } else { p.muted };
+            // Agent icons align under the session dots (their own section now,
+            // not nested), so they share the session row's one-space indent.
+            let label = truncate_text(&entry.label, content_width.saturating_sub(3));
+            let mut name_span = Span::new(label, name_color);
+            name_span = if emphasized { name_span.bold() } else { name_span.dim() };
+            render_row(
+                out,
+                0,
+                row_y,
+                content_width,
+                row_bg,
+                &[
+                    Span::new(" ", p.text),
+                    Span::new(icon, icon_color),
+                    Span::new(" ", p.text),
+                    name_span,
+                ],
+            );
+        },
     }
 }
 
@@ -734,7 +833,9 @@ fn render_thin(
     let body_height = rows.saturating_sub(RAIL_VPAD * 2);
 
     // Scroll the rail so the selected glyph's row stays within the padded body.
-    let mut scroll = input.scroll.min(glyphs.len().saturating_sub(body_height.max(1)));
+    // The narrow rail keeps the sessions-then-agents glyphs as one flat column,
+    // so it reuses the sessions scroll offset and leaves the agents one as-is.
+    let mut scroll = input.scroll_sessions.min(glyphs.len().saturating_sub(body_height.max(1)));
     if selected < scroll {
         scroll = selected;
     } else if body_height > 0 && selected >= scroll + body_height {
@@ -772,7 +873,8 @@ fn render_thin(
     RenderOutput {
         ansi: out,
         selected,
-        scroll,
+        scroll_sessions: scroll,
+        scroll_agents: input.scroll_agents,
         click_map,
     }
 }

@@ -126,8 +126,10 @@ struct State {
     palette: Theme,
     /// Unified keyboard selection cursor over the sessions then the agents.
     selected: usize,
-    /// Scroll offset into the agent list.
-    scroll: usize,
+    /// Scroll offset into the workspaces (sessions) section.
+    scroll_sessions: usize,
+    /// Scroll offset into the agents section.
+    scroll_agents: usize,
     /// Spinner animation frame counter, advanced by the timer while working.
     spinner_tick: u32,
     /// Row → selection-index map from the last render, for mouse hit-testing.
@@ -390,13 +392,15 @@ impl ZellijPlugin for State {
             palette: &self.palette,
             focused: self.focused,
             selected: self.selected,
-            scroll: self.scroll,
+            scroll_sessions: self.scroll_sessions,
+            scroll_agents: self.scroll_agents,
             spinner_tick: self.spinner_tick,
             rows,
             cols,
         });
         self.selected = output.selected;
-        self.scroll = output.scroll;
+        self.scroll_sessions = output.scroll_sessions;
+        self.scroll_agents = output.scroll_agents;
         self.click_map = output.click_map;
         print!("{}", output.ansi);
     }
