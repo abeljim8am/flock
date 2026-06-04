@@ -1779,6 +1779,19 @@ pub fn resize_pane_with_id(resize_strategy: ResizeStrategy, pane_id: PaneId) {
     unsafe { host_run_plugin_command() };
 }
 
+/// Set the specified pane's width to an exact column count. Unlike
+/// [`resize_pane_with_id`], which steps by a screen-relative percentage and
+/// won't shrink a percent-sized pane below 5% of the screen, this makes the
+/// pane fixed-width at exactly `width` columns; sibling panes reflow to fill the
+/// remaining space. Useful for a docked rail that must stay a few columns wide
+/// regardless of how wide the terminal is.
+pub fn resize_pane_id_to_fixed_width(pane_id: PaneId, width: u32) {
+    let plugin_command = PluginCommand::ResizePaneIdToFixedWidth(pane_id, width);
+    let protobuf_plugin_command: ProtobufPluginCommand = plugin_command.try_into().unwrap();
+    object_to_stdout(&protobuf_plugin_command.encode_to_vec());
+    unsafe { host_run_plugin_command() };
+}
+
 /// Changes the focus to the pane with the specified id, unsuppressing it if it was suppressed and switching to its tab and layer (eg. floating/tiled).
 pub fn focus_pane_with_id(
     pane_id: PaneId,

@@ -472,7 +472,7 @@ impl State {
         } else {
             SIDEBAR_SLIM_COLS
         };
-        self.resize_toward(target, current, total);
+        self.set_width(target);
     }
 
     /// Once we know the real layout geometry, resize the sidebar to its default
@@ -495,30 +495,17 @@ impl State {
         // Cap to half the tab on small terminals so the sidebar never crowds out
         // the content — matching the expand branch of `toggle_width`.
         let target = SIDEBAR_EXPANDED_COLS.min(total / 2).max(WIDTH_EXPAND_THRESHOLD);
-        if target != current {
-            self.resize_toward(target, current, total);
-        }
+        self.set_width(target);
     }
 
-    /// Resize our own pane toward `target` columns, given the sidebar's
-    /// `current` width and the tab `total`. Each resize step is ~5% of the tab
-    /// width; the column delta is converted into a step count so we land near
-    /// the target. At least one step so a toggle always moves.
-    fn resize_toward(&self, target: usize, current: usize, total: usize) {
+    /// Set our own pane to an exact `target` column width. Uses the fixed-width
+    /// resize so the sidebar lands on precisely `target` columns on any screen —
+    /// the increment resize can't do this, as it steps by ~5% of the screen and
+    /// won't shrink a percent-sized pane below 5% of the screen width (which is
+    /// many columns on an ultrawide, leaving the slim rail far too wide).
+    fn set_width(&self, target: usize) {
         let own = PaneId::Plugin(self.own_plugin_id);
-        let expanding = target > current;
-        let step_cols = ((total as f64) * 0.05).max(1.0);
-        let delta = (target as i64 - current as i64).unsigned_abs() as f64;
-        let steps = ((delta / step_cols).round() as usize).max(1);
-        let resize = if expanding {
-            Resize::Increase
-        } else {
-            Resize::Decrease
-        };
-        let strategy = ResizeStrategy::new(resize, Some(Direction::Right));
-        for _ in 0..steps {
-            resize_pane_with_id(strategy, own);
-        }
+        resize_pane_id_to_fixed_width(own, target as u32);
     }
 
     /// The sidebar's current width and the active tab's total width (cols), read

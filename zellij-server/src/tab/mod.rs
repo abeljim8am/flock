@@ -5665,6 +5665,21 @@ impl Tab {
         }
         Ok(())
     }
+    pub fn resize_pane_id_to_fixed_width(&mut self, pane_id: PaneId, width: usize) -> Result<()> {
+        // Only tiled panes have a meaningful split width to fix; floating /
+        // suppressed panes are positioned independently, so this is a no-op for
+        // them (the docked rail this serves is always tiled).
+        if self.tiled_panes.panes_contain(&pane_id) {
+            if self.tiled_panes.set_pane_fixed_width(pane_id, width) {
+                // Like a regular resize, the split boundary moved: force a clean
+                // redraw so cells vacated by the shrunk pane are cleared.
+                self.swap_layouts.set_is_tiled_damaged();
+                self.set_force_render();
+                self.set_should_clear_display_before_rendering();
+            }
+        }
+        Ok(())
+    }
     pub fn update_theme(&mut self, theme: Styling) {
         self.style.colors = theme;
         // The tab's `default_mode_info` is what `update_input_modes`

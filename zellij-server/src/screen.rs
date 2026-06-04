@@ -748,6 +748,7 @@ pub enum ScreenInstruction {
     },
     RerunCommandPane(u32, Option<NotificationEnd>), // u32 - terminal pane id
     ResizePaneWithId(ResizeStrategy, PaneId),
+    ResizePaneIdToFixedWidth(PaneId, usize), // usize - target width in columns
     EditScrollbackForPaneWithId(PaneId, Option<NotificationEnd>),
     WriteToPaneId(Vec<u8>, PaneId, Option<NotificationEnd>),
     Paste(Vec<u8>, Option<PaneId>, ClientId, Option<NotificationEnd>),
@@ -1085,6 +1086,9 @@ impl From<&ScreenInstruction> for ScreenContext {
             ScreenInstruction::Reconfigure { .. } => ScreenContext::Reconfigure,
             ScreenInstruction::RerunCommandPane { .. } => ScreenContext::RerunCommandPane,
             ScreenInstruction::ResizePaneWithId(..) => ScreenContext::ResizePaneWithId,
+            ScreenInstruction::ResizePaneIdToFixedWidth(..) => {
+                ScreenContext::ResizePaneIdToFixedWidth
+            },
             ScreenInstruction::EditScrollbackForPaneWithId(..) => {
                 ScreenContext::EditScrollbackForPaneWithId
             },
@@ -4075,6 +4079,22 @@ impl Screen {
         }
         if !found {
             log::error!("Failed to find pane with id: {:?} to resize", pane_id);
+        }
+    }
+    pub fn resize_pane_id_to_fixed_width(&mut self, pane_id: PaneId, width: usize) {
+        let mut found = false;
+        for tab in self.tabs.values_mut() {
+            if tab.has_pane_with_pid(&pane_id) {
+                tab.resize_pane_id_to_fixed_width(pane_id, width).non_fatal();
+                found = true;
+                break;
+            }
+        }
+        if !found {
+            log::error!(
+                "Failed to find pane with id: {:?} to set fixed width",
+                pane_id
+            );
         }
     }
     pub fn break_pane(
@@ -8810,6 +8830,12 @@ pub(crate) fn screen_thread_main(
             },
             ScreenInstruction::ResizePaneWithId(resize, pane_id) => {
                 screen.resize_pane_with_id(resize, pane_id);
+                // Repaint so the resize is reflected and a shrunk pane's vacated
+                // cells are cleared rather than left as garbage.
+                screen.render(None)?;
+            },
+            ScreenInstruction::ResizePaneIdToFixedWidth(pane_id, width) => {
+                screen.resize_pane_id_to_fixed_width(pane_id, width);
                 // Repaint so the resize is reflected and a shrunk pane's vacated
                 // cells are cleared rather than left as garbage.
                 screen.render(None)?;

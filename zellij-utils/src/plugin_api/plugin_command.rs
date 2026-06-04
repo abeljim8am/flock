@@ -112,7 +112,8 @@ pub use super::generated_api::api::{
         RegexHighlight as ProtobufRegexHighlight, ReloadPluginPayload, RenameLayoutPayload,
         RenameLayoutResponse as ProtobufRenameLayoutResponse, RenameTabWithIdPayload,
         RenameWebLoginTokenPayload, RenameWebTokenResponse, ReplacePaneWithExistingPanePayload,
-        RequestPluginPermissionPayload, RerunCommandPanePayload, ResizePaneIdWithDirectionPayload,
+        RequestPluginPermissionPayload, RerunCommandPanePayload, ResizePaneIdToFixedWidthPayload,
+        ResizePaneIdWithDirectionPayload,
         ResizePayload, RevokeAllWebTokensResponse, RevokeTokenResponse, RevokeWebLoginTokenPayload,
         RunActionPayload, RunCommandPayload, RunningCommand as ProtobufRunningCommand,
         SaveLayoutPayload, SaveLayoutResponse as ProtobufSaveLayoutResponse, SaveSessionPayload,
@@ -1573,6 +1574,16 @@ impl TryFrom<ProtobufPluginCommand> for PluginCommand {
                     }
                 },
                 _ => Err("Mismatched payload for Resize"),
+            },
+            Some(CommandName::ResizePaneIdToFixedWidth) => match protobuf_plugin_command.payload {
+                Some(Payload::ResizePaneIdToFixedWidthPayload(payload)) => match payload.pane_id {
+                    Some(pane_id) => Ok(PluginCommand::ResizePaneIdToFixedWidth(
+                        pane_id.try_into()?,
+                        payload.width,
+                    )),
+                    _ => Err("Malformed resize_pane_id_to_fixed_width payload"),
+                },
+                _ => Err("Mismatched payload for ResizePaneIdToFixedWidth"),
             },
             Some(CommandName::EditScrollbackForPaneWithId) => match protobuf_plugin_command.payload
             {
@@ -3431,6 +3442,17 @@ impl TryFrom<PluginCommand> for ProtobufPluginCommand {
                         ResizePaneIdWithDirectionPayload {
                             resize: Some(resize.try_into()?),
                             pane_id: Some(pane_id.try_into()?),
+                        },
+                    )),
+                })
+            },
+            PluginCommand::ResizePaneIdToFixedWidth(pane_id, width) => {
+                Ok(ProtobufPluginCommand {
+                    name: CommandName::ResizePaneIdToFixedWidth as i32,
+                    payload: Some(Payload::ResizePaneIdToFixedWidthPayload(
+                        ResizePaneIdToFixedWidthPayload {
+                            pane_id: Some(pane_id.try_into()?),
+                            width,
                         },
                     )),
                 })

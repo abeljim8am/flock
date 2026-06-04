@@ -24,7 +24,7 @@ use zellij_utils::{
         command::RunCommand,
         layout::{Run, RunPluginOrAlias, SplitDirection},
     },
-    pane_size::{Offset, PaneGeom, Size, SizeInPixels, Viewport},
+    pane_size::{Dimension, Offset, PaneGeom, Size, SizeInPixels, Viewport},
 };
 
 use std::{
@@ -1783,6 +1783,38 @@ impl TiledPanes {
         }
         self.reset_boundaries();
         Ok(pane_size_changed)
+    }
+
+    /// Set a pane's width to an exact column count. The pane's `cols` constraint
+    /// becomes `Fixed(width)` and the layout is recomputed, so the solver gives
+    /// it exactly `width` columns and flexible siblings absorb the rest — the
+    /// same way a layout `size=N` pane is laid out. Unlike the increment-based
+    /// `resize_pane_with_id`, this is not bounded by the per-step / 5%-of-screen
+    /// floor, so a docked rail can be a few columns wide on any screen. Returns
+    /// whether the target pane was found.
+    pub fn set_pane_fixed_width(&mut self, pane_id: PaneId, width: usize) -> bool {
+        match self.panes.get_mut(&pane_id) {
+            Some(pane) => {
+                let mut geom = pane.position_and_size();
+                geom.cols = Dimension::fixed(width);
+                pane.set_geom(geom);
+            },
+            None => {
+                log::error!(
+                    "Failed to find pane with id: {:?} to set fixed width",
+                    pane_id
+                );
+                return false;
+            },
+        }
+        // Recompute the horizontal split so the now-fixed pane keeps `width` and
+        // the flexible sibling(s) reflow into the remaining columns.
+        self.relayout(SplitDirection::Horizontal);
+        for pane in self.panes.values_mut() {
+            resize_pty!(pane, self.os_api, self.senders, self.character_cell_size).unwrap();
+        }
+        self.reset_boundaries();
+        true
     }
 
     pub fn resize_pane_with_strategies(

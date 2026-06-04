@@ -3540,6 +3540,11 @@ pub enum PluginCommand {
     OpenCommandPaneBackground(CommandToRun, Context),
     RerunCommandPane(u32), // u32  - terminal pane id
     ResizePaneIdWithDirection(ResizeStrategy, PaneId),
+    /// Set a pane's width to an exact column count, bypassing the increment /
+    /// percent-floor resize (which can't shrink a percent-sized pane below 5% of
+    /// the screen). The pane becomes fixed-width and siblings reflow to fill the
+    /// rest, the same way a layout `size=N` pane is laid out. u32 -> target cols.
+    ResizePaneIdToFixedWidth(PaneId, u32),
     EditScrollbackForPaneWithId(PaneId),
     GetPaneScrollback {
         pane_id: PaneId,

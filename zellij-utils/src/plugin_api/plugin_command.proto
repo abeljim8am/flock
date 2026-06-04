@@ -208,6 +208,7 @@ enum CommandName {
   DeleteDeadSessionAndReply = 213;
   DeleteAllDeadSessionsAndReply = 214;
   PublishAgentState = 215;
+  ResizePaneIdToFixedWidth = 216;
 }
 
 message PluginCommand {
@@ -363,11 +364,17 @@ message PluginCommand {
     KillSessionsPayload kill_sessions_and_reply_payload = 162;
     string delete_dead_session_and_reply_payload = 163;
     PublishAgentStatePayload publish_agent_state_payload = 164;
+    ResizePaneIdToFixedWidthPayload resize_pane_id_to_fixed_width_payload = 165;
   }
 }
 
 message PublishAgentStatePayload {
   repeated PaneAgentStatus agent_states = 1;
+}
+
+message ResizePaneIdToFixedWidthPayload {
+  PaneId pane_id = 1;
+  uint32 width = 2;
 }
 
 message PaneAgentStatus {
