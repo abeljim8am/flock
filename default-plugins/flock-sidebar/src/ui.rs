@@ -844,10 +844,8 @@ fn draw_row(
 }
 
 /// Render the compact icon rail used when the pane is too narrow for labels: a
-/// centered vertical column of glyphs — one per [`build_rows`] entry, a session's
-/// activity dot or an agent's state icon — sharing the full view's selection
-/// index space so keyboard and mouse handling are unchanged. Working agents
-/// still animate; the selected glyph gets the selection background.
+/// centered vertical column of session activity dots. Agent detail stays in the
+/// expanded view; mini mode is a workspace overview only.
 fn render_thin(
     mut out: String,
     input: &RenderInput,
@@ -866,13 +864,19 @@ fn render_thin(
     let divider_x = cols.saturating_sub(1 + RAIL_HPAD);
     let rail_width = divider_x.max(1);
 
-    // One glyph per row, in the same order (and selection index) as the full
-    // view and `navigable_targets`.
+    // One glyph per session row. Sessions are the leading run in `rows_data`, so
+    // their local indices are still the same selection indices used by targets.
+    let session_count = rows_data
+        .iter()
+        .take_while(|row| matches!(row, Row::Session { .. }))
+        .count();
+    let selected = clamp_selection(selected, session_count);
     let glyphs: Vec<(&'static str, PaletteColor)> = rows_data
         .iter()
+        .take(session_count)
         .map(|row| match row {
             Row::Session { activity, .. } => activity_dot(*activity, p),
-            Row::Agent(entry) => agent_icon(entry.state, entry.seen, input.spinner_tick, p),
+            Row::Agent(_) => unreachable!("agent rows are outside the sessions prefix"),
         })
         .collect();
 
@@ -881,9 +885,7 @@ fn render_thin(
     let top = RAIL_VPAD.min(rows);
     let body_height = rows.saturating_sub(RAIL_VPAD * 2);
 
-    // Scroll the rail so the selected glyph's row stays within the padded body.
-    // The narrow rail keeps the sessions-then-agents glyphs as one flat column,
-    // so it reuses the sessions scroll offset and leaves the agents one as-is.
+    // Scroll the rail so the selected session glyph stays within the padded body.
     let mut scroll = input.scroll_sessions.min(glyphs.len().saturating_sub(body_height.max(1)));
     if selected < scroll {
         scroll = selected;
@@ -1077,6 +1079,57 @@ mod tests {
         assert!(!output.ansi.contains("workspaces"));
         assert!(!output.ansi.contains("workspace-a"));
         assert!(output.click_map.iter().any(|hit| hit.index == 0));
+    }
+
+    #[test]
+    fn closed_sidebar_mode_renders_only_session_indicators() {
+        use crate::detect::Agent;
+
+        let panes = PaneManifest {
+            panes: std::collections::HashMap::from([(
+                0,
+                vec![zellij_tile::prelude::PaneInfo {
+                    id: 7,
+                    is_plugin: false,
+                    ..Default::default()
+                }],
+            )]),
+        };
+        let tabs = vec![TabInfo {
+            position: 0,
+            active: true,
+            ..Default::default()
+        }];
+        let mut agents = BTreeMap::new();
+        agents.insert(
+            PaneId::Terminal(7),
+            agent_pane(Agent::Codex, AgentState::Working, true),
+        );
+        let mut current_session = sess("workspace-a", "/home/u/proj");
+        current_session.is_current_session = true;
+        let sessions = vec![current_session];
+        let palette = Theme::default();
+
+        let output = render(RenderInput {
+            permissions_granted: true,
+            panes: &panes,
+            tabs: &tabs,
+            agents: &agents,
+            sessions: &sessions,
+            palette: &palette,
+            sidebar_mode: SidebarMode::Closed,
+            focused: false,
+            selected: 1,
+            scroll_sessions: 0,
+            scroll_agents: 0,
+            spinner_tick: 0,
+            rows: 8,
+            cols: 40,
+        });
+
+        assert_eq!(output.selected, 0);
+        assert_eq!(output.click_map.len(), 1);
+        assert_eq!(output.click_map[0].index, 0);
     }
 
     #[test]
