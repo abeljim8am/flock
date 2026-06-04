@@ -5670,10 +5670,17 @@ impl Tab {
         // suppressed panes are positioned independently, so this is a no-op for
         // them (the docked rail this serves is always tiled).
         if self.tiled_panes.panes_contain(&pane_id) {
+            let pane_is_selectable = self
+                .tiled_panes
+                .get_pane(pane_id)
+                .map(|pane| pane.selectable())
+                .unwrap_or(true);
             if self.tiled_panes.set_pane_fixed_width(pane_id, width) {
                 // Like a regular resize, the split boundary moved: force a clean
                 // redraw so cells vacated by the shrunk pane are cleared.
-                self.swap_layouts.set_is_tiled_damaged();
+                if pane_is_selectable {
+                    self.swap_layouts.set_is_tiled_damaged();
+                }
                 self.set_force_render();
                 self.set_should_clear_display_before_rendering();
             }

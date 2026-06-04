@@ -35,7 +35,7 @@ use std::collections::BTreeMap;
 
 use unicode_width::UnicodeWidthStr;
 use zellij_tile::prelude::{
-    AgentRunState, FlockSidebarMode, PaneAgentStatus, PaneId, PaneManifest, PaletteColor,
+    AgentRunState, FlockSidebarMode, PaletteColor, PaneAgentStatus, PaneId, PaneManifest,
     SessionInfo, TabInfo,
 };
 
@@ -330,7 +330,9 @@ pub fn build_entries(
             if !st.is_agent() {
                 continue;
             }
-            let agent_label = st.effective_agent_label().unwrap_or_else(|| "?".to_string());
+            let agent_label = st
+                .effective_agent_label()
+                .unwrap_or_else(|| "?".to_string());
             let label = if multi_tab {
                 let tab = tab_name
                     .get(tab_idx)
@@ -621,6 +623,8 @@ pub fn render(input: RenderInput) -> RenderOutput {
         return render_thin(out, &input, &rows_data, selected);
     }
 
+    let (content_cols, divider_x) = divider_geometry(cols);
+
     // Match the thin rail's breathing room: keep RAIL_VPAD blank rows above and
     // below the content, so the full view and the rail line up at the same top
     // offset and neither sits flush against the pane edges.
@@ -654,7 +658,14 @@ pub fn render(input: RenderInput) -> RenderOutput {
         sessions_body_height,
     );
     if top < bottom_limit {
-        render_row(&mut out, 0, top, cols, None, &[Span::new(" workspaces", p.muted).bold()]);
+        render_row(
+            &mut out,
+            0,
+            top,
+            content_cols,
+            None,
+            &[Span::new(" workspaces", p.muted).bold()],
+        );
     }
     render_section(
         &mut out,
@@ -668,7 +679,7 @@ pub fn render(input: RenderInput) -> RenderOutput {
             selected,
             focused: input.focused,
             spinner_tick: input.spinner_tick,
-            cols,
+            cols: content_cols,
             p,
         },
     );
@@ -684,7 +695,14 @@ pub fn render(input: RenderInput) -> RenderOutput {
         agents_body_height,
     );
     if mid < bottom_limit {
-        render_row(&mut out, 0, mid, cols, None, &[Span::new(" agents", p.muted).bold()]);
+        render_row(
+            &mut out,
+            0,
+            mid,
+            content_cols,
+            None,
+            &[Span::new(" agents", p.muted).bold()],
+        );
     }
     render_section(
         &mut out,
@@ -698,10 +716,11 @@ pub fn render(input: RenderInput) -> RenderOutput {
             selected,
             focused: input.focused,
             spinner_tick: input.spinner_tick,
-            cols,
+            cols: content_cols,
             p,
         },
     );
+    render_divider(&mut out, divider_x, rows, p);
 
     RenderOutput {
         ansi: out,
@@ -759,7 +778,14 @@ fn render_section(out: &mut String, click_map: &mut Vec<ClickTarget>, s: Section
 
     if total == 0 {
         if s.body_start < body_bottom {
-            render_row(out, 0, s.body_start, content_width, None, &[Span::new(" (none)", p.muted).dim()]);
+            render_row(
+                out,
+                0,
+                s.body_start,
+                content_width,
+                None,
+                &[Span::new(" (none)", p.muted).dim()],
+            );
         }
         return;
     }
@@ -778,7 +804,16 @@ fn render_section(out: &mut String, click_map: &mut Vec<ClickTarget>, s: Section
     }
 
     if scrollbar {
-        render_scrollbar(out, s.cols.saturating_sub(1), s.body_start, s.body_height, total, s.body_height, s.scroll, p);
+        render_scrollbar(
+            out,
+            s.cols.saturating_sub(1),
+            s.body_start,
+            s.body_height,
+            total,
+            s.body_height,
+            s.scroll,
+            p,
+        );
     }
 }
 
@@ -796,13 +831,21 @@ fn draw_row(
 ) {
     let row_bg = cursor.then_some(p.selection_bg);
     match row {
-        Row::Session { name, activity, is_current } => {
+        Row::Session {
+            name,
+            activity,
+            is_current,
+        } => {
             let (dot, dot_color) = activity_dot(*activity, p);
             let emphasized = cursor || *is_current;
             let name_color = if emphasized { p.text } else { p.muted };
             let label = truncate_text(name, content_width.saturating_sub(3));
             let mut name_span = Span::new(label, name_color);
-            name_span = if emphasized { name_span.bold() } else { name_span.dim() };
+            name_span = if emphasized {
+                name_span.bold()
+            } else {
+                name_span.dim()
+            };
             render_row(
                 out,
                 0,
@@ -825,7 +868,11 @@ fn draw_row(
             // not nested), so they share the session row's one-space indent.
             let label = truncate_text(&entry.label, content_width.saturating_sub(3));
             let mut name_span = Span::new(label, name_color);
-            name_span = if emphasized { name_span.bold() } else { name_span.dim() };
+            name_span = if emphasized {
+                name_span.bold()
+            } else {
+                name_span.dim()
+            };
             render_row(
                 out,
                 0,
@@ -861,8 +908,7 @@ fn render_thin(
     // `RAIL_HPAD` columns in from the right edge so it gets a little breathing
     // room from the content pane rather than butting against it; the glyph lives
     // in the columns to its left.
-    let divider_x = cols.saturating_sub(1 + RAIL_HPAD);
-    let rail_width = divider_x.max(1);
+    let (rail_width, divider_x) = divider_geometry(cols);
 
     // One glyph per session row. Sessions are the leading run in `rows_data`, so
     // their local indices are still the same selection indices used by targets.
@@ -886,7 +932,9 @@ fn render_thin(
     let body_height = rows.saturating_sub(RAIL_VPAD * 2);
 
     // Scroll the rail so the selected session glyph stays within the padded body.
-    let mut scroll = input.scroll_sessions.min(glyphs.len().saturating_sub(body_height.max(1)));
+    let mut scroll = input
+        .scroll_sessions
+        .min(glyphs.len().saturating_sub(body_height.max(1)));
     if selected < scroll {
         scroll = selected;
     } else if body_height > 0 && selected >= scroll + body_height {
@@ -912,14 +960,7 @@ fn render_thin(
         click_map.push(ClickTarget { row: y, index });
     }
 
-    // A continuous vertical divider down the right edge (inset by RAIL_HPAD),
-    // drawn over every row (including the top/bottom padding) so it reads as one
-    // clean line. Skipped if the strip is too narrow to hold a glyph beside it.
-    if divider_x >= 1 {
-        for y in 0..rows {
-            render_row(&mut out, divider_x, y, 1, None, &[Span::new("│", p.separator).dim()]);
-        }
-    }
+    render_divider(&mut out, divider_x, rows, p);
 
     RenderOutput {
         ansi: out,
@@ -927,6 +968,28 @@ fn render_thin(
         scroll_sessions: scroll,
         scroll_agents: input.scroll_agents,
         click_map,
+    }
+}
+
+fn divider_geometry(cols: usize) -> (usize, usize) {
+    let divider_x = cols.saturating_sub(1 + RAIL_HPAD);
+    (divider_x.max(1), divider_x)
+}
+
+/// Draw a continuous vertical divider down the right edge, inset by
+/// [`RAIL_HPAD`] so it has breathing room from the content pane beside it.
+fn render_divider(out: &mut String, divider_x: usize, rows: usize, p: &Theme) {
+    if divider_x >= 1 {
+        for y in 0..rows {
+            render_row(
+                out,
+                divider_x,
+                y,
+                1,
+                None,
+                &[Span::new("│", p.separator).dim()],
+            );
+        }
     }
 }
 
@@ -963,7 +1026,11 @@ fn render_scrollbar(
 
     for i in 0..body_height {
         let is_thumb = i >= thumb_top && i < thumb_top + thumb_len;
-        let (symbol, color) = if is_thumb { ("▐", p.accent) } else { ("▕", p.separator) };
+        let (symbol, color) = if is_thumb {
+            ("▐", p.accent)
+        } else {
+            ("▕", p.separator)
+        };
         let mut span = Span::new(symbol, color);
         if !is_thumb {
             // The track stays subtle; only the thumb is full-strength accent.
@@ -1082,6 +1149,34 @@ mod tests {
     }
 
     #[test]
+    fn open_sidebar_mode_draws_divider() {
+        let panes = PaneManifest::default();
+        let tabs = Vec::new();
+        let agents = BTreeMap::new();
+        let sessions = vec![sess("workspace-a", "/home/u/proj")];
+        let palette = Theme::default();
+
+        let output = render(RenderInput {
+            permissions_granted: true,
+            panes: &panes,
+            tabs: &tabs,
+            agents: &agents,
+            sessions: &sessions,
+            palette: &palette,
+            sidebar_mode: SidebarMode::Open,
+            focused: false,
+            selected: 0,
+            scroll_sessions: 0,
+            scroll_agents: 0,
+            spinner_tick: 0,
+            rows: 8,
+            cols: 40,
+        });
+
+        assert!(output.ansi.contains("│"));
+    }
+
+    #[test]
     fn closed_sidebar_mode_renders_only_session_indicators() {
         use crate::detect::Agent;
 
@@ -1139,12 +1234,7 @@ mod tests {
             sess("c", ""),
             sess("d", "/home/u/other"),
         ];
-        let targets = navigable_targets(
-            &PaneManifest::default(),
-            &[],
-            &BTreeMap::new(),
-            &sessions,
-        );
+        let targets = navigable_targets(&PaneManifest::default(), &[], &BTreeMap::new(), &sessions);
         assert_eq!(
             targets,
             vec![
@@ -1190,7 +1280,10 @@ mod tests {
             PaneId::Terminal(3),
             agent_pane(Agent::Pi, AgentState::Idle, false),
         );
-        assert_eq!(current_session_activity(&agents), SessionActivity::DoneUnseen);
+        assert_eq!(
+            current_session_activity(&agents),
+            SessionActivity::DoneUnseen
+        );
 
         // Add a blocked agent → Blocked wins over everything.
         agents.insert(
@@ -1217,18 +1310,27 @@ mod tests {
 
         // An idle, seen agent → Stopped.
         states.insert(PaneId::Terminal(1), status(AgentRunState::Idle, true));
-        assert_eq!(session_activity_from_states(&states), SessionActivity::Stopped);
+        assert_eq!(
+            session_activity_from_states(&states),
+            SessionActivity::Stopped
+        );
 
         // A working agent in another session → Running (detectable now that the
         // state crosses the bus).
         states.insert(PaneId::Terminal(2), status(AgentRunState::Working, true));
-        assert_eq!(session_activity_from_states(&states), SessionActivity::Running);
+        assert_eq!(
+            session_activity_from_states(&states),
+            SessionActivity::Running
+        );
 
         // A blocked agent in another session → Blocked wins, so a workspace
         // waiting on the user shows its red ◉ here. This is the cross-session
         // win the richer rollup unlocks.
         states.insert(PaneId::Terminal(3), status(AgentRunState::Blocked, false));
-        assert_eq!(session_activity_from_states(&states), SessionActivity::Blocked);
+        assert_eq!(
+            session_activity_from_states(&states),
+            SessionActivity::Blocked
+        );
     }
 
     #[test]

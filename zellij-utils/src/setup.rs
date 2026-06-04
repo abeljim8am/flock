@@ -114,6 +114,18 @@ pub const WELCOME_LAYOUT: &[u8] = include_bytes!(concat!(
     "assets/layouts/welcome.kdl"
 ));
 
+pub const FLOCK_LAYOUT: &[u8] = include_bytes!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/",
+    "assets/layouts/flock.kdl"
+));
+
+pub const FLOCK_SWAP_LAYOUT: &[u8] = include_bytes!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/",
+    "assets/layouts/flock.swap.kdl"
+));
+
 pub const FLOCK_SELECTOR_LAYOUT: &[u8] = include_bytes!(concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/",
@@ -178,6 +190,7 @@ pub fn dump_specified_layout(layout: &str) -> std::io::Result<()> {
         "compact" => dump_asset(COMPACT_BAR_LAYOUT),
         "disable-status" => dump_asset(NO_STATUS_LAYOUT),
         "classic" => dump_asset(CLASSIC_LAYOUT),
+        "flock" => dump_asset(FLOCK_LAYOUT),
         "flock-selector" => dump_asset(FLOCK_SELECTOR_LAYOUT),
         custom => {
             info!("Dump {custom} layout");

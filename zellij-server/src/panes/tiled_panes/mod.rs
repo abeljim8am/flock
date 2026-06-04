@@ -1810,11 +1810,94 @@ impl TiledPanes {
         // Recompute the horizontal split so the now-fixed pane keeps `width` and
         // the flexible sibling(s) reflow into the remaining columns.
         self.relayout(SplitDirection::Horizontal);
+        self.normalize_flexible_widths_overlapping_pane(pane_id);
         for pane in self.panes.values_mut() {
             resize_pty!(pane, self.os_api, self.senders, self.character_cell_size).unwrap();
         }
         self.reset_boundaries();
         true
+    }
+
+    fn normalize_flexible_widths_overlapping_pane(&mut self, pane_id: PaneId) {
+        let Some(target_geom) = self
+            .panes
+            .get(&pane_id)
+            .map(|pane| pane.position_and_size())
+        else {
+            return;
+        };
+        let target_top = target_geom.y;
+        let target_bottom = target_geom.y + target_geom.rows.as_usize();
+        if target_top >= target_bottom {
+            return;
+        }
+
+        let display_cols = self.display_area.borrow().cols;
+        if display_cols == 0 {
+            return;
+        }
+
+        let mut edges = vec![target_top, target_bottom];
+        for pane in self.panes.values() {
+            let geom = pane.position_and_size();
+            let top = geom.y.max(target_top);
+            let bottom = (geom.y + geom.rows.as_usize()).min(target_bottom);
+            if top < bottom {
+                edges.push(top);
+                edges.push(bottom);
+            }
+        }
+        edges.sort_unstable();
+        edges.dedup();
+
+        let mut percent_updates = vec![];
+        for boundary in edges.windows(2) {
+            let boundary_top = boundary[0];
+            let boundary_bottom = boundary[1];
+            if boundary_top >= boundary_bottom {
+                continue;
+            }
+
+            let panes_in_boundary: Vec<_> = self
+                .panes
+                .iter()
+                .filter(|(_, pane)| {
+                    let geom = pane.position_and_size();
+                    geom.y <= boundary_top
+                        && geom.y + geom.rows.as_usize() >= boundary_bottom
+                        && !self.panes_to_hide.contains(&pane.pid())
+                })
+                .collect();
+            let fixed_cols: usize = panes_in_boundary
+                .iter()
+                .filter_map(|(_, pane)| {
+                    let geom = pane.position_and_size();
+                    geom.cols.is_fixed().then_some(geom.cols.as_usize())
+                })
+                .sum();
+            let flex_cols = display_cols.saturating_sub(fixed_cols);
+            if flex_cols == 0 {
+                continue;
+            }
+
+            for (pane_id, pane) in panes_in_boundary {
+                let geom = pane.position_and_size();
+                if !geom.cols.is_fixed() {
+                    let percent = (geom.cols.as_usize() as f64 / flex_cols as f64) * 100.0;
+                    percent_updates.push((*pane_id, percent));
+                }
+            }
+        }
+
+        percent_updates.sort_by_key(|(pane_id, _)| *pane_id);
+        percent_updates.dedup_by_key(|(pane_id, _)| *pane_id);
+        for (pane_id, percent) in percent_updates {
+            if let Some(pane) = self.panes.get_mut(&pane_id) {
+                let mut geom = pane.position_and_size();
+                geom.cols.set_percent(percent);
+                pane.set_geom(geom);
+            }
+        }
     }
 
     pub fn resize_pane_with_strategies(
