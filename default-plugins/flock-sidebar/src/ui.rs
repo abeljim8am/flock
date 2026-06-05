@@ -623,7 +623,8 @@ pub fn render(input: RenderInput) -> RenderOutput {
         return render_thin(out, &input, &rows_data, selected);
     }
 
-    let (content_cols, divider_x) = divider_geometry(cols);
+    let divider_x = cols.saturating_sub(1);
+    let content_cols = divider_x;
 
     // Match the thin rail's breathing room: keep RAIL_VPAD blank rows above and
     // below the content, so the full view and the rail line up at the same top
@@ -721,7 +722,6 @@ pub fn render(input: RenderInput) -> RenderOutput {
         },
     );
     render_divider(&mut out, divider_x, rows, p);
-
     RenderOutput {
         ansi: out,
         selected,
