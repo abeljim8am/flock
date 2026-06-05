@@ -166,7 +166,12 @@ fn session_activity(
     agents: &BTreeMap<PaneId, PaneAgentState>,
 ) -> SessionActivity {
     if session.is_current_session {
-        current_session_activity(agents)
+        let activity = current_session_activity(agents);
+        if activity == SessionActivity::None {
+            session_activity_from_states(&session.agent_states)
+        } else {
+            activity
+        }
     } else {
         let activity = session_activity_from_states(&session.agent_states);
         if activity == SessionActivity::None && session_agent_count(session) > 0 {
@@ -304,6 +309,7 @@ pub fn build_entries(
     panes: &PaneManifest,
     tabs: &[TabInfo],
     agents: &BTreeMap<PaneId, PaneAgentState>,
+    published_agent_states: &BTreeMap<PaneId, PaneAgentStatus>,
     session_name: &str,
 ) -> Vec<AgentEntry> {
     let multi_tab = tabs.len() > 1;
@@ -324,15 +330,32 @@ pub fn build_entries(
             } else {
                 PaneId::Terminal(pane.id)
             };
-            let Some(st) = agents.get(&pane_id) else {
+            let published_status = published_agent_states.get(&pane_id);
+            let live_state = agents.get(&pane_id);
+            let live_signal = live_state
+                .filter(|st| st.is_agent())
+                .map(|st| {
+                    (
+                        st.effective_agent_label().unwrap_or_else(|| "?".to_string()),
+                        st.state,
+                        st.seen,
+                    )
+                });
+            let published_signal = published_status.map(|status| {
+                (
+                    if status.label.is_empty() {
+                        "?".to_string()
+                    } else {
+                        status.label.clone()
+                    },
+                    run_state_to_agent_state(status.state),
+                    status.seen,
+                )
+            });
+            let Some((agent_label, state, seen)) = entry_signal(live_signal, published_signal)
+            else {
                 continue;
             };
-            if !st.is_agent() {
-                continue;
-            }
-            let agent_label = st
-                .effective_agent_label()
-                .unwrap_or_else(|| "?".to_string());
             let label = if multi_tab {
                 let tab = tab_name
                     .get(tab_idx)
@@ -347,8 +370,8 @@ pub fn build_entries(
             entries.push(AgentEntry {
                 pane_id,
                 label,
-                state: st.state,
-                seen: st.seen,
+                state,
+                seen,
                 is_active,
                 is_current: true,
                 session_name: session_name.to_string(),
@@ -356,6 +379,33 @@ pub fn build_entries(
         }
     }
     entries
+}
+
+fn entry_signal(
+    live: Option<(String, AgentState, bool)>,
+    published: Option<(String, AgentState, bool)>,
+) -> Option<(String, AgentState, bool)> {
+    match (live, published) {
+        (
+            Some((live_label, AgentState::Unknown, _)),
+            Some((published_label, published_state, published_seen)),
+        ) if published_state != AgentState::Unknown
+            && labels_compatible(&live_label, &published_label) =>
+        {
+            let label = if live_label == "?" {
+                published_label
+            } else {
+                live_label
+            };
+            Some((label, published_state, published_seen))
+        },
+        (Some(live), _) => Some(live),
+        (None, published) => published,
+    }
+}
+
+fn labels_compatible(live_label: &str, published_label: &str) -> bool {
+    live_label == "?" || published_label.is_empty() || live_label == published_label
 }
 
 /// The unified, ordered sidebar list: every session (in [`ordered_sessions`]
@@ -386,7 +436,7 @@ pub(crate) fn build_rows(
     // current session's panes are observable from here, so this is the live
     // detail view for the workspace you're in.
     if let Some(current) = sessions.iter().find(|s| s.is_current_session) {
-        let entries = build_entries(panes, tabs, agents, &current.name);
+        let entries = build_entries(panes, tabs, agents, &current.agent_states, &current.name);
         rows.extend(entries.into_iter().map(Row::Agent));
     }
     rows
@@ -1331,6 +1381,107 @@ mod tests {
             session_activity_from_states(&states),
             SessionActivity::Blocked
         );
+    }
+
+    #[test]
+    fn current_session_activity_falls_back_to_published_state() {
+        let agents: BTreeMap<PaneId, PaneAgentState> = BTreeMap::new();
+        let mut current_session = sess("workspace-a", "/home/u/proj");
+        current_session.is_current_session = true;
+        current_session.agent_states.insert(
+            PaneId::Terminal(7),
+            status(AgentRunState::Working, true),
+        );
+
+        assert_eq!(
+            session_activity(&current_session, &agents),
+            SessionActivity::Running
+        );
+    }
+
+    #[test]
+    fn current_session_entries_fall_back_to_published_state() {
+        let panes = PaneManifest {
+            panes: std::collections::HashMap::from([(
+                0,
+                vec![zellij_tile::prelude::PaneInfo {
+                    id: 7,
+                    is_plugin: false,
+                    ..Default::default()
+                }],
+            )]),
+        };
+        let tabs = vec![TabInfo {
+            position: 0,
+            active: true,
+            ..Default::default()
+        }];
+        let agents: BTreeMap<PaneId, PaneAgentState> = BTreeMap::new();
+        let mut current_session = sess("workspace-a", "/home/u/proj");
+        current_session.is_current_session = true;
+        current_session.agent_states.insert(
+            PaneId::Terminal(7),
+            PaneAgentStatus {
+                state: AgentRunState::Working,
+                label: "codex".to_owned(),
+                seen: true,
+            },
+        );
+
+        let rows = build_rows(&panes, &tabs, &agents, &[current_session]);
+        assert!(rows.iter().any(|row| matches!(
+            row,
+            Row::Agent(entry)
+                if entry.pane_id == PaneId::Terminal(7)
+                    && entry.label == "codex"
+                    && entry.state == AgentState::Working
+        )));
+    }
+
+    #[test]
+    fn current_session_entries_keep_published_idle_while_live_state_is_unknown() {
+        use crate::detect::Agent;
+
+        let panes = PaneManifest {
+            panes: std::collections::HashMap::from([(
+                0,
+                vec![zellij_tile::prelude::PaneInfo {
+                    id: 7,
+                    is_plugin: false,
+                    ..Default::default()
+                }],
+            )]),
+        };
+        let tabs = vec![TabInfo {
+            position: 0,
+            active: true,
+            ..Default::default()
+        }];
+        let mut agents: BTreeMap<PaneId, PaneAgentState> = BTreeMap::new();
+        agents.insert(
+            PaneId::Terminal(7),
+            agent_pane(Agent::Codex, AgentState::Unknown, true),
+        );
+        let mut current_session = sess("workspace-a", "/home/u/proj");
+        current_session.is_current_session = true;
+        current_session.agent_states.insert(
+            PaneId::Terminal(7),
+            PaneAgentStatus {
+                state: AgentRunState::Idle,
+                label: "codex".to_owned(),
+                seen: true,
+            },
+        );
+
+        let rows = build_rows(&panes, &tabs, &agents, &[current_session]);
+        assert!(rows.iter().any(|row| matches!(
+            row,
+            Row::Agent(entry)
+                if entry.pane_id == PaneId::Terminal(7)
+                    && entry.label == "codex"
+                    && entry.state == AgentState::Idle
+                    && entry.seen
+        )));
     }
 
     #[test]

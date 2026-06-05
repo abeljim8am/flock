@@ -72,6 +72,9 @@ const RENDER_REPORT_STALE_SECS: f64 = 1.5;
 /// cache from the live socket/session-metadata files so the workspace section
 /// contains every running session.
 const SESSION_REFRESH_SECS: f64 = 1.0;
+/// How often to reconcile pane command identity outside PaneUpdate. Session
+/// switches can leave the plugin rendering before a fresh command event arrives.
+const AGENT_COMMAND_SYNC_SECS: f64 = 1.0;
 
 /// Pipe message name (sent by a `MessagePlugin` keybind, e.g. Super b) that
 /// toggles the sidebar between its slim rail and an expanded width. We resize
@@ -112,6 +115,8 @@ struct State {
     /// Last time we explicitly refreshed the cross-session list via
     /// `get_session_list`.
     last_session_refresh: Option<Instant>,
+    /// Last time we reconciled pane ids with their foreground commands.
+    last_agent_command_sync: Option<Instant>,
     /// Per-pane agent detection + arbitrated state, keyed by pane id.
     agents: BTreeMap<PaneId, PaneAgentState>,
     /// The last per-pane agent status we published to the cross-session bus
@@ -230,9 +235,15 @@ impl ZellijPlugin for State {
                 should_render = true;
             },
             Event::PaneUpdate(manifest) => {
+                let now = Instant::now();
                 self.panes = manifest;
                 // Drop tracked state for panes that no longer exist.
                 self.prune_closed_panes();
+                // Re-seed agent identity from the live pane manifest / process
+                // table. When a client switches away and back, the previous
+                // CommandChanged event may not replay for an already-running
+                // agent, so this keeps the detail list from falling back to none.
+                self.sync_agents_from_manifest(now);
                 // A focus change here may clear a Done-unseen notification.
                 self.sync_focus();
                 // First time we see the real geometry, size to the default view.
@@ -281,6 +292,9 @@ impl ZellijPlugin for State {
                     if entry.tick(now) {
                         should_render = true;
                     }
+                }
+                if self.should_sync_agent_commands(now) {
+                    should_render |= self.sync_agents_from_manifest(now);
                 }
                 // When pushed render reports have gone stale — i.e. no client is
                 // attached because we've been switched away from — pull each
@@ -394,7 +408,7 @@ impl ZellijPlugin for State {
     fn render(&mut self, rows: usize, cols: usize) {
         self.rows = rows;
         self.cols = cols;
-        let sessions = self.visible_sessions();
+        let sessions = self.render_sessions();
 
         let output = ui::render(ui::RenderInput {
             permissions_granted: self.permissions_granted,
@@ -485,6 +499,13 @@ impl State {
                 .is_none_or(|last| now.duration_since(last).as_secs_f64() >= SESSION_REFRESH_SECS)
     }
 
+    fn should_sync_agent_commands(&self, now: Instant) -> bool {
+        self.permissions_granted
+            && self.last_agent_command_sync.is_none_or(|last| {
+                now.duration_since(last).as_secs_f64() >= AGENT_COMMAND_SYNC_SECS
+            })
+    }
+
     /// Ask the host for a fresh live-session snapshot. The host also feeds the
     /// result back into the server's `SessionUpdate` cache, but updating our
     /// local copy here avoids waiting for the round trip.
@@ -529,6 +550,37 @@ impl State {
             })
             .cloned()
             .collect()
+    }
+
+    /// The session list used for rendering, with this plugin's last published
+    /// state overlaid onto the current session. The cross-session snapshot can
+    /// lag a refresh behind after switching sessions; using the local publish
+    /// cache avoids a one-frame Unknown icon while screen detection catches up.
+    fn render_sessions(&self) -> Vec<SessionInfo> {
+        let mut sessions = self.visible_sessions();
+        self.overlay_last_published_agent_state(&mut sessions);
+        sessions
+    }
+
+    fn overlay_last_published_agent_state(&self, sessions: &mut [SessionInfo]) {
+        if self.last_published.is_empty() {
+            return;
+        }
+        let Some(current) = sessions.iter_mut().find(|session| session.is_current_session) else {
+            return;
+        };
+        for (pane_id, status) in &self.last_published {
+            if status.state == AgentRunState::Unknown {
+                continue;
+            }
+            let should_overlay = current.agent_states.get(pane_id).is_none_or(|current| {
+                current.state == AgentRunState::Unknown
+                    && labels_compatible(&current.label, &status.label)
+            });
+            if should_overlay {
+                current.agent_states.insert(*pane_id, status.clone());
+            }
+        }
     }
 
     /// Toggle the sidebar between its slim rail and an expanded width by
@@ -703,14 +755,7 @@ impl State {
             if !st.is_agent() {
                 continue;
             }
-            states.insert(
-                *pane_id,
-                PaneAgentStatus {
-                    state: to_run_state(st.state),
-                    label: st.effective_agent_label().unwrap_or_default(),
-                    seen: st.seen,
-                },
-            );
+            states.insert(*pane_id, self.status_to_publish(pane_id, st));
         }
         if states != self.last_published {
             self.last_published = states.clone();
@@ -732,6 +777,24 @@ impl State {
             self.last_published_sidebar_state = Some(state);
             publish_flock_sidebar_state(state);
         }
+    }
+
+    fn status_to_publish(&self, pane_id: &PaneId, st: &PaneAgentState) -> PaneAgentStatus {
+        let next = PaneAgentStatus {
+            state: to_run_state(st.state),
+            label: st.effective_agent_label().unwrap_or_default(),
+            seen: st.seen,
+        };
+        if next.state == AgentRunState::Unknown {
+            if let Some(previous) = self.last_published.get(pane_id) {
+                if previous.state != AgentRunState::Unknown
+                    && labels_compatible(&next.label, &previous.label)
+                {
+                    return previous.clone();
+                }
+            }
+        }
+        next
     }
 
     /// Push the current focus picture into each tracked pane's state: a pane is
@@ -768,6 +831,57 @@ impl State {
         self.focused = self_focused;
     }
 
+    /// Reconcile tracked agent identities with the panes currently present in
+    /// the manifest. `CommandChanged` remains the main live path, but it is not
+    /// replayed just because a client switches back to an existing session. This
+    /// pass lets an already-running agent reappear after reconnect/re-attach by
+    /// asking the host for the current foreground command, falling back to the
+    /// layout command stored in `PaneInfo`.
+    fn sync_agents_from_manifest(&mut self, now: Instant) -> bool {
+        if !self.permissions_granted {
+            return false;
+        }
+        self.last_agent_command_sync = Some(now);
+        let panes: Vec<(PaneId, Option<String>)> = self
+            .panes
+            .panes
+            .values()
+            .flatten()
+            .filter(|pane| !pane.is_plugin)
+            .map(|pane| (PaneId::Terminal(pane.id), pane.terminal_command.clone()))
+            .collect();
+
+        let mut changed = false;
+        for (pane_id, terminal_command) in panes {
+            let command = get_pane_running_command(pane_id)
+                .ok()
+                .filter(|command| !command.is_empty())
+                .or_else(|| {
+                    terminal_command
+                        .as_deref()
+                        .map(argv_from_terminal_command)
+                        .filter(|command| !command.is_empty())
+                });
+            let Some(command) = command else {
+                continue;
+            };
+            if self.seed_agent_command(pane_id, &command, now) {
+                changed = true;
+            }
+        }
+        changed
+    }
+
+    fn seed_agent_command(&mut self, pane_id: PaneId, command: &[String], now: Instant) -> bool {
+        let Some(agent) = identify_agent_from_command(command) else {
+            return false;
+        };
+        self.agents
+            .entry(pane_id)
+            .or_default()
+            .set_detected_agent(Some(agent), now)
+    }
+
     /// Remove tracked agent state for panes that are no longer in the manifest.
     fn prune_closed_panes(&mut self) {
         let live: HashSet<PaneId> = self
@@ -785,6 +899,14 @@ impl State {
             .collect();
         self.agents.retain(|pane_id, _| live.contains(pane_id));
     }
+}
+
+fn argv_from_terminal_command(command: &str) -> Vec<String> {
+    command.split_whitespace().map(String::from).collect()
+}
+
+fn labels_compatible(left: &str, right: &str) -> bool {
+    left.is_empty() || right.is_empty() || left == right
 }
 
 /// Map the plugin's internal agent state to the serializable, cross-session
@@ -859,5 +981,104 @@ fn strip_ansi_into(line: &str, out: &mut String) {
             },
             None => {},
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::detect::Agent;
+
+    #[test]
+    fn seed_agent_command_recreates_missing_agent_entry() {
+        let mut state = State::default();
+        let now = Instant::now();
+        let pane_id = PaneId::Terminal(7);
+        let command = vec!["/opt/homebrew/bin/codex".to_string()];
+
+        assert!(state.seed_agent_command(pane_id, &command, now));
+        assert_eq!(
+            state
+                .agents
+                .get(&pane_id)
+                .and_then(|pane| pane.detected_agent),
+            Some(Agent::Codex)
+        );
+    }
+
+    #[test]
+    fn seed_agent_command_does_not_clear_existing_agent_on_plain_shell_snapshot() {
+        let mut state = State::default();
+        let now = Instant::now();
+        let pane_id = PaneId::Terminal(7);
+        state.seed_agent_command(pane_id, &["codex".to_string()], now);
+
+        assert!(!state.seed_agent_command(pane_id, &["zsh".to_string()], now));
+        assert_eq!(
+            state
+                .agents
+                .get(&pane_id)
+                .and_then(|pane| pane.detected_agent),
+            Some(Agent::Codex)
+        );
+        assert!(state
+            .agents
+            .get(&pane_id)
+            .is_some_and(|pane| pane.is_agent()));
+    }
+
+    #[test]
+    fn terminal_command_string_can_seed_agent_identity() {
+        let argv =
+            argv_from_terminal_command("/opt/homebrew/bin/claude --dangerously-skip-permissions");
+
+        assert_eq!(identify_agent_from_command(&argv), Some(Agent::Claude));
+    }
+
+    #[test]
+    fn publish_preserves_previous_state_during_unknown_warmup() {
+        let mut state = State::default();
+        let pane_id = PaneId::Terminal(7);
+        state.last_published.insert(
+            pane_id,
+            PaneAgentStatus {
+                state: AgentRunState::Idle,
+                label: "codex".to_owned(),
+                seen: true,
+            },
+        );
+        let mut pane = PaneAgentState::new();
+        pane.detected_agent = Some(Agent::Codex);
+        pane.state = AgentState::Unknown;
+
+        let status = state.status_to_publish(&pane_id, &pane);
+
+        assert_eq!(status.state, AgentRunState::Idle);
+        assert_eq!(status.label, "codex");
+        assert!(status.seen);
+    }
+
+    #[test]
+    fn render_sessions_overlay_last_published_current_state() {
+        let mut state = State::default();
+        let pane_id = PaneId::Terminal(7);
+        let mut current = SessionInfo::new("workspace-a".to_string());
+        current.is_current_session = true;
+        state.sessions = vec![current];
+        state.last_published.insert(
+            pane_id,
+            PaneAgentStatus {
+                state: AgentRunState::Idle,
+                label: "codex".to_owned(),
+                seen: true,
+            },
+        );
+
+        let sessions = state.render_sessions();
+
+        assert_eq!(
+            sessions[0].agent_states.get(&pane_id).map(|status| status.state),
+            Some(AgentRunState::Idle)
+        );
     }
 }
