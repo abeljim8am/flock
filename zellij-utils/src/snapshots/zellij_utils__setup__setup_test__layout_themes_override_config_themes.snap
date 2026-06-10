@@ -4251,38 +4251,6 @@ Config {
                 bare_key: Char(
                     'f',
                 ),
-                key_modifiers: {},
-            }: [
-                LaunchOrFocusPlugin {
-                    plugin: RunPlugin(
-                        RunPlugin {
-                            _allow_exec_host_cmd: false,
-                            location: Zellij(
-                                PluginTag(
-                                    "flock-sidebar",
-                                ),
-                            ),
-                            configuration: PluginUserConfiguration(
-                                {},
-                            ),
-                            initial_cwd: None,
-                        },
-                    ),
-                    should_float: true,
-                    move_to_focused_tab: true,
-                    should_open_in_place: false,
-                    close_replaced_pane: false,
-                    skip_cache: false,
-                    tab_id: None,
-                },
-                SwitchToMode {
-                    input_mode: Normal,
-                },
-            ],
-            KeyWithModifier {
-                bare_key: Char(
-                    'f',
-                ),
                 key_modifiers: {
                     Alt,
                 },
