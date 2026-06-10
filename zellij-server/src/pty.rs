@@ -882,15 +882,13 @@ pub(crate) fn pty_thread_main(mut pty: Pty, layout: Box<Layout>) -> Result<()> {
                 pane_id,
                 response_channel,
             } => {
-                let response = pty.get_pane_running_command(pane_id);
-                let _ = response_channel.send(response);
+                pty.get_pane_running_command(pane_id, response_channel);
             },
             PtyInstruction::GetPaneCwd {
                 pane_id,
                 response_channel,
             } => {
-                let response = pty.get_pane_cwd(pane_id);
-                let _ = response_channel.send(response);
+                pty.get_pane_cwd(pane_id, response_channel);
             },
             PtyInstruction::UpdateAndReportCwds => {
                 pty.update_and_report_cwds();
@@ -2275,76 +2273,104 @@ impl Pty {
             },
         }
     }
-    pub fn get_pane_running_command(&self, pane_id: PaneId) -> GetPaneRunningCommandResponse {
-        match pane_id {
-            PaneId::Terminal(terminal_id) => {
-                if let Some(&child_pid) = self.id_to_child_pid.get(&terminal_id) {
-                    // Query OS for current running command
-                    if let Some(os_input) = self.bus.os_input.as_ref() {
-                        // First, try to get child process command (e.g., nvim running in bash)
-                        let ppids_to_cmds =
-                            os_input.get_all_cmds_by_ppid(&self.post_command_discovery_hook);
-                        let cmd_ps = ppids_to_cmds.get(&format!("{}", child_pid));
-
-                        // If no child process, fall back to parent process (e.g., the shell itself)
-                        let (_cwds, cmds) = os_input.get_cwds(vec![child_pid]);
-                        let cmd_sysinfo = cmds.get(&child_pid);
-
-                        if let Some(command_args) = cmd_ps {
-                            GetPaneRunningCommandResponse::Ok(command_args.clone())
-                        } else if let Some(command_args) = cmd_sysinfo {
-                            GetPaneRunningCommandResponse::Ok(command_args.clone())
-                        } else {
-                            GetPaneRunningCommandResponse::Err(format!(
-                                "Could not retrieve running command for terminal pane {}",
-                                terminal_id
-                            ))
-                        }
-                    } else {
-                        GetPaneRunningCommandResponse::Err("OS input not available".to_string())
-                    }
-                } else {
-                    GetPaneRunningCommandResponse::Err(format!(
-                        "Terminal pane {} not found or not running",
-                        terminal_id
-                    ))
-                }
-            },
-            PaneId::Plugin(plugin_id) => GetPaneRunningCommandResponse::Err(format!(
-                "Cannot get running command for plugin pane {}",
-                plugin_id
-            )),
-        }
-    }
-    pub fn get_pane_cwd(&self, pane_id: PaneId) -> GetPaneCwdResponse {
-        match pane_id {
-            PaneId::Terminal(terminal_id) => {
-                if let Some(&child_pid) = self.id_to_child_pid.get(&terminal_id) {
-                    // Query OS for current working directory
-                    if let Some(os_input) = self.bus.os_input.as_ref() {
-                        let (cwds, _cmds) = os_input.get_cwds(vec![child_pid]);
-                        if let Some(cwd) = cwds.get(&child_pid) {
-                            GetPaneCwdResponse::Ok(cwd.clone())
-                        } else {
-                            GetPaneCwdResponse::Err(format!(
-                                "Could not retrieve CWD for terminal pane {}",
-                                terminal_id
-                            ))
-                        }
-                    } else {
-                        GetPaneCwdResponse::Err("OS input not available".to_string())
-                    }
-                } else {
-                    GetPaneCwdResponse::Err(format!(
-                        "Terminal pane {} not found or not running",
-                        terminal_id
-                    ))
-                }
-            },
+    /// Resolve the pane's child pid (which needs `Pty` state) on the pty
+    /// thread, then answer from a background task: the process-table queries
+    /// fork a full `ps` scan (plus an optional per-line discovery hook) and a
+    /// sysinfo refresh, and running those here would queue `SpawnTerminal` —
+    /// i.e. every new pane — behind them.
+    pub fn get_pane_running_command(
+        &self,
+        pane_id: PaneId,
+        response_channel: crossbeam::channel::Sender<GetPaneRunningCommandResponse>,
+    ) {
+        let terminal_id = match pane_id {
+            PaneId::Terminal(terminal_id) => terminal_id,
             PaneId::Plugin(plugin_id) => {
-                GetPaneCwdResponse::Err(format!("Cannot get CWD for plugin pane {}", plugin_id))
+                let _ = response_channel.send(GetPaneRunningCommandResponse::Err(format!(
+                    "Cannot get running command for plugin pane {}",
+                    plugin_id
+                )));
+                return;
             },
-        }
+        };
+        let Some(&child_pid) = self.id_to_child_pid.get(&terminal_id) else {
+            let _ = response_channel.send(GetPaneRunningCommandResponse::Err(format!(
+                "Terminal pane {} not found or not running",
+                terminal_id
+            )));
+            return;
+        };
+        let Some(os_input) = self.bus.os_input.clone() else {
+            let _ = response_channel.send(GetPaneRunningCommandResponse::Err(
+                "OS input not available".to_string(),
+            ));
+            return;
+        };
+        let post_command_discovery_hook = self.post_command_discovery_hook.clone();
+        async_runtime().spawn_blocking(move || {
+            // First, try to get child process command (e.g., nvim running in bash)
+            let ppids_to_cmds = os_input.get_all_cmds_by_ppid(&post_command_discovery_hook);
+            let cmd_ps = ppids_to_cmds.get(&format!("{}", child_pid));
+
+            // If no child process, fall back to parent process (e.g., the shell itself)
+            let (_cwds, cmds) = os_input.get_cwds(vec![child_pid]);
+            let cmd_sysinfo = cmds.get(&child_pid);
+
+            let response = if let Some(command_args) = cmd_ps {
+                GetPaneRunningCommandResponse::Ok(command_args.clone())
+            } else if let Some(command_args) = cmd_sysinfo {
+                GetPaneRunningCommandResponse::Ok(command_args.clone())
+            } else {
+                GetPaneRunningCommandResponse::Err(format!(
+                    "Could not retrieve running command for terminal pane {}",
+                    terminal_id
+                ))
+            };
+            let _ = response_channel.send(response);
+        });
+    }
+    /// Same pattern as [`Self::get_pane_running_command`]: the sysinfo cwd
+    /// scan runs off-thread so it can't block pane creation.
+    pub fn get_pane_cwd(
+        &self,
+        pane_id: PaneId,
+        response_channel: crossbeam::channel::Sender<GetPaneCwdResponse>,
+    ) {
+        let terminal_id = match pane_id {
+            PaneId::Terminal(terminal_id) => terminal_id,
+            PaneId::Plugin(plugin_id) => {
+                let _ = response_channel.send(GetPaneCwdResponse::Err(format!(
+                    "Cannot get CWD for plugin pane {}",
+                    plugin_id
+                )));
+                return;
+            },
+        };
+        let Some(&child_pid) = self.id_to_child_pid.get(&terminal_id) else {
+            let _ = response_channel.send(GetPaneCwdResponse::Err(format!(
+                "Terminal pane {} not found or not running",
+                terminal_id
+            )));
+            return;
+        };
+        let Some(os_input) = self.bus.os_input.clone() else {
+            let _ = response_channel.send(GetPaneCwdResponse::Err(
+                "OS input not available".to_string(),
+            ));
+            return;
+        };
+        async_runtime().spawn_blocking(move || {
+            let (cwds, _cmds) = os_input.get_cwds(vec![child_pid]);
+            let response = if let Some(cwd) = cwds.get(&child_pid) {
+                GetPaneCwdResponse::Ok(cwd.clone())
+            } else {
+                GetPaneCwdResponse::Err(format!(
+                    "Could not retrieve CWD for terminal pane {}",
+                    terminal_id
+                ))
+            };
+            let _ = response_channel.send(response);
+        });
     }
 }
 
