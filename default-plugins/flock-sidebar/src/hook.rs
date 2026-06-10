@@ -41,19 +41,18 @@ pub const HOOK_PIPE_NAME: &str = "flock-state";
 /// veto it — see [`crate::state::PaneAgentState`].
 const DEFAULT_AGENT_LABEL: &str = "agent";
 
-/// Default report source when a report omits `source`.
-const DEFAULT_SOURCE: &str = "flock";
-
 /// A parsed agent self-report from a `flock-state` pipe message.
+///
+/// The bundled hook scripts also send `source=` and `message=` args (herdr's
+/// protocol carries them); nothing in the sidebar displays them yet, so they
+/// are deliberately ignored here until something does.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HookReport {
     /// Set or refresh the pane's hook authority (herdr's `pane.report_agent`).
     State {
         pane_id: PaneId,
-        source: String,
         agent_label: String,
         state: AgentState,
-        message: Option<String>,
     },
     /// Release the pane back to the shell, clearing hook authority (herdr's
     /// `pane.release_agent`).
@@ -64,8 +63,8 @@ pub enum HookReport {
 ///
 /// Required: `pane_id` (the target pane) and `state`. The `state` value is one
 /// of `idle`/`working`/`blocked`/`unknown` (mirroring herdr's CLI
-/// `parse_pane_agent_state`) or `release` to clear authority. Optional `agent`,
-/// `source`, and `message` carry display/arbitration metadata.
+/// `parse_pane_agent_state`) or `release` to clear authority. The optional
+/// `agent` arg carries the display/arbitration label.
 ///
 /// Returns `Err` with a human-readable reason on a malformed report so the
 /// caller can log it; a bad report is dropped rather than mutating any pane.
@@ -92,24 +91,11 @@ pub fn parse_hook_report(args: &BTreeMap<String, String>) -> Result<HookReport, 
         .filter(|label| !label.trim().is_empty())
         .unwrap_or(DEFAULT_AGENT_LABEL)
         .to_string();
-    let source = args
-        .get("source")
-        .map(String::as_str)
-        .filter(|source| !source.trim().is_empty())
-        .unwrap_or(DEFAULT_SOURCE)
-        .to_string();
-    let message = args
-        .get("message")
-        .map(|message| message.trim())
-        .filter(|message| !message.is_empty())
-        .map(str::to_string);
 
     Ok(HookReport::State {
         pane_id,
-        source,
         agent_label,
         state,
-        message,
     })
 }
 
@@ -153,6 +139,8 @@ mod tests {
 
     #[test]
     fn parses_a_full_state_report() {
+        // `source` and `message` are part of the hook protocol but unused by
+        // the sidebar; the parser must tolerate (and ignore) them.
         let report = parse_hook_report(&args(&[
             ("pane_id", "7"),
             ("state", "blocked"),
@@ -166,16 +154,14 @@ mod tests {
             report,
             HookReport::State {
                 pane_id: PaneId::Terminal(7),
-                source: "flock:claude".into(),
                 agent_label: "claude".into(),
                 state: AgentState::Blocked,
-                message: Some("needs approval".into()),
             }
         );
     }
 
     #[test]
-    fn defaults_agent_and_source_when_omitted() {
+    fn defaults_agent_when_omitted() {
         // The Phase 5 verification step runs exactly this minimal report.
         let report = parse_hook_report(&args(&[("pane_id", "3"), ("state", "blocked")]))
             .expect("valid report");
@@ -184,10 +170,8 @@ mod tests {
             report,
             HookReport::State {
                 pane_id: PaneId::Terminal(3),
-                source: DEFAULT_SOURCE.into(),
                 agent_label: DEFAULT_AGENT_LABEL.into(),
                 state: AgentState::Blocked,
-                message: None,
             }
         );
     }
@@ -264,20 +248,16 @@ mod tests {
     }
 
     #[test]
-    fn blank_agent_and_source_fall_back_to_defaults() {
+    fn blank_agent_falls_back_to_default() {
         let report = parse_hook_report(&args(&[
             ("pane_id", "1"),
             ("state", "working"),
             ("agent", "   "),
-            ("source", ""),
         ]))
         .expect("valid report");
         match report {
-            HookReport::State {
-                agent_label, source, ..
-            } => {
+            HookReport::State { agent_label, .. } => {
                 assert_eq!(agent_label, DEFAULT_AGENT_LABEL);
-                assert_eq!(source, DEFAULT_SOURCE);
             },
             other => panic!("expected a state report, got {other:?}"),
         }

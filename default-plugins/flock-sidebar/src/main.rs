@@ -81,9 +81,9 @@ const AGENT_COMMAND_SYNC_SECS: f64 = 1.0;
 /// our *own* pane rather than swap the layout, so the user's content panes keep
 /// their arrangement — only the sidebar/content split ratio changes.
 const WIDTH_TOGGLE_PIPE: &str = "flock-toggle-width";
-/// Width (cols) below which we treat the sidebar as collapsed and expand on
-/// toggle; at or above it we collapse back to the rail. Sits between the slim
-/// rail (~5) and the full-view threshold (16).
+/// Floor (cols) for the expanded width on small terminals: the half-the-tab
+/// cap in `set_width_for_mode` never shrinks the expanded sidebar below this.
+/// Sits between the slim rail (~5) and the full-view threshold (16).
 const WIDTH_EXPAND_THRESHOLD: usize = 14;
 /// Target widths (cols) for the toggle. Fixed column counts — not a screen
 /// relative percent — so the expanded sidebar is the same size on a laptop and
@@ -622,15 +622,7 @@ impl State {
         self.sidebar_mode = self.sidebar_mode.toggled();
         self.sidebar_state_updated_at_millis = now_millis();
         self.default_width_applied = true;
-        let (_, total) = self.sidebar_and_tab_cols();
-        // Toward a fixed target column count (capped to half the tab on small
-        // terminals so it never crowds out the content) — a fixed width, not a
-        // screen-relative percent, so it's the same on a laptop and an ultrawide.
-        let target = match self.sidebar_mode {
-            SidebarMode::Open => SIDEBAR_EXPANDED_COLS.min(total / 2).max(WIDTH_EXPAND_THRESHOLD),
-            SidebarMode::Closed => SIDEBAR_SLIM_COLS,
-        };
-        self.set_width(target);
+        self.set_width_for_mode(self.sidebar_mode);
     }
 
     /// Adopt the newest sidebar mode published by any live session. Sessions
@@ -659,6 +651,10 @@ impl State {
         true
     }
 
+    /// Resize the sidebar to the target width for `mode` — a fixed column
+    /// count, not a screen-relative percent, so it's the same on a laptop and
+    /// an ultrawide. The expanded width is capped to half the tab on small
+    /// terminals so the sidebar never crowds out the content.
     fn set_width_for_mode(&self, mode: SidebarMode) {
         let (_, total) = self.sidebar_and_tab_cols();
         let target = match mode {
@@ -686,10 +682,7 @@ impl State {
         }
         self.default_width_applied = true;
         self.sidebar_mode = SidebarMode::Open;
-        // Cap to half the tab on small terminals so the sidebar never crowds out
-        // the content — matching the expand branch of `toggle_width`.
-        let target = SIDEBAR_EXPANDED_COLS.min(total / 2).max(WIDTH_EXPAND_THRESHOLD);
-        self.set_width(target);
+        self.set_width_for_mode(SidebarMode::Open);
     }
 
     /// Set our own pane to an exact `target` column width. Uses the fixed-width
@@ -755,13 +748,11 @@ impl State {
         match report {
             HookReport::State {
                 pane_id,
-                source,
                 agent_label,
                 state,
-                message,
             } => {
                 let entry = self.agents.entry(pane_id).or_default();
-                entry.set_hook_authority(source, agent_label, state, message, now)
+                entry.set_hook_authority(agent_label, state, now)
             },
             HookReport::Release { pane_id } => match self.agents.get_mut(&pane_id) {
                 // Releasing a pane we never tracked is a no-op.

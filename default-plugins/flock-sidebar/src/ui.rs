@@ -264,13 +264,6 @@ pub struct AgentEntry {
     pub seen: bool,
     /// Whether this is the focused pane in the focused tab.
     pub is_active: bool,
-    /// Whether this agent lives in the *current* session. A current-session agent
-    /// can be focused directly; an agent in another session is reached by
-    /// switching to that session first (its pane isn't focusable from here).
-    pub is_current: bool,
-    /// The name of the session this agent belongs to (the switch target for a
-    /// non-current agent).
-    pub session_name: String,
 }
 
 /// One entry in the unified sidebar list: a workspace (session) header, or an
@@ -310,7 +303,6 @@ pub fn build_entries(
     tabs: &[TabInfo],
     agents: &BTreeMap<PaneId, PaneAgentState>,
     published_agent_states: &BTreeMap<PaneId, PaneAgentStatus>,
-    session_name: &str,
 ) -> Vec<AgentEntry> {
     let multi_tab = tabs.len() > 1;
     let tab_active: BTreeMap<usize, bool> =
@@ -373,8 +365,6 @@ pub fn build_entries(
                 state,
                 seen,
                 is_active,
-                is_current: true,
-                session_name: session_name.to_string(),
             });
         }
     }
@@ -436,24 +426,19 @@ pub(crate) fn build_rows(
     // current session's panes are observable from here, so this is the live
     // detail view for the workspace you're in.
     if let Some(current) = sessions.iter().find(|s| s.is_current_session) {
-        let entries = build_entries(panes, tabs, agents, &current.agent_states, &current.name);
+        let entries = build_entries(panes, tabs, agents, &current.agent_states);
         rows.extend(entries.into_iter().map(Row::Agent));
     }
     rows
 }
 
-/// The activation target for a row: switch to a session, focus a current-session
-/// agent pane, or switch to the session owning a non-current agent.
+/// The activation target for a row: switch to a session, or focus an agent
+/// pane. Agent rows only exist for the current session (see [`build_rows`]),
+/// so their panes are always directly focusable.
 fn row_target(row: &Row) -> Target {
     match row {
         Row::Session { name, .. } => Target::Session(name.clone()),
-        Row::Agent(entry) => {
-            if entry.is_current {
-                Target::Pane(entry.pane_id)
-            } else {
-                Target::Session(entry.session_name.clone())
-            }
-        },
+        Row::Agent(entry) => Target::Pane(entry.pane_id),
     }
 }
 

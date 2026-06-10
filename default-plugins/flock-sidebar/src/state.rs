@@ -11,7 +11,7 @@
 //! ```
 //!
 //! This is a focused port: it keeps the arbitration precedence and the
-//! `stabilize_agent_detection` hold/grace timers, but drops herdr's persistence,
+//! `stabilize_agent_state` hold/grace timers, but drops herdr's persistence,
 //! session-ref, and metadata machinery (none of which a Zellij plugin owns). The
 //! async polling task that drove herdr's timers becomes Zellij `Timer` events —
 //! see `tick()`, which the plugin calls on each timer fire so the Claude
@@ -34,10 +34,8 @@ const STALE_HOOK_IDLE_GRACE: Duration = Duration::from_secs(2);
 /// a strong visible screen signal vetoes it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HookAuthority {
-    pub source: String,
     pub agent_label: String,
     pub state: AgentState,
-    pub message: Option<String>,
     pub reported_at: Instant,
 }
 
@@ -123,15 +121,6 @@ impl PaneAgentState {
             .or_else(|| self.detected_agent.map(|a| detect::agent_label(a).to_string()))
     }
 
-    /// The known [`Agent`] backing the effective state, if any.
-    #[allow(dead_code)] // exercised in tests; consumed by the Phase 3 UI.
-    pub fn effective_known_agent(&self) -> Option<Agent> {
-        if let Some(authority) = &self.hook_authority {
-            return detect::parse_agent_label(&authority.agent_label);
-        }
-        self.detected_agent
-    }
-
     /// Update the detected agent from a pane's running command. Clears the
     /// screen fallback when the agent changes (the old chrome no longer applies).
     /// Returns whether the arbitrated state or label changed.
@@ -166,11 +155,10 @@ impl PaneAgentState {
         let snapshot = self.snapshot();
         self.detected_agent = agent;
         self.last_detection = Some(detection);
-        let stabilized = stabilize_agent_detection(
+        let stabilized = stabilize_agent_state(
             agent,
             self.state,
-            detection,
-            false,
+            detection.state,
             now,
             &mut self.last_claude_working_at,
         );
@@ -182,18 +170,14 @@ impl PaneAgentState {
     /// arbitrated state or label changed.
     pub fn set_hook_authority(
         &mut self,
-        source: String,
         agent_label: String,
         state: AgentState,
-        message: Option<String>,
         now: Instant,
     ) -> bool {
         let snapshot = self.snapshot();
         self.hook_authority = Some(HookAuthority {
-            source,
             agent_label,
             state,
-            message,
             reported_at: now,
         });
         self.stale_hook_idle_since = None;
@@ -237,11 +221,10 @@ impl PaneAgentState {
         let snapshot = self.snapshot();
         if let Some(detection) = self.last_detection {
             let agent = self.detected_agent;
-            let stabilized = stabilize_agent_detection(
+            let stabilized = stabilize_agent_state(
                 agent,
                 self.state,
-                detection,
-                false,
+                detection.state,
                 now,
                 &mut self.last_claude_working_at,
             );
@@ -425,23 +408,6 @@ pub(crate) fn stabilize_agent_state(
     }
 }
 
-/// Stabilize a fresh detection. A process-exit observation bypasses the hold so
-/// a finished agent settles immediately. Ported verbatim from herdr.
-pub(crate) fn stabilize_agent_detection(
-    agent: Option<Agent>,
-    previous: AgentState,
-    detection: AgentDetection,
-    process_exited: bool,
-    now: Instant,
-    last_claude_working_at: &mut Option<Instant>,
-) -> AgentState {
-    if process_exited {
-        return detection.state;
-    }
-
-    stabilize_agent_state(agent, previous, detection.state, now, last_claude_working_at)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -506,31 +472,14 @@ mod tests {
     }
 
     #[test]
-    fn process_exit_idle_bypasses_claude_working_hold() {
-        let now = Instant::now();
-        let mut last_working = Some(now);
-
-        let state = stabilize_agent_detection(
-            Some(Agent::Claude),
-            AgentState::Working,
-            detection(AgentState::Idle),
-            true,
-            now + Duration::from_millis(100),
-            &mut last_working,
-        );
-        assert_eq!(state, AgentState::Idle);
-    }
-
-    #[test]
     fn visible_idle_does_not_bypass_claude_working_hold() {
         let now = Instant::now();
         let mut last_working = Some(now);
 
-        let state = stabilize_agent_detection(
+        let state = stabilize_agent_state(
             Some(Agent::Claude),
             AgentState::Working,
-            visible(AgentState::Idle, false, true, false),
-            false,
+            AgentState::Idle,
             now + Duration::from_millis(100),
             &mut last_working,
         );
@@ -570,10 +519,8 @@ mod tests {
         let mut pane = PaneAgentState::new();
         pane.observe_screen(Some(Agent::Pi), detection(AgentState::Idle), now);
         pane.set_hook_authority(
-            "flock:pi".into(),
             "pi".into(),
             AgentState::Working,
-            None,
             now,
         );
 
@@ -589,16 +536,13 @@ mod tests {
         let mut pane = PaneAgentState::new();
         pane.observe_screen(Some(Agent::Pi), detection(AgentState::Idle), now);
         pane.set_hook_authority(
-            "flock:custom".into(),
             "custom-agent".into(),
             AgentState::Working,
-            None,
             now,
         );
 
         assert_eq!(pane.detected_agent, Some(Agent::Pi));
         assert_eq!(pane.effective_agent_label().as_deref(), Some("custom-agent"));
-        assert_eq!(pane.effective_known_agent(), None);
         assert_eq!(pane.state, AgentState::Working);
     }
 
@@ -608,10 +552,8 @@ mod tests {
         let mut pane = PaneAgentState::new();
         pane.observe_screen(Some(Agent::Codex), detection(AgentState::Idle), now);
         pane.set_hook_authority(
-            "flock:codex".into(),
             "codex".into(),
             AgentState::Working,
-            None,
             now,
         );
 
@@ -632,10 +574,8 @@ mod tests {
         let mut pane = PaneAgentState::new();
         pane.observe_screen(Some(Agent::Codex), detection(AgentState::Idle), now);
         pane.set_hook_authority(
-            "flock:codex".into(),
             "codex".into(),
             AgentState::Working,
-            None,
             now,
         );
 
@@ -655,10 +595,8 @@ mod tests {
         let mut pane = PaneAgentState::new();
         pane.observe_screen(Some(Agent::Codex), detection(AgentState::Working), now);
         pane.set_hook_authority(
-            "flock:codex".into(),
             "codex".into(),
             AgentState::Blocked,
-            None,
             now,
         );
 
@@ -677,10 +615,8 @@ mod tests {
         let now = Instant::now();
         let mut pane = PaneAgentState::new();
         pane.set_hook_authority(
-            "custom:agent".into(),
             "custom-agent".into(),
             AgentState::Working,
-            None,
             now,
         );
 
@@ -702,17 +638,15 @@ mod tests {
         let now = Instant::now();
         let mut pane = PaneAgentState::new();
         pane.set_hook_authority(
-            "flock:pi".into(),
             "pi".into(),
             AgentState::Working,
-            None,
             now,
         );
         // Screen now shows a different known agent — the stale pi hook is dropped.
         pane.observe_screen(Some(Agent::Codex), detection(AgentState::Idle), now);
 
         assert!(pane.hook_authority.is_none());
-        assert_eq!(pane.effective_known_agent(), Some(Agent::Codex));
+        assert_eq!(pane.detected_agent, Some(Agent::Codex));
         assert_eq!(pane.state, AgentState::Idle);
     }
 
@@ -721,10 +655,8 @@ mod tests {
         let now = Instant::now();
         let mut pane = PaneAgentState::new();
         pane.set_hook_authority(
-            "flock:codex".into(),
             "codex".into(),
             AgentState::Working,
-            None,
             now,
         );
         // Visible idle screen opens the stale-hook grace window but doesn't win yet.
@@ -747,10 +679,8 @@ mod tests {
         let mut pane = PaneAgentState::new();
         pane.observe_screen(Some(Agent::Codex), detection(AgentState::Working), now);
         pane.set_hook_authority(
-            "flock:codex".into(),
             "codex".into(),
             AgentState::Idle,
-            None,
             now,
         );
         assert_eq!(pane.state, AgentState::Idle);
