@@ -529,13 +529,19 @@ impl TiledPanes {
         self.panes.keys()
     }
     pub fn relayout(&mut self, direction: SplitDirection) {
+        self.try_relayout(direction).non_fatal();
+    }
+    /// The fallible core of [`Self::relayout`]: recompute the layout along
+    /// `direction`, returning the solver's error instead of swallowing it so
+    /// callers can roll back geometry changes that turned out unsatisfiable.
+    fn try_relayout(&mut self, direction: SplitDirection) -> Result<()> {
         let mut pane_grid = TiledPaneGrid::new(
             &mut self.panes,
             &self.panes_to_hide,
             *self.display_area.borrow(),
             *self.viewport.borrow(),
         );
-        match direction {
+        let result = match direction {
             SplitDirection::Horizontal => {
                 pane_grid.layout(direction, (*self.display_area.borrow()).cols)
             },
@@ -544,10 +550,10 @@ impl TiledPanes {
             },
         }
         .or_else(|e| Err(anyError::msg(e)))
-        .with_context(|| format!("{:?} relayout of tab failed", direction))
-        .non_fatal();
+        .with_context(|| format!("{:?} relayout of tab failed", direction));
 
         self.set_pane_frames(self.draw_pane_frames);
+        result
     }
     pub fn reapply_pane_frames(&mut self) {
         // same as set_pane_frames except it reapplies the current situation
@@ -1793,6 +1799,32 @@ impl TiledPanes {
     /// floor, so a docked rail can be a few columns wide on any screen. Returns
     /// whether the target pane was found.
     pub fn set_pane_fixed_width(&mut self, pane_id: PaneId, width: usize) -> bool {
+        // While a pane is fullscreened the hidden panes' saved geometry must
+        // not be rewritten — the solver only sees the visible panes, so the
+        // recomputed percents would be wrong inputs to the unfullscreen
+        // re-solve.
+        if self.fullscreen_is_active.is_some() {
+            log::error!("Cannot set a fixed pane width while a pane is fullscreen");
+            return false;
+        }
+        // Reject obviously unsatisfiable widths before mutating any geometry.
+        let display_cols = self.display_area.borrow().cols;
+        if width == 0 || width > display_cols {
+            log::error!(
+                "Cannot set fixed pane width {}: must be between 1 and the display width ({})",
+                width,
+                display_cols
+            );
+            return false;
+        }
+        // Snapshot all geometries: a Fixed constraint the solver cannot
+        // satisfy must not leave the tab with half-applied geometry and a
+        // permanently unresizable pane.
+        let previous_geoms: Vec<(PaneId, PaneGeom)> = self
+            .panes
+            .iter()
+            .map(|(id, pane)| (*id, pane.position_and_size()))
+            .collect();
         match self.panes.get_mut(&pane_id) {
             Some(pane) => {
                 let mut geom = pane.position_and_size();
@@ -1809,7 +1841,22 @@ impl TiledPanes {
         }
         // Recompute the horizontal split so the now-fixed pane keeps `width` and
         // the flexible sibling(s) reflow into the remaining columns.
-        self.relayout(SplitDirection::Horizontal);
+        if let Err(e) = self.try_relayout(SplitDirection::Horizontal) {
+            log::error!(
+                "Cannot fix pane {:?} to width {}, restoring previous geometry: {:?}",
+                pane_id,
+                width,
+                e
+            );
+            for (id, geom) in previous_geoms {
+                if let Some(pane) = self.panes.get_mut(&id) {
+                    pane.set_geom(geom);
+                }
+            }
+            self.set_pane_frames(self.draw_pane_frames);
+            self.reset_boundaries();
+            return false;
+        }
         self.normalize_flexible_widths_overlapping_pane(pane_id);
         for pane in self.panes.values_mut() {
             resize_pty!(pane, self.os_api, self.senders, self.character_cell_size).unwrap();
