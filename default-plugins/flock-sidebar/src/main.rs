@@ -171,6 +171,10 @@ struct State {
     /// agent pane's contents on the timer — see [`State::pull_agent_screens`] —
     /// keeping a backgrounded session's agent state live cross-session.
     last_render_report_at: Option<Instant>,
+    /// When we last pulled agent pane contents ourselves. Pulls serialize each
+    /// pane's grid across the wasm boundary, so they're clamped to the slow
+    /// state cadence even when the timer runs at the spinner cadence.
+    last_screen_pull: Option<Instant>,
     /// Whether we've applied the one-time default width after the layout first
     /// reports our geometry. The flock layout opens the sidebar at a resizable
     /// percent (so Super b can toggle it in place); once we know the real
@@ -309,12 +313,19 @@ impl ZellijPlugin for State {
                 // When pushed render reports have gone stale — i.e. no client is
                 // attached because we've been switched away from — pull each
                 // agent pane's screen ourselves so detection keeps running and we
-                // keep publishing live state for the cross-session view.
-                if self.render_reports_are_stale(now) {
+                // keep publishing live state for the cross-session view. Pulls
+                // are bounded to the slow state cadence so a working spinner
+                // never turns into an 8Hz scrollback poll of a session nobody
+                // is looking at.
+                let reports_are_stale = self.render_reports_are_stale(now);
+                if reports_are_stale && self.should_pull_agent_screens(now) {
+                    self.last_screen_pull = Some(now);
                     should_render |= self.pull_agent_screens(now);
                 }
                 // While anything is working, animate the spinner and tick faster;
-                // otherwise fall back to the slow hold/grace cadence.
+                // otherwise fall back to the slow hold/grace cadence. With stale
+                // reports no client is attached, so there is no spinner to
+                // animate — stay on the slow cadence.
                 let working = self.any_working();
                 if working {
                     self.spinner_tick = self.spinner_tick.wrapping_add(1);
@@ -326,7 +337,7 @@ impl ZellijPlugin for State {
                 // Catch the resize if permissions/geometry weren't ready when
                 // the first PaneUpdate arrived (runs once, gated by the flag).
                 self.maybe_set_default_width();
-                set_timeout(if working {
+                set_timeout(if working && !reports_are_stale {
                     SPINNER_TICK_SECS
                 } else {
                     STATE_TICK_SECS
@@ -507,6 +518,14 @@ impl State {
             && self
                 .last_session_refresh
                 .is_none_or(|last| now.duration_since(last).as_secs_f64() >= SESSION_REFRESH_SECS)
+    }
+
+    /// Whether enough time has elapsed since the last self-initiated screen
+    /// pull. Keeps the pull cadence at `STATE_TICK_SECS` even when the timer
+    /// itself runs at the (much faster) spinner cadence.
+    fn should_pull_agent_screens(&self, now: Instant) -> bool {
+        self.last_screen_pull
+            .is_none_or(|last| now.duration_since(last).as_secs_f64() >= STATE_TICK_SECS)
     }
 
     fn should_sync_agent_commands(&self, now: Instant) -> bool {
