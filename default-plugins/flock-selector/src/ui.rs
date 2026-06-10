@@ -107,8 +107,11 @@ pub fn render(input: RenderInput) -> RenderOutput {
 
     // Clamp the selection + scroll to the current result set, keeping the
     // selected row inside the visible window above the input.
+    // Rows above the input line. 0 when the pane is a single row tall, in
+    // which case no result rows render (the loop below would otherwise
+    // compute `input_y - 1 - k` with input_y == 0 and underflow).
     let total = results.len();
-    let capacity = rows.saturating_sub(1).max(1);
+    let capacity = rows.saturating_sub(1);
     let selected = if total == 0 {
         0
     } else {
@@ -444,6 +447,51 @@ fn tail_text(text: &str, max_width: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A pane squeezed to a single row has no room for result rows; the
+    /// render loop must not run (it would compute `input_y - 1 - k` with
+    /// input_y == 0 and underflow).
+    #[test]
+    fn render_at_one_row_does_not_underflow() {
+        let c = PaletteColor::EightBit(1);
+        let theme = Theme {
+            text: c,
+            muted: c,
+            separator: c,
+            selection_bg: c,
+            accent: c,
+            red: c,
+            yellow: c,
+            green: c,
+            teal: c,
+            blue: c,
+        };
+        let project = crate::discovery::Project {
+            path: std::path::PathBuf::from("/tmp/proj"),
+            name: "proj".to_string(),
+            display_path: "~/proj".to_string(),
+        };
+        let results = vec![Ranked {
+            project: &project,
+            rank: 1.0,
+            name_ranges: Vec::new(),
+            path_ranges: Vec::new(),
+        }];
+        let out = render(RenderInput {
+            permissions_granted: true,
+            configured: true,
+            query: "p",
+            results: &results,
+            open_paths: &std::collections::HashSet::new(),
+            palette: &theme,
+            selected: 0,
+            scroll: 0,
+            total_candidates: 1,
+            rows: 1,
+            cols: 40,
+        });
+        assert!(out.row_map.is_empty(), "no result rows fit in a 1-row pane");
+    }
 
     #[test]
     fn truncate_adds_ellipsis() {
