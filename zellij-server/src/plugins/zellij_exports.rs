@@ -3341,50 +3341,45 @@ fn kill_sessions(session_names: Vec<String>) {
 // Wedge timeout: only guards against a peer that neither shuts down nor
 // crashes. Normal kill latency is tens of milliseconds (peer's route loop
 // reads the message, server sends Exit back), so 500 ms is several times the
-// expected worst case while still feeling instant to the user. Applied as a
-// single budget over the whole batch -- per-session kills are issued
-// concurrently so killing many sessions does not multiply the wait.
+// expected worst case while still feeling instant to the user. Applied per
+// session -- kills are issued concurrently, so the whole batch is still
+// bounded by a single budget of wall time while one wedged peer cannot mark
+// the kills that succeeded as failed.
 const KILL_WEDGE_TIMEOUT: Duration = Duration::from_millis(500);
 
 fn kill_sessions_and_reply(env: &PluginEnv, session_names: Vec<String>) {
     use tokio::task::JoinSet;
     let runtime = get_tokio_runtime();
     let result: Result<(), String> = runtime.block_on(async {
-        let mut set: JoinSet<(String, std::io::Result<()>)> = JoinSet::new();
+        let mut set: JoinSet<(String, Result<(), String>)> = JoinSet::new();
         for name in session_names {
             let path = ZELLIJ_SOCK_DIR.join(&name);
             set.spawn(async move {
-                let res = zellij_utils::ipc::async_send_kill_and_await(&path).await;
+                let res = match tokio::time::timeout(
+                    KILL_WEDGE_TIMEOUT,
+                    zellij_utils::ipc::async_send_kill_and_await(&path),
+                )
+                .await
+                {
+                    Ok(Ok(())) => Ok(()),
+                    Ok(Err(e)) => Err(e.to_string()),
+                    Err(_) => Err("timed out waiting for kill acknowledgement".to_string()),
+                };
                 (name, res)
             });
         }
-        let drain = async {
-            let mut first_err: Option<String> = None;
-            while let Some(joined) = set.join_next().await {
-                match joined {
-                    Ok((_name, Ok(()))) => {},
-                    Ok((name, Err(e))) => {
-                        if first_err.is_none() {
-                            first_err = Some(format!("Failed to kill session {}: {}", name, e));
-                        }
-                    },
-                    Err(e) => {
-                        if first_err.is_none() {
-                            first_err = Some(format!("Internal error in kill task: {}", e));
-                        }
-                    },
-                }
+        let mut failures: Vec<String> = Vec::new();
+        while let Some(joined) = set.join_next().await {
+            match joined {
+                Ok((_name, Ok(()))) => {},
+                Ok((name, Err(e))) => failures.push(format!("{}: {}", name, e)),
+                Err(e) => failures.push(format!("internal error in kill task: {}", e)),
             }
-            match first_err {
-                Some(e) => Err(e),
-                None => Ok(()),
-            }
-        };
-        match tokio::time::timeout(KILL_WEDGE_TIMEOUT, drain).await {
-            Ok(res) => res,
-            Err(_) => {
-                Err("Timed out waiting for one or more sessions to acknowledge kill".to_string())
-            },
+        }
+        if failures.is_empty() {
+            Ok(())
+        } else {
+            Err(format!("Failed to kill session(s): {}", failures.join(", ")))
         }
     });
     let response = match result {
