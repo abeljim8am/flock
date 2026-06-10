@@ -228,7 +228,7 @@ fn render_result_row(
     push_highlighted(
         &mut spans,
         &name,
-        &clip_ranges(&r.name_ranges, name.len()),
+        &clip_ranges(&r.name_ranges, &name),
         name_style,
         name_style,
     );
@@ -250,7 +250,7 @@ fn render_result_row(
             push_highlighted(
                 &mut spans,
                 &path,
-                &clip_ranges(&r.path_ranges, path.len()),
+                &clip_ranges(&r.path_ranges, &path),
                 path_style,
                 path_style,
             );
@@ -333,13 +333,23 @@ fn styled(text: &str, s: Style) -> Span {
     span
 }
 
-/// Keep only the ranges that fall within `len` (a truncated string), clamping
-/// the tail range so a highlight never spills past the visible text.
-fn clip_ranges(ranges: &[(usize, usize)], len: usize) -> Vec<(usize, usize)> {
+/// Keep only the ranges that fall within `text`, clamping so a highlight never
+/// spills past the visible text. The ranges were computed against the original
+/// (untruncated) string, while `text` may be a truncated copy ending in a
+/// multi-byte '…' — so every endpoint must also be snapped down to a char
+/// boundary or slicing in `push_highlighted` panics mid-'…'.
+fn clip_ranges(ranges: &[(usize, usize)], text: &str) -> Vec<(usize, usize)> {
+    let snap = |i: usize| {
+        let mut i = i.min(text.len());
+        while i > 0 && !text.is_char_boundary(i) {
+            i -= 1;
+        }
+        i
+    };
     ranges
         .iter()
-        .filter(|(s, _)| *s < len)
-        .map(|&(s, e)| (s, e.min(len)))
+        .map(|&(s, e)| (snap(s), snap(e)))
+        .filter(|(s, e)| s < e)
         .collect()
 }
 
@@ -449,7 +459,41 @@ mod tests {
 
     #[test]
     fn clip_ranges_drops_and_clamps() {
-        assert_eq!(clip_ranges(&[(0, 3), (5, 9)], 6), vec![(0, 3), (5, 6)]);
+        assert_eq!(
+            clip_ranges(&[(0, 3), (5, 9)], "abcdef"),
+            vec![(0, 3), (5, 6)]
+        );
+    }
+
+    /// Ranges computed on the original string can land inside the multi-byte
+    /// '…' of a truncated copy; they must be snapped to char boundaries (and
+    /// dropped when they collapse), never sliced mid-char.
+    #[test]
+    fn clip_ranges_snaps_to_char_boundaries() {
+        // truncate_text("abcdefgh", 5) == "abcd…": '…' occupies bytes 4..7.
+        let truncated = truncate_text("abcdefgh", 5);
+        assert_eq!(truncated, "abcd…");
+        // 'f' matched at (5, 6) in the original — inside '…' here. Snapped
+        // endpoints collapse, so the range is dropped entirely.
+        assert_eq!(clip_ranges(&[(5, 6)], &truncated), vec![]);
+        // A range straddling the ellipsis keeps the boundary-safe part.
+        assert_eq!(clip_ranges(&[(3, 6)], &truncated), vec![(3, 4)]);
+        // Rendering with the clipped ranges must not panic.
+        let mut spans = Vec::new();
+        let style = Style {
+            fg: PaletteColor::EightBit(1),
+            bold: false,
+            dim: false,
+        };
+        push_highlighted(
+            &mut spans,
+            &truncated,
+            &clip_ranges(&[(5, 6), (3, 6)], &truncated),
+            style,
+            style,
+        );
+        let joined: String = spans.iter().map(|s| s.text.as_str()).collect();
+        assert_eq!(joined, "abcd…");
     }
 
     #[test]
