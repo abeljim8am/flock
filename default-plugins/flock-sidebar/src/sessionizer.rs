@@ -83,6 +83,8 @@ fn expand_home(path: &str) -> PathBuf {
     PathBuf::from(path)
 }
 
+/// Must stay behaviorally identical to `normalize` in
+/// `flock-selector/src/config.rs` — see the note there.
 fn normalize(path: &Path) -> PathBuf {
     let s = path.to_string_lossy();
     if s.len() > 1 {
@@ -135,6 +137,9 @@ mod tests {
         assert!(config.is_configured());
         assert!(config.contains_workspace(Path::new("/work/app")));
         assert!(config.contains_workspace(Path::new("/other/tool")));
+        // Repeated trailing slashes must collapse exactly like the selector's
+        // config.rs normalize does, or sessions vanish from one side.
+        assert!(config.contains_workspace(Path::new("/work/app//")));
         assert!(!config.contains_workspace(Path::new("/work/app/nested")));
     }
 

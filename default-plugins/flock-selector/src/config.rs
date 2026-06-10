@@ -121,13 +121,19 @@ fn expand_home(path: &str) -> PathBuf {
     PathBuf::from(path)
 }
 
-/// Drop a trailing slash so paths compare/dedupe consistently (e.g. a scanned
+/// Drop trailing slashes so paths compare/dedupe consistently (e.g. a scanned
 /// subdir and a `workspace_root` both land on the same key). The root `/` is
 /// left as-is.
+///
+/// Must stay behaviorally identical to `normalize` in
+/// `flock-sidebar/src/sessionizer.rs`: the sidebar filters sessions the
+/// selector creates by comparing the same configured paths, so any
+/// divergence makes sessions silently disappear from one side.
 pub fn normalize(path: &Path) -> PathBuf {
     let s = path.to_string_lossy();
     if s.len() > 1 {
-        if let Some(stripped) = s.strip_suffix('/') {
+        let stripped = s.trim_end_matches('/');
+        if !stripped.is_empty() {
             return PathBuf::from(stripped);
         }
     }
@@ -196,6 +202,13 @@ mod tests {
             resolve_path("/a/b/", &PathBuf::from("/")),
             Some(PathBuf::from("/a/b"))
         );
+        // Repeated trailing slashes must collapse too — the sidebar's
+        // sessionizer normalizes the same way, and the two must agree.
+        assert_eq!(
+            resolve_path("/a/b//", &PathBuf::from("/")),
+            Some(PathBuf::from("/a/b"))
+        );
+        assert_eq!(normalize(Path::new("/")), PathBuf::from("/"));
         assert_eq!(resolve_path("  ", &PathBuf::from("/")), None);
     }
 
