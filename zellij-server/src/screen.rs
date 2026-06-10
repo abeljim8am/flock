@@ -746,6 +746,11 @@ pub enum ScreenInstruction {
         visual_bell: bool,
         focus_follows_mouse: bool,
         mouse_click_through: bool,
+        /// Whether this reconfigure represents the session's saved (on-disk)
+        /// configuration, as opposed to a runtime-only change for
+        /// `client_id`. Only saved-config changes may update session-wide
+        /// fallbacks like `default_mode_info`.
+        write_config_to_disk: bool,
     },
     RerunCommandPane(u32, Option<NotificationEnd>), // u32 - terminal pane id
     ResizePaneWithId(ResizeStrategy, PaneId),
@@ -4537,6 +4542,7 @@ impl Screen {
         visual_bell: bool,
         focus_follows_mouse: bool,
         mouse_click_through: bool,
+        write_config_to_disk: bool,
         client_id: ClientId,
     ) -> Result<()> {
         let should_support_arrow_fonts = !simplified_ui;
@@ -4547,9 +4553,14 @@ impl Screen {
             .update_rounded_corners(rounded_corners);
         // `default_mode_info` is the fallback used by `change_mode` for
         // clients that don't yet have a per-client `mode_info` entry, so its
-        // keybinds and base mode must be kept in sync with reconfigures.
-        self.default_mode_info.update_keybinds(new_keybinds.clone());
-        self.default_mode_info.update_default_mode(new_default_mode);
+        // keybinds and base mode must be kept in sync with saved-config
+        // reconfigures. Runtime-only changes are scoped to `client_id`:
+        // absorbing them here would leak one client's private rebinds into
+        // every later-attaching client's ModeUpdate events.
+        if write_config_to_disk {
+            self.default_mode_info.update_keybinds(new_keybinds.clone());
+            self.default_mode_info.update_default_mode(new_default_mode);
+        }
         self.default_shell = default_shell.clone().unwrap_or_else(|| get_default_shell());
         self.default_editor = default_editor.clone().or_else(|| get_default_editor());
         self.auto_layout = auto_layout;
@@ -8817,6 +8828,7 @@ pub(crate) fn screen_thread_main(
                 visual_bell,
                 focus_follows_mouse,
                 mouse_click_through,
+                write_config_to_disk,
             } => {
                 screen.host_theme_dark_styling = host_theme_dark;
                 screen.host_theme_light_styling = host_theme_light;
@@ -8841,6 +8853,7 @@ pub(crate) fn screen_thread_main(
                         visual_bell,
                         focus_follows_mouse,
                         mouse_click_through,
+                        write_config_to_disk,
                         client_id,
                     )
                     .non_fatal();

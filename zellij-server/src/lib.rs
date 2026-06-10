@@ -433,6 +433,7 @@ impl SessionMetaData {
                     visual_bell: new_config.options.visual_bell.unwrap_or(true),
                     focus_follows_mouse: new_config.options.focus_follows_mouse.unwrap_or(false),
                     mouse_click_through: new_config.options.mouse_click_through.unwrap_or(false),
+                    write_config_to_disk: config_was_written_to_disk,
                 })
                 .unwrap();
             self.senders
