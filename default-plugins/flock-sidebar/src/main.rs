@@ -117,6 +117,13 @@ struct State {
     last_session_refresh: Option<Instant>,
     /// Last time we reconciled pane ids with their foreground commands.
     last_agent_command_sync: Option<Instant>,
+    /// Panes whose foreground command we've already resolved — either via a
+    /// live `CommandChanged` event or one `get_pane_running_command` host
+    /// query. Each host query forks a full `ps` process-table scan on the pty
+    /// thread, so the manifest sync only queries panes it hasn't answered yet
+    /// instead of every terminal pane on every tick; `CommandChanged` is the
+    /// live path for later foreground changes.
+    command_synced: HashSet<PaneId>,
     /// Per-pane agent detection + arbitrated state, keyed by pane id.
     agents: BTreeMap<PaneId, PaneAgentState>,
     /// The last per-pane agent status we published to the cross-session bus
@@ -266,6 +273,9 @@ impl ZellijPlugin for State {
                 // pane; only it determines the agent. A background change (e.g. a
                 // job control bump) shouldn't reassign the pane's agent.
                 if is_foreground {
+                    // A live event is authoritative — no need for the manifest
+                    // sync to ever host-query this pane.
+                    self.command_synced.insert(pane_id);
                     let agent = identify_agent_from_command(&command);
                     let entry = self.agents.entry(pane_id).or_default();
                     if entry.set_detected_agent(agent, Instant::now()) {
@@ -849,6 +859,7 @@ impl State {
             .flatten()
             .filter(|pane| !pane.is_plugin)
             .map(|pane| (PaneId::Terminal(pane.id), pane.terminal_command.clone()))
+            .filter(|(pane_id, _)| !self.command_synced.contains(pane_id))
             .collect();
 
         let mut changed = false;
@@ -862,6 +873,9 @@ impl State {
                         .map(argv_from_terminal_command)
                         .filter(|command| !command.is_empty())
                 });
+            // One answer (even "no command") is enough: later foreground
+            // changes arrive as CommandChanged events.
+            self.command_synced.insert(pane_id);
             let Some(command) = command else {
                 continue;
             };
@@ -898,6 +912,10 @@ impl State {
             })
             .collect();
         self.agents.retain(|pane_id, _| live.contains(pane_id));
+        // Pane ids are reused; forgetting closed panes lets the manifest sync
+        // re-query a fresh pane that takes over an old id.
+        self.command_synced
+            .retain(|pane_id| live.contains(pane_id));
     }
 }
 
