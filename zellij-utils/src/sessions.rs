@@ -148,6 +148,13 @@ fn assert_socket(name: &str) -> bool {
     let path = &*ZELLIJ_SOCK_DIR.join(name);
     match ipc_connect(path) {
         Ok(stream) => {
+            // A peer that accepts the connection but never sends a valid
+            // reply — a wedged server, or one built from an incompatible
+            // binary still holding a socket in the shared contract dir —
+            // must not block forever: this handshake runs on every zellij
+            // invocation that lists sessions (including plain startup).
+            // Bound it; an unresponsive peer is treated as not-a-session.
+            set_handshake_timeout(&stream);
             let mut sender: IpcSenderWithContext<ClientToServerMsg> =
                 IpcSenderWithContext::new(stream);
             let _ = sender.send_client_msg(ClientToServerMsg::ConnStatus);
@@ -163,6 +170,21 @@ fn assert_socket(name: &str) -> bool {
         },
         Err(_) => false,
     }
+}
+
+/// Bound `assert_socket`'s liveness handshake with send/receive socket
+/// timeouts. The reply normally arrives in microseconds (it's a local
+/// socket), so one second is purely a wedge guard with a wide margin
+/// for a busy-but-alive server. Failure to set the timeout is ignored —
+/// the handshake then simply behaves as before.
+#[cfg(unix)]
+fn set_handshake_timeout(stream: &interprocess::local_socket::Stream) {
+    // On unix the local-socket stream is always the UdSocket variant
+    // (NamedPipe is windows-only), wrapping a std UnixStream.
+    let interprocess::local_socket::Stream::UdSocket(uds_stream) = stream;
+    let timeout = Some(Duration::from_secs(1));
+    let _ = uds_stream.inner().set_read_timeout(timeout);
+    let _ = uds_stream.inner().set_write_timeout(timeout);
 }
 
 /// On Windows, reads the server PID from the marker file and checks whether
