@@ -20,13 +20,19 @@ use crate::config::normalize;
 /// Fallback session name when a path has no usable folder components (e.g. `/`).
 const FALLBACK_NAME: &str = "session";
 
-/// An existing session reduced to the two fields the resolution needs.
+/// An existing session reduced to the fields the resolution needs.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExistingSession {
     /// The session's name (the switch target, and a collision source for naming).
     pub name: String,
     /// The folder the session was rooted in, normalized (no trailing slash).
     pub workspace_root: PathBuf,
+    /// Not a real project session — the picker's own cold-shell entry session,
+    /// whose `workspace_root` is just the folder `zellij` happened to be
+    /// launched from. Hidden sessions never match a folder (switching into one
+    /// strands the user in a pane-less throwaway), but their names still count
+    /// as taken so a new session can't collide with them.
+    pub hidden: bool,
 }
 
 /// What to do when a project is confirmed.
@@ -48,7 +54,7 @@ pub fn resolve_open(project_path: &Path, sessions: &[ExistingSession]) -> OpenAc
 
     if let Some(existing) = sessions
         .iter()
-        .find(|s| s.workspace_root == project_path)
+        .find(|s| !s.hidden && s.workspace_root == project_path)
     {
         return OpenAction::Switch {
             name: existing.name.clone(),
@@ -124,6 +130,14 @@ mod tests {
         ExistingSession {
             name: name.to_string(),
             workspace_root: PathBuf::from(root),
+            hidden: false,
+        }
+    }
+
+    fn hidden_session(name: &str, root: &str) -> ExistingSession {
+        ExistingSession {
+            hidden: true,
+            ..session(name, root)
         }
     }
 
@@ -198,5 +212,22 @@ mod tests {
     fn rootless_path_uses_fallback_name() {
         let action = resolve_open(Path::new("/"), &[]);
         assert_eq!(action, OpenAction::Create { name: FALLBACK_NAME.into() });
+    }
+
+    #[test]
+    fn hidden_session_never_matches_its_root() {
+        // The cold-shell entry session claims the folder zellij was launched
+        // from; picking that folder must create a real session there, not
+        // switch into the throwaway.
+        let sessions = vec![hidden_session("flock-selector", "/home/me/myproj")];
+        let action = resolve_open(Path::new("/home/me/myproj"), &sessions);
+        assert_eq!(action, OpenAction::Create { name: "myproj".into() });
+    }
+
+    #[test]
+    fn hidden_session_name_still_blocks_the_namespace() {
+        let sessions = vec![hidden_session("api", "/elsewhere")];
+        let action = resolve_open(Path::new("/home/backend/api"), &sessions);
+        assert_eq!(action, OpenAction::Create { name: "backend-api".into() });
     }
 }

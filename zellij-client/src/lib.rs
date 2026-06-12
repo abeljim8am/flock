@@ -1186,6 +1186,16 @@ pub fn start_client(
                 os_input.send_to_server(ClientToServerMsg::ClientExited);
                 break;
             },
+            ClientInstruction::RenamedSession(new_session_name) => {
+                // Keep this process's view of its own session current; the
+                // reconnect flow compares ZELLIJ_SESSION_NAME against switch
+                // targets, and a stale name makes a later legitimate switch
+                // look like an attach-to-self (panic in commands.rs). Note:
+                // `os_input.update_session_name` must NOT be called here — that
+                // field is the stdin-handoff token compared around blocking
+                // reads, and changing it mid-session discards all input.
+                envs::set_session_name(new_session_name);
+            },
             ClientInstruction::SetSynchronizedOutput(enabled) => {
                 synchronised_output = enabled;
             },

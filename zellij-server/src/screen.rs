@@ -8753,12 +8753,37 @@ pub(crate) fn screen_thread_main(
                             },
                         );
                     }
+                } else if ZELLIJ_SOCK_DIR.join(&name).exists()
+                    && zellij_utils::sessions::session_exists(&name).unwrap_or(false)
+                {
+                    // The peer cache is filled asynchronously, so early in this
+                    // server's life it can miss a live session holding the
+                    // target name; renaming would fs::rename our socket over
+                    // that session's socket, orphaning it. `session_exists`
+                    // probes the socket, so a stale file left by a dead server
+                    // doesn't block the rename (the probe also cleans it up).
+                    let error_text = "A session by this name already exists.";
+                    log::error!("{}", error_text);
+                    if let Some(os_input) = &mut screen.bus.os_input {
+                        let _ = os_input.send_to_client(
+                            client_id,
+                            ServerToClientMsg::LogError {
+                                lines: vec![error_text.to_owned()],
+                            },
+                        );
+                    }
                 } else {
                     let err_context = || format!("Failed to rename session");
                     let old_session_name = screen.session_name.clone();
 
                     // update state
                     screen.session_name = name.clone();
+                    // Drop the cache entry made under the old name, otherwise
+                    // SessionUpdates keep advertising a ghost session (the old
+                    // name is never refreshed away in sessions that don't run
+                    // a get_session_list scan) and switching to it strands the
+                    // client.
+                    screen.peer_sessions_cache.remove(&old_session_name);
                     screen.default_mode_info.session_name = Some(name.clone());
                     for (_client_id, mode_info) in screen.mode_info.iter_mut() {
                         mode_info.session_name = Some(name.clone());

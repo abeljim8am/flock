@@ -49,6 +49,14 @@ use zellij_tile::prelude::*;
 /// without reopening the picker.
 const REFRESH_SECS: f64 = 10.0;
 
+/// Session name used by the cold-shell entry layout (its `session_name` arg).
+/// Sessions with this name are selector throwaways, not project sessions: their
+/// `workspace_root` is whatever folder zellij happened to be launched from, so
+/// they must never be treated as "the session rooted at" that folder. Must
+/// match `HIDDEN_SESSION_NAME` in `flock-sidebar/src/main.rs`, which hides the
+/// same session from the sidebar's workspace list.
+const SELECTOR_SESSION_NAME: &str = "flock-selector";
+
 #[derive(Default)]
 struct State {
     /// Granted once our permission request resolves; until then we can't scan or
@@ -222,11 +230,26 @@ impl State {
         }
     }
 
+    /// Whether `session` is a selector entry session rather than a project
+    /// session: the fixed cold-shell name (shared with the sidebar's hiding
+    /// rule), whatever name this instance was configured to take, or — when we
+    /// *are* the cold-shell entry (`session_name` set) — our own session even
+    /// under a random name (the rename can fail if a previous throwaway still
+    /// holds the fixed name).
+    fn is_selector_session(&self, session: &SessionInfo) -> bool {
+        session.name == SELECTOR_SESSION_NAME
+            || Some(session.name.as_str()) == self.config.session_name.as_deref()
+            || (self.config.session_name.is_some() && session.is_current_session)
+    }
+
     /// Absolute paths of folders that currently have a live session, matched
     /// against each session's `workspace_root` (the Phase 6 fork field).
+    /// Selector throwaway sessions don't count — their root is just the folder
+    /// zellij was launched from.
     fn open_session_paths(&self) -> HashSet<String> {
         self.sessions
             .iter()
+            .filter(|s| !self.is_selector_session(s))
             .map(|s| config::normalize(&s.workspace_root).to_string_lossy().to_string())
             .filter(|p| !p.is_empty())
             .collect()
@@ -350,21 +373,51 @@ impl State {
         self.frecency.bump(&path.to_string_lossy(), now);
         self.frecency.save();
 
+        let current_session_name = self
+            .sessions
+            .iter()
+            .find(|s| s.is_current_session)
+            .map(|s| s.name.clone());
+
         match action {
+            // The folder's session is the one we're already in: switching would
+            // be refused by the server ("Cannot attach to same session"), so
+            // just dismiss the picker.
+            OpenAction::Switch { name } if Some(&name) == current_session_name.as_ref() => {},
             OpenAction::Switch { name } => {
                 switch_session_with_cwd(Some(&name), Some(path));
+                self.discard_throwaway_session(current_session_name.as_deref());
             },
             OpenAction::Create { name } => {
                 let layout =
                     LayoutInfo::File(self.config.session_layout.clone(), LayoutMetadata::default());
                 switch_session_with_layout(Some(&name), layout, Some(path));
+                self.discard_throwaway_session(current_session_name.as_deref());
             },
         }
         close_self();
     }
 
+    /// In cold-shell mode (`session_name` set) the session we ran in is a
+    /// throwaway whose only purpose was hosting this picker. Once the client
+    /// has been handed to the target session (the switch shim blocks until the
+    /// handoff completes), kill it so it doesn't linger holding the fixed
+    /// session name — a lingering throwaway makes the next cold-shell launch's
+    /// rename collide, and its `workspace_root` (the launch folder) shadows
+    /// that folder's real session. No-op for keybind launches, where the
+    /// current session is the user's working session.
+    fn discard_throwaway_session(&self, current_session_name: Option<&str>) {
+        if self.config.session_name.is_none() {
+            return;
+        }
+        if let Some(name) = current_session_name {
+            let _ = kill_sessions(&[name]);
+        }
+    }
+
     /// The live sessions reduced to the fields [`session::resolve_open`] needs,
-    /// dropping any whose `workspace_root` is unknown (they can't match a folder).
+    /// dropping any whose `workspace_root` is unknown (they can't match a folder)
+    /// and marking selector throwaways hidden (matchable by name only).
     fn existing_sessions(&self) -> Vec<ExistingSession> {
         self.sessions
             .iter()
@@ -372,6 +425,7 @@ impl State {
             .map(|s| ExistingSession {
                 name: s.name.clone(),
                 workspace_root: config::normalize(&s.workspace_root),
+                hidden: self.is_selector_session(s),
             })
             .collect()
     }
