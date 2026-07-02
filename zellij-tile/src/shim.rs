@@ -2934,7 +2934,17 @@ pub fn clear_pane_highlights(pane_id: PaneId) {
     unsafe { host_run_plugin_command() };
 }
 
+#[cfg(target_family = "wasm")]
 #[link(wasm_import_module = "zellij")]
 extern "C" {
     fn host_run_plugin_command();
+}
+
+/// Native (non-wasm) stub so plugin unit-test binaries link: the shims end up
+/// in test builds via `register_plugin!`'s exported symbols even though tests
+/// never invoke them. Any actual call outside the wasm host is a bug, so it
+/// panics rather than silently doing nothing.
+#[cfg(not(target_family = "wasm"))]
+unsafe fn host_run_plugin_command() {
+    unreachable!("host_run_plugin_command is only available inside a Zellij wasm plugin");
 }

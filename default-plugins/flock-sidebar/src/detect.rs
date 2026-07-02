@@ -32,6 +32,10 @@ pub struct AgentDetection {
     /// narrower than a fallback `Working` heuristic and may guard against stale
     /// hook idle reports.
     pub visible_working: bool,
+    /// True when the screen shows an overlay (transcript viewer, model picker)
+    /// that replaces the live UI — no state can be derived from it, so the
+    /// consumer holds the previous state (herdr's `skip_state_update` rules).
+    pub skip_state_update: bool,
 }
 
 /// Which agent we detected running in a pane.
@@ -140,8 +144,18 @@ pub fn detect_agent(agent: Option<Agent>, screen_content: &str) -> AgentDetectio
             visible_blocker: false,
             visible_idle: false,
             visible_working: false,
+            skip_state_update: false,
         };
     };
+    if matches!(agent, Agent::Claude) && claude_skips_state_update(screen_content) {
+        return AgentDetection {
+            state: AgentState::Unknown,
+            visible_blocker: false,
+            visible_idle: false,
+            visible_working: false,
+            skip_state_update: true,
+        };
+    }
     let state = match agent {
         Agent::Pi => detect_pi(screen_content),
         Agent::Claude => detect_claude(screen_content),
@@ -165,6 +179,7 @@ pub fn detect_agent(agent: Option<Agent>, screen_content: &str) -> AgentDetectio
         visible_blocker: has_visible_blocker(agent, screen_content, state),
         visible_idle: has_visible_idle(agent, screen_content, state),
         visible_working: has_visible_working(agent, screen_content, state),
+        skip_state_update: false,
     }
 }
 
@@ -189,33 +204,97 @@ fn detect_pi(content: &str) -> AgentState {
 ///   ❯ _                      (prompt line)
 ///   ───────────────────────── (bottom border)
 /// ```
+/// Ordering mirrors herdr's manifest priorities: live select-form footer and
+/// the dynamic-workflow modal are the strongest signals, then live working
+/// chrome, and only then the legacy permission/interview wording — which is
+/// trusted only when no live prompt box sits below it (otherwise the wording
+/// is stale scrollback above an idle input line).
 fn detect_claude(content: &str) -> AgentState {
     let lower = content.to_lowercase();
 
-    // Search prompt is always idle
-    if content.contains("⌕ Search…") {
-        return AgentState::Idle;
-    }
-
-    // ctrl+r toggle — don't change state
-    // (we return Idle as a safe default since we don't have previous state here)
-    if lower.contains("ctrl+r to toggle") {
-        return AgentState::Idle;
-    }
-
-    // --- Blocked detection (full content including prompt box) ---
-
-    if has_claude_blocked_prompt(content, &lower) {
+    if has_claude_live_blocked_form(content) {
         return AgentState::Blocked;
     }
 
-    // --- Working detection (content above the prompt box) ---
+    if has_claude_dynamic_workflow_prompt(&lower) {
+        return AgentState::Blocked;
+    }
 
     if has_claude_working_chrome(content) {
         return AgentState::Working;
     }
 
+    if !has_claude_prompt_box(content) && has_claude_blocked_prompt(content, &lower) {
+        return AgentState::Blocked;
+    }
+
     AgentState::Idle
+}
+
+/// Whether the screen shows a Claude overlay (transcript viewer, model
+/// picker) that replaces the live UI entirely — any state derived from it
+/// would be wrong, so detection holds the previous state instead
+/// (herdr's `skip_state_update` manifest rules).
+fn claude_skips_state_update(content: &str) -> bool {
+    is_claude_transcript_viewer(content) || is_claude_model_picker(content)
+}
+
+/// The ctrl+o transcript viewer: match on its footer in the last three
+/// non-empty lines (herdr 58af4902 — "preserve status in transcript viewers").
+fn is_claude_transcript_viewer(content: &str) -> bool {
+    let tail: Vec<String> = content
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| {
+            line.split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ")
+                .to_lowercase()
+        })
+        .collect();
+    let tail = tail[tail.len().saturating_sub(3)..].join("\n");
+    tail.contains("showing detailed transcript")
+        && ((tail.contains("ctrl+o") && tail.contains("to toggle"))
+            || (tail.contains("ctrl+e") && tail.contains("show all"))
+            || (tail.contains("ctrl+e") && tail.contains("collapse"))
+            || tail.contains("↑↓ scroll")
+            || tail.contains("? for shortcuts"))
+}
+
+/// The /model picker: a menu, not a blocker and not idle.
+fn is_claude_model_picker(content: &str) -> bool {
+    let lower = content.to_lowercase();
+    lower.contains("select model")
+        && lower.contains("enter to set as default")
+        && lower.contains("esc to cancel")
+        && !lower.contains("do you want to proceed?")
+        && !lower.contains("enter to select")
+}
+
+/// Footer of Claude's live select/question forms (AskUserQuestion, plan
+/// interview, …): "Enter to select · Tab/Arrow keys to navigate · Esc to
+/// cancel" and its arrow-glyph variants (herdr 295b09ca + 719dff6d). Matched
+/// only below the last horizontal rule so a dismissed form left in scrollback
+/// can't re-block the pane.
+fn has_claude_live_blocked_form(content: &str) -> bool {
+    content_after_last_horizontal_rule(content)
+        .lines()
+        .any(|line| {
+            let lower = line.to_lowercase();
+            lower.contains("enter to select")
+                && lower.contains("esc to cancel")
+                && (lower.contains("tab/arrow keys to navigate")
+                    || lower.contains("arrow keys to navigate")
+                    || lower.contains("arrows to navigate")
+                    || lower.contains("↑/↓ to navigate")
+                    || lower.contains("↑↓ to navigate"))
+        })
+}
+
+/// The dynamic-workflow confirmation modal (herdr ee51c5e5): a distinct
+/// blocker not covered by the permission wording.
+fn has_claude_dynamic_workflow_prompt(lower_content: &str) -> bool {
+    lower_content.contains("run a dynamic workflow?") && lower_content.contains("esc to cancel")
 }
 
 fn detect_codex(content: &str) -> AgentState {
@@ -720,18 +799,57 @@ fn has_confirmation_prompt(lower_content: &str) -> bool {
 /// Claude uses the same generic Select and Dialog widgets for both
 /// permission flows and ordinary slash/settings menus. Match only the
 /// permission and interview prompts that actually need user input.
+///
+/// Mirrors herdr's `legacy_no_prompt_blocker` manifest rule: a bare `❯` line
+/// anywhere on screen means the live input prompt is empty and everything
+/// matched here is stale scrollback. Dropped from the old port:
+/// `"chat about this"` (custom status footers like `/coach-dive to chat about
+/// this` caused permanent false Blocked — herdr 5c86f066) and the bare
+/// `"…proceed?"` forms (now paired with their yes/no options or esc hint).
 fn has_claude_blocked_prompt(content: &str, lower_content: &str) -> bool {
-    has_confirmation_prompt(lower_content)
-        || lower_content.contains("do you want to proceed?")
-        || lower_content.contains("would you like to proceed?")
+    if has_bare_prompt_line(content) {
+        return false;
+    }
+    has_claude_confirmation_prompt(lower_content)
+        || (lower_content.contains("do you want to proceed?")
+            && lower_content.contains("esc to cancel"))
         || lower_content.contains("waiting for permission")
         || lower_content.contains("do you want to allow this connection?")
         || lower_content.contains("tab to amend")
         || lower_content.contains("ctrl+e to explain")
-        || lower_content.contains("chat about this")
         || lower_content.contains("review your answers")
         || lower_content.contains("skip interview and plan immediately")
         || (has_selection_prompt(content) && has_claude_yes_no_choice(content))
+}
+
+/// Claude-specific confirmation wording, tightened from the shared
+/// `has_confirmation_prompt`'s "do you want"/"would you like" to the full
+/// "…to" forms so prose mentions don't read as prompts (herdr 295b09ca).
+fn has_claude_confirmation_prompt(lower_content: &str) -> bool {
+    if let Some(pos) = lower_content
+        .find("do you want to")
+        .or_else(|| lower_content.find("would you like to"))
+    {
+        let after = &lower_content[pos..];
+        return after.contains("yes") || after.contains('❯');
+    }
+    false
+}
+
+/// A line that is exactly `❯`: Claude's live, empty input prompt.
+fn has_bare_prompt_line(content: &str) -> bool {
+    content.lines().any(|line| line.trim() == "❯")
+}
+
+/// The screen tail below the last `─` horizontal rule — the live form/footer
+/// region. The whole screen when no rule is present.
+fn content_after_last_horizontal_rule(content: &str) -> &str {
+    let lines: Vec<&str> = content.lines().collect();
+    let Some(last_rule) = lines.iter().rposition(|line| is_horizontal_rule(line)) else {
+        return content;
+    };
+    let byte_offset: usize = lines[..=last_rule].iter().map(|l| l.len() + 1).sum();
+    &content[byte_offset.min(content.len())..]
 }
 
 fn has_claude_yes_no_choice(content: &str) -> bool {
@@ -812,14 +930,48 @@ fn has_visible_blocker(agent: Agent, content: &str, state: AgentState) -> bool {
 }
 
 fn has_claude_visible_blocker(content: &str) -> bool {
+    // A live typed input box below means any approval wording above it is
+    // stale scrollback, never a live blocker.
+    if has_claude_live_input_prompt_box(content) {
+        return false;
+    }
     let lower = content.to_lowercase();
-    lower.contains("do you want to proceed?")
+    let bash_permission_prompt = lower.contains("do you want to proceed?")
         && has_claude_yes_no_choice(content)
         && (lower.contains("bash command")
             || lower.contains("bash(")
             || lower.contains("contains expansion")
             || lower.contains("tab to amend")
-            || lower.contains("ctrl+e to explain"))
+            || lower.contains("ctrl+e to explain"));
+    bash_permission_prompt
+        || has_claude_generic_permission_prompt(content)
+        || has_claude_live_blocked_form(content)
+        || has_claude_dynamic_workflow_prompt(&lower)
+}
+
+/// The generic (non-Bash) permission modal, matched below the last horizontal
+/// rule: "Do you want to proceed?" + esc hint + its numbered Yes/No options
+/// (herdr's `generic_permission_prompt` manifest rule).
+fn has_claude_generic_permission_prompt(content: &str) -> bool {
+    let region = content_after_last_horizontal_rule(content);
+    let lower = region.to_lowercase();
+    lower.contains("do you want to proceed?")
+        && lower.contains("esc to cancel")
+        && region.lines().any(|line| {
+            let trimmed = line.trim().trim_start_matches('❯').trim_start().to_lowercase();
+            [("1.", "yes"), ("2.", "yes"), ("2.", "no"), ("3.", "no")]
+                .iter()
+                .any(|(number, word)| {
+                    trimmed.strip_prefix(number).is_some_and(|rest| {
+                        let rest = rest.trim_start();
+                        rest.starts_with(word)
+                            && rest[word.len()..]
+                                .chars()
+                                .next()
+                                .is_none_or(|c| !c.is_alphanumeric())
+                    })
+                })
+        })
 }
 
 fn has_codex_visible_blocker(content: &str) -> bool {
@@ -1011,7 +1163,79 @@ fn has_claude_working_chrome(content: &str) -> bool {
     let above_lower = above.to_lowercase();
     above_lower.contains("esc to interrupt")
         || above_lower.contains("ctrl+c to interrupt")
-        || has_spinner_activity(above)
+        || (has_spinner_activity(above) && !has_claude_idle_recap_notice(above))
+        || has_claude_running_status_line(above)
+}
+
+/// Claude's post-turn recap banner (`※ Recap: …` … `(disable recaps in
+/// /config)`). Its `※` + ellipsis lines look like spinner activity, so a
+/// visible recap must not read as Working (herdr f18bee9f).
+fn has_claude_idle_recap_notice(above: &str) -> bool {
+    let lower = above.to_lowercase();
+    if lower.contains("esc to interrupt") || lower.contains("ctrl+c to interrupt") {
+        return false;
+    }
+    let tail: Vec<&str> = above.lines().filter(|line| !line.trim().is_empty()).collect();
+    let tail = &tail[tail.len().saturating_sub(8)..];
+    tail.iter()
+        .any(|line| line.to_lowercase().contains("※ recap:"))
+        && tail
+            .last()
+            .is_some_and(|line| line.to_lowercase().contains("(disable recaps in /config)"))
+}
+
+/// Live "still running" status directly above the prompt box: a background
+/// agent wait (`✻ Waiting for 2 background agents to finish`) or a running
+/// shell / local-agent count (`✻ Crunched for 7s · 1 shell still running`).
+/// Only the last non-empty line counts — completed waits scroll up and must
+/// not stick the pane on Working (herdr 816cb88c, 03208d25).
+fn has_claude_running_status_line(above: &str) -> bool {
+    let Some(line) = above.lines().rev().find(|line| !line.trim().is_empty()) else {
+        return false;
+    };
+    is_claude_background_agent_wait_line(line) || is_claude_still_running_status_line(line)
+}
+
+/// `[spinner glyph] Waiting for <N> background agent(s) to finish`, N > 0.
+fn is_claude_background_agent_wait_line(line: &str) -> bool {
+    let trimmed = line.trim();
+    // Optional single leading spinner glyph (any non-alphanumeric char).
+    let rest = match trimmed.chars().next() {
+        Some(first) if !first.is_alphanumeric() => trimmed[first.len_utf8()..].trim_start(),
+        _ => trimmed,
+    };
+    let lower = rest.to_lowercase();
+    let Some(after) = lower.strip_prefix("waiting for ") else {
+        return false;
+    };
+    let Some((count, tail)) = after.split_once(' ') else {
+        return false;
+    };
+    count.parse::<u32>().is_ok_and(|n| n > 0)
+        && (tail == "background agent to finish" || tail == "background agents to finish")
+}
+
+/// `… <N> shell(s) still running` / `… <N> local agent(s) still running`,
+/// N > 0. The idle footer `1 shell · ← for agents` has no "still running"
+/// and must not match.
+fn is_claude_still_running_status_line(line: &str) -> bool {
+    let words: Vec<String> = line
+        .split_whitespace()
+        .map(|word| word.to_lowercase())
+        .collect();
+    let count_at = |index: usize| words[index].parse::<u32>().is_ok_and(|n| n > 0);
+    words.windows(4).enumerate().any(|(i, window)| {
+        count_at(i)
+            && matches!(window[1].as_str(), "shell" | "shells")
+            && window[2] == "still"
+            && window[3] == "running"
+    }) || words.windows(5).enumerate().any(|(i, window)| {
+        count_at(i)
+            && window[1] == "local"
+            && matches!(window[2].as_str(), "agent" | "agents")
+            && window[3] == "still"
+            && window[4] == "running"
+    })
 }
 
 /// Extract content above Claude's prompt box.
@@ -1028,16 +1252,66 @@ fn content_above_prompt_box(content: &str) -> &str {
     content
 }
 
+/// The live input prompt box: a `❯` line between the box borders whose body
+/// carries no select-form chrome. Claude renders question/permission forms
+/// with their own `❯` cursor between rules too — those must not read as the
+/// idle input box (herdr's `live_prompt_box` not-gates).
 fn has_claude_prompt_box(content: &str) -> bool {
-    let lines: Vec<&str> = content.lines().collect();
-    let Some(top_border_index) = claude_prompt_box_top_border_index(&lines) else {
+    let Some(body) = claude_prompt_box_body(content) else {
         return false;
     };
+    !body.iter().any(|line| is_claude_selector_chrome_line(line))
+        && body.iter().any(|line| line.trim_start().starts_with('❯'))
+}
 
-    lines[top_border_index + 1..]
-        .iter()
-        .take_while(|line| !is_horizontal_rule(line))
-        .any(|line| line.trim_start().starts_with('❯'))
+/// The prompt box holds a live *typed* input line: the first non-empty body
+/// line starts with `❯` and no body line is select-form chrome or a numbered
+/// option. A stale approval prompt above such a box is scrollback, not a
+/// blocker — even when the typed text wraps (herdr eeacb45b).
+fn has_claude_live_input_prompt_box(content: &str) -> bool {
+    let Some(body) = claude_prompt_box_body(content) else {
+        return false;
+    };
+    let Some(first) = body.iter().find(|line| !line.trim().is_empty()) else {
+        return false;
+    };
+    first.trim_start().starts_with('❯')
+        && !body.iter().any(|line| is_claude_selector_chrome_line(line))
+}
+
+/// The lines between the prompt box's top border and its bottom border (or
+/// screen end). `None` when no box is on screen.
+fn claude_prompt_box_body<'a>(content: &'a str) -> Option<Vec<&'a str>> {
+    let lines: Vec<&str> = content.lines().collect();
+    let top_border_index = claude_prompt_box_top_border_index(&lines)?;
+    Some(
+        lines[top_border_index + 1..]
+            .iter()
+            .take_while(|line| !is_horizontal_rule(line))
+            .copied()
+            .collect(),
+    )
+}
+
+/// Select-form chrome inside the prompt box region: navigation footers,
+/// confirm hints, or `N.`-numbered option lines (herdr eeacb45b).
+fn is_claude_selector_chrome_line(line: &str) -> bool {
+    let lower = line.to_lowercase();
+    let trimmed = lower.trim().trim_start_matches('❯').trim_start();
+    let numbered_option = trimmed
+        .split_once('.')
+        .is_some_and(|(number, _)| !number.is_empty() && number.chars().all(|c| c.is_ascii_digit()));
+    numbered_option
+        || lower.contains("enter to select")
+        || lower.contains("enter to confirm")
+        || lower.contains("enter to submit")
+        || lower.contains("esc to cancel")
+        || lower.contains("tab/arrow")
+        || lower.contains("arrow keys")
+        || lower.contains("↑/↓")
+        || lower.contains("↑↓")
+        || lower.contains("ctrl+g to edit")
+        || lower.contains("ctrl+e to explain")
 }
 
 fn claude_prompt_box_top_border_index(lines: &[&str]) -> Option<usize> {
@@ -1055,9 +1329,24 @@ fn claude_prompt_box_top_border_index(lines: &[&str]) -> Option<usize> {
     None
 }
 
+/// A prompt-box border line: a run of `─` characters, alone or — for runs of
+/// three or more — followed by status text (Claude appends e.g.
+/// `"──────── ◐ medium · /effort"` to the box border). Requiring the whole
+/// line to be `─` missed those borders, so the box wasn't found at all
+/// (herdr 5c86f066).
 fn is_horizontal_rule(line: &str) -> bool {
     let trimmed = line.trim();
-    !trimmed.is_empty() && trimmed.chars().all(|c| c == '─')
+    let rule_chars = trimmed.chars().take_while(|&c| c == '─').count();
+    if rule_chars == 0 {
+        return false;
+    }
+    let rule_bytes = trimmed
+        .char_indices()
+        .nth(rule_chars)
+        .map(|(i, _)| i)
+        .unwrap_or(trimmed.len());
+    let suffix = trimmed[rule_bytes..].trim_start();
+    suffix.is_empty() || rule_chars >= 3
 }
 
 // ---------------------------------------------------------------------------
@@ -1089,8 +1378,9 @@ pub fn identify_agent_from_command(command: &[String]) -> Option<Agent> {
         }
     }
 
-    // Direct binary match on the basename (`claude`, `/opt/homebrew/bin/codex`).
-    if let Some(agent) = identify_agent(effective) {
+    // Direct binary match on the basename (`claude`, `/opt/homebrew/bin/codex`,
+    // `claude.exe`), with launcher suffixes stripped.
+    if let Some(agent) = identify_agent(&normalized_agent_lookup_name(effective)) {
         return Some(agent);
     }
 
@@ -1190,8 +1480,20 @@ fn agent_name_from_path_token(token: &str) -> Option<String> {
 }
 
 fn agent_name_from_basename(basename: &str) -> Option<String> {
-    let agent = parse_agent_label(basename)?;
+    let agent = parse_agent_label(&normalized_agent_lookup_name(basename))?;
     Some(agent_label(agent).to_string())
+}
+
+/// Strip launcher/script suffixes (`claude.js`, `codex.exe`, `pi.cmd`) so the
+/// basename maps to the agent name (herdr HEAD `normalized_agent_lookup_name`).
+fn normalized_agent_lookup_name(basename: &str) -> String {
+    let lower = basename.to_lowercase();
+    for suffix in [".exe", ".cmd", ".bat", ".ps1", ".js"] {
+        if let Some(stripped) = lower.strip_suffix(suffix) {
+            return stripped.to_string();
+        }
+    }
+    lower
 }
 
 fn path_basename(path: &str) -> &str {
@@ -1560,6 +1862,164 @@ mod tests {
         // The "esc to interrupt" is ABOVE the prompt box — should be working
         let screen = "✽ Writing…\nesc to interrupt\n──────\n❯ \n──────";
         assert_eq!(detect_claude(screen), AgentState::Working);
+    }
+
+    #[test]
+    fn claude_live_blocked_form_with_arrow_glyph_footer() {
+        // Newer Claude renders "↑/↓ to navigate" instead of "Tab/Arrow keys".
+        let screen =
+            "Which option?\n❯ 1. First\n  2. Second\n\nEnter to select · ↑/↓ to navigate · Esc to cancel";
+        assert_eq!(detect_claude(screen), AgentState::Blocked);
+    }
+
+    #[test]
+    fn claude_dismissed_form_in_scrollback_is_not_blocked() {
+        // The form footer sits above the live prompt box — history, not a form.
+        let screen = "Which option?\n❯ 1. First\nEnter to select · Tab/Arrow keys to navigate · Esc to cancel\n─────────\n❯ \n─────────";
+        assert_eq!(detect_claude(screen), AgentState::Idle);
+    }
+
+    #[test]
+    fn claude_dynamic_workflow_prompt_is_visible_blocker() {
+        let screen = "Run a dynamic workflow?\n❯ 1. Yes\n  2. No\n\nEsc to cancel";
+        let detection = detect_agent(Some(Agent::Claude), screen);
+
+        assert_eq!(detection.state, AgentState::Blocked);
+        assert!(detection.visible_blocker);
+    }
+
+    #[test]
+    fn claude_old_permission_prompt_above_live_prompt_box_is_idle() {
+        // Declined prompt scrolled up; a live typed input box sits below it.
+        let screen = "Do you want to proceed?\n❯ 1. Yes\n  2. No\n(escape pressed)\n─────────\n❯ type your message\n─────────";
+        assert_eq!(detect_claude(screen), AgentState::Idle);
+    }
+
+    #[test]
+    fn claude_declined_question_above_bare_prompt_is_idle() {
+        // A bare `❯` line is the live empty input; the wording is scrollback.
+        let screen = "Do you want to proceed?\n 1. Yes\n 2. No\n\n❯";
+        assert_eq!(detect_claude(screen), AgentState::Idle);
+    }
+
+    #[test]
+    fn claude_custom_status_chat_footer_is_not_blocked() {
+        // "chat about this" alone (a custom status footer) must not block
+        // (herdr 5c86f066); only a live select form or permission modal does.
+        let screen = "All done.\n/coach-dive to chat about this\n─────────\n❯ \n─────────";
+        assert_eq!(detect_claude(screen), AgentState::Idle);
+    }
+
+    #[test]
+    fn claude_generic_permission_prompt_is_visible_blocker() {
+        let screen = "● Edit(src/main.rs)\n\n──────────────\nEdit file\n src/main.rs\n\nDo you want to proceed?\n❯ 1. Yes\n  2. Yes, allow all edits during this session\n  3. No, and tell Claude what to do differently (esc)\n\nEsc to cancel";
+        let detection = detect_agent(Some(Agent::Claude), screen);
+
+        assert_eq!(detection.state, AgentState::Blocked);
+        assert!(detection.visible_blocker);
+    }
+
+    #[test]
+    fn claude_stale_permission_above_wrapped_live_prompt_is_not_visible_blocker() {
+        // The prompt box holds live *typed* input (wrapped over two lines);
+        // the bash approval wording above it is stale scrollback.
+        let screen = "Bash command\nDo you want to proceed?\n❯ 1. Yes\n  2. No\nTab to amend\n─────────\n❯ please rework the parser so that it\nhandles multiline input\n─────────";
+        let detection = detect_agent(Some(Agent::Claude), screen);
+
+        assert!(!detection.visible_blocker);
+    }
+
+    #[test]
+    fn claude_transcript_viewer_skips_state_update() {
+        let screen = "12:01 user: hi\n12:02 assistant: hello\n\nShowing detailed transcript · ctrl+o to toggle";
+        let detection = detect_agent(Some(Agent::Claude), screen);
+
+        assert!(detection.skip_state_update);
+    }
+
+    #[test]
+    fn claude_model_picker_skips_state_update() {
+        let screen = "Select model\nSwitch between Claude models\n❯ 1. Default\n  2. Opus\n  3. Sonnet\n\nEnter to set as default · Esc to cancel";
+        let detection = detect_agent(Some(Agent::Claude), screen);
+
+        assert!(detection.skip_state_update);
+    }
+
+    #[test]
+    fn claude_recap_banner_is_not_working() {
+        // `※ Recap: …` matches the spinner heuristic but is a post-turn banner.
+        let screen =
+            "※ Recap: Fixed the sidebar bug…\n  (disable recaps in /config)\n─────────\n❯ \n─────────";
+        assert_eq!(detect_claude(screen), AgentState::Idle);
+    }
+
+    #[test]
+    fn claude_background_agent_wait_is_working() {
+        let screen = "✻ Waiting for 2 background agents to finish\n─────────\n❯ \n─────────";
+        assert_eq!(detect_claude(screen), AgentState::Working);
+    }
+
+    #[test]
+    fn claude_completed_wait_in_scrollback_is_not_working() {
+        // The wait line is no longer the last line above the prompt box.
+        let screen =
+            "✻ Waiting for 2 background agents to finish\n● Done\n─────────\n❯ \n─────────";
+        assert_eq!(detect_claude(screen), AgentState::Idle);
+    }
+
+    #[test]
+    fn claude_shell_still_running_status_is_working() {
+        let screen = "✻ Crunched for 7s · 1 shell still running\n─────────\n❯ \n─────────";
+        assert_eq!(detect_claude(screen), AgentState::Working);
+    }
+
+    #[test]
+    fn claude_local_agents_still_running_is_working() {
+        let screen = "✻ Worked for 4s · 2 local agents still running\n─────────\n❯ \n─────────";
+        assert_eq!(detect_claude(screen), AgentState::Working);
+    }
+
+    #[test]
+    fn claude_idle_shell_footer_is_not_working() {
+        // "1 shell · ← for agents" is the idle footer, not a running status.
+        let screen = "● Done\n1 shell · ← for agents\n─────────\n❯ \n─────────";
+        assert_eq!(detect_claude(screen), AgentState::Idle);
+    }
+
+    #[test]
+    fn claude_prompt_box_with_status_suffix_border_is_visible_idle() {
+        // The bottom border carries status text after the `─` run.
+        let screen =
+            "Task complete.\n────────────────────\n❯ \n──────────────────── ◐ medium · /effort";
+        let detection = detect_agent(Some(Agent::Claude), screen);
+
+        assert_eq!(detection.state, AgentState::Idle);
+        assert!(detection.visible_idle);
+    }
+
+    #[test]
+    fn claude_select_form_between_rules_is_not_visible_idle() {
+        // A select form's `❯` cursor between rules is not the live input box.
+        let screen = "Question?\n─────────\n❯ 1. Yes\n  2. No\nEnter to select · ↑/↓ to navigate · Esc to cancel\n─────────";
+        let detection = detect_agent(Some(Agent::Claude), screen);
+
+        assert!(!detection.visible_idle);
+    }
+
+    #[test]
+    fn node_wrapped_claude_js_is_identified() {
+        let argv: Vec<String> =
+            ["node", "/usr/lib/node_modules/@anthropic-ai/claude-code/claude.js"]
+                .iter()
+                .map(|arg| arg.to_string())
+                .collect();
+        assert_eq!(identify_agent_from_command(&argv), Some(Agent::Claude));
+    }
+
+    #[test]
+    fn windows_launcher_suffixes_are_stripped() {
+        let argv = vec!["claude.exe".to_string()];
+        assert_eq!(identify_agent_from_command(&argv), Some(Agent::Claude));
     }
 
     // ---- Codex ----

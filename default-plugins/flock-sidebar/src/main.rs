@@ -273,18 +273,8 @@ impl ZellijPlugin for State {
                 should_render = true;
             },
             Event::CommandChanged(pane_id, command, is_foreground, _focused_clients) => {
-                // The foreground command is the program actually running in the
-                // pane; only it determines the agent. A background change (e.g. a
-                // job control bump) shouldn't reassign the pane's agent.
-                if is_foreground {
-                    // A live event is authoritative — no need for the manifest
-                    // sync to ever host-query this pane.
-                    self.command_synced.insert(pane_id);
-                    let agent = identify_agent_from_command(&command);
-                    let entry = self.agents.entry(pane_id).or_default();
-                    if entry.set_detected_agent(agent, Instant::now()) {
-                        should_render = true;
-                    }
+                if self.apply_command_changed(pane_id, &command, is_foreground, Instant::now()) {
+                    should_render = true;
                 }
             },
             Event::PaneRenderReportWithAnsi(pane_contents) => {
@@ -896,6 +886,39 @@ impl State {
         changed
     }
 
+    /// Apply a live `CommandChanged` event to the pane's tracked agent state.
+    /// Returns whether a repaint is needed.
+    fn apply_command_changed(
+        &mut self,
+        pane_id: PaneId,
+        command: &[String],
+        is_foreground: bool,
+        now: Instant,
+    ) -> bool {
+        // A live event is authoritative — no need for the manifest sync to
+        // ever host-query this pane.
+        self.command_synced.insert(pane_id);
+        if is_foreground {
+            // The foreground command is the program actually running in the
+            // pane; only it determines the agent.
+            let agent = identify_agent_from_command(command);
+            let entry = self.agents.entry(pane_id).or_default();
+            entry.set_detected_agent(agent, now)
+        } else {
+            // `is_foreground == false` means the pane's shell has no foreground
+            // child at all (the host falls back to reporting the shell
+            // command) — the agent process exited while the pane stayed open.
+            // This is the only live signal for that transition, so open the
+            // agent-missing grace window; the timer releases the agent unless
+            // a fresh detection lands first (the host scan can transiently
+            // miss a live process).
+            if let Some(entry) = self.agents.get_mut(&pane_id) {
+                entry.mark_agent_missing(now);
+            }
+            false
+        }
+    }
+
     fn seed_agent_command(&mut self, pane_id: PaneId, command: &[String], now: Instant) -> bool {
         let Some(agent) = identify_agent_from_command(command) else {
             return false;
@@ -1053,6 +1076,55 @@ mod tests {
             .agents
             .get(&pane_id)
             .is_some_and(|pane| pane.is_agent()));
+    }
+
+    #[test]
+    fn foreground_exit_releases_agent_after_grace() {
+        let mut state = State::default();
+        let now = Instant::now();
+        let pane_id = PaneId::Terminal(7);
+
+        assert!(state.apply_command_changed(
+            pane_id,
+            &["/opt/homebrew/bin/claude".to_string()],
+            true,
+            now
+        ));
+        assert!(state.agents.get(&pane_id).is_some_and(|pane| pane.is_agent()));
+
+        // Claude exits: the host reports the shell itself, no foreground child.
+        assert!(!state.apply_command_changed(
+            pane_id,
+            &["/opt/homebrew/bin/fish".to_string()],
+            false,
+            now
+        ));
+        // Still shown inside the grace window (the scan may have missed).
+        assert!(state.agents.get(&pane_id).is_some_and(|pane| pane.is_agent()));
+
+        // The timer tick past the grace window releases the agent.
+        let entry = state.agents.get_mut(&pane_id).expect("tracked pane");
+        assert!(entry.tick(now + crate::state::AGENT_GONE_GRACE));
+        assert!(!entry.is_agent());
+    }
+
+    #[test]
+    fn foreground_exit_for_untracked_pane_is_ignored() {
+        let mut state = State::default();
+        let now = Instant::now();
+        let pane_id = PaneId::Terminal(9);
+
+        // A shell-only pane reporting "no foreground child" must not create
+        // an agent entry (or crash) — it was never tracked.
+        assert!(!state.apply_command_changed(
+            pane_id,
+            &["/bin/zsh".to_string()],
+            false,
+            now
+        ));
+        assert!(!state.agents.contains_key(&pane_id));
+        // But the answer still counts as synced: no host re-query needed.
+        assert!(state.command_synced.contains(&pane_id));
     }
 
     #[test]

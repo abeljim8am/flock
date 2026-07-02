@@ -28,6 +28,14 @@ const CLAUDE_WORKING_HOLD: Duration = Duration::from_millis(1200);
 /// How long a visible idle screen must persist before it is allowed to override
 /// a `Working` hook report (guards against a hook that missed its stop event).
 const STALE_HOOK_IDLE_GRACE: Duration = Duration::from_secs(2);
+/// How long after the host reports "no foreground child" before the pane's
+/// agent is released. The host's process-table scan can transiently miss a
+/// live process (herdr hit exactly this — its fix confirms a miss over
+/// `AGENT_MISS_CONFIRMATION_ATTEMPTS` ticks before clearing), so a single
+/// report opens a window instead of clearing outright; a fresh foreground
+/// detection inside the window cancels it. The host rescans about once a
+/// second, so this rides out ~3 missed scans.
+pub(crate) const AGENT_GONE_GRACE: Duration = Duration::from_secs(3);
 
 /// An agent's self-reported state, delivered via the Phase 5 hook channel
 /// (`zellij pipe`). This is the authority for the agent's internal state unless
@@ -52,6 +60,10 @@ pub struct PaneAgentState {
     stale_hook_idle_since: Option<Instant>,
     /// Latest agent self-report, if any (Phase 5).
     pub hook_authority: Option<HookAuthority>,
+    /// When the host first reported this pane's shell has no foreground child
+    /// (`CommandChanged` with `is_foreground == false`). Once the report has
+    /// stood for [`AGENT_GONE_GRACE`] the agent is released — see `tick()`.
+    agent_missing_since: Option<Instant>,
     last_claude_working_at: Option<Instant>,
     /// Raw screen detection from the last render report, re-evaluated on `tick()`
     /// so time-based holds/grace windows expire without a new screen update.
@@ -91,6 +103,7 @@ impl Default for PaneAgentState {
             fallback_observed_at: None,
             stale_hook_idle_since: None,
             hook_authority: None,
+            agent_missing_since: None,
             last_claude_working_at: None,
             last_detection: None,
             state: AgentState::Unknown,
@@ -125,6 +138,9 @@ impl PaneAgentState {
     /// screen fallback when the agent changes (the old chrome no longer applies).
     /// Returns whether the arbitrated state or label changed.
     pub fn set_detected_agent(&mut self, agent: Option<Agent>, now: Instant) -> bool {
+        // A fresh foreground answer settles any pending agent-missing window,
+        // even when the identity is unchanged (the miss was transient).
+        self.agent_missing_since = None;
         if agent == self.detected_agent {
             return false;
         }
@@ -155,14 +171,18 @@ impl PaneAgentState {
         let snapshot = self.snapshot();
         self.detected_agent = agent;
         self.last_detection = Some(detection);
-        let stabilized = stabilize_agent_state(
-            agent,
-            self.state,
-            detection.state,
-            now,
-            &mut self.last_claude_working_at,
-        );
-        self.apply_screen_signals(stabilized, detection, now);
+        // An overlay screen (transcript viewer, model picker) carries no state
+        // evidence — hold everything as-is until the live UI is back.
+        if !detection.skip_state_update {
+            let stabilized = stabilize_agent_state(
+                agent,
+                self.state,
+                detection.state,
+                now,
+                &mut self.last_claude_working_at,
+            );
+            self.apply_screen_signals(stabilized, detection, now);
+        }
         self.changed_since(&snapshot)
     }
 
@@ -181,6 +201,42 @@ impl PaneAgentState {
             reported_at: now,
         });
         self.stale_hook_idle_since = None;
+        self.recompute(now);
+        self.changed_since(&snapshot)
+    }
+
+    /// Note that the host reported this pane's shell has no foreground child —
+    /// whatever agent ran here has exited (or the process scan missed it).
+    /// Opens the [`AGENT_GONE_GRACE`] window rather than clearing outright;
+    /// `tick()` releases the agent once the window expires, and a fresh
+    /// foreground detection ([`set_detected_agent`](Self::set_detected_agent))
+    /// cancels it. Never changes visible state directly, so returns nothing.
+    pub fn mark_agent_missing(&mut self, now: Instant) {
+        if !self.is_agent() {
+            self.agent_missing_since = None;
+            return;
+        }
+        self.agent_missing_since.get_or_insert(now);
+    }
+
+    /// Drop every agent signal for this pane: the "no foreground child" report
+    /// outlived its grace window, so the agent process is really gone. Native
+    /// clearing also drops hook authority — mirroring herdr, where process-exit
+    /// clearing is equivalent to `pane.release_agent` — because a crashed or
+    /// killed agent never sends its own `state=release`. Returns whether the
+    /// arbitrated state or label changed.
+    fn release_agent(&mut self, now: Instant) -> bool {
+        let snapshot = self.snapshot();
+        self.agent_missing_since = None;
+        self.hook_authority = None;
+        self.stale_hook_idle_since = None;
+        self.detected_agent = None;
+        self.last_detection = None;
+        self.fallback_state = AgentState::Unknown;
+        self.fallback_visible_blocker = false;
+        self.fallback_visible_idle = false;
+        self.fallback_visible_working = false;
+        self.fallback_observed_at = None;
         self.recompute(now);
         self.changed_since(&snapshot)
     }
@@ -218,20 +274,33 @@ impl PaneAgentState {
     /// grace can expire without a new render report. Returns whether the
     /// arbitrated state or label changed.
     pub fn tick(&mut self, now: Instant) -> bool {
+        // An expired agent-missing window wins over everything else: the last
+        // screen detection belongs to a process that no longer exists, so
+        // re-applying it would only keep the ghost alive.
+        if self
+            .agent_missing_since
+            .is_some_and(|since| now.duration_since(since) >= AGENT_GONE_GRACE)
+        {
+            return self.release_agent(now);
+        }
         let snapshot = self.snapshot();
-        if let Some(detection) = self.last_detection {
-            let agent = self.detected_agent;
-            let stabilized = stabilize_agent_state(
-                agent,
-                self.state,
-                detection.state,
-                now,
-                &mut self.last_claude_working_at,
-            );
-            self.apply_screen_signals(stabilized, detection, now);
-        } else {
-            self.update_stale_hook_idle_window(now);
-            self.recompute(now);
+        match self.last_detection {
+            // A skip-detection (overlay screen) carries no evidence to re-apply.
+            Some(detection) if !detection.skip_state_update => {
+                let agent = self.detected_agent;
+                let stabilized = stabilize_agent_state(
+                    agent,
+                    self.state,
+                    detection.state,
+                    now,
+                    &mut self.last_claude_working_at,
+                );
+                self.apply_screen_signals(stabilized, detection, now);
+            },
+            _ => {
+                self.update_stale_hook_idle_window(now);
+                self.recompute(now);
+            },
         }
         self.changed_since(&snapshot)
     }
@@ -418,6 +487,7 @@ mod tests {
             visible_blocker: false,
             visible_idle: false,
             visible_working: false,
+            skip_state_update: false,
         }
     }
 
@@ -427,6 +497,17 @@ mod tests {
             visible_blocker: blocker,
             visible_idle: idle,
             visible_working: working,
+            skip_state_update: false,
+        }
+    }
+
+    fn skip_detection() -> AgentDetection {
+        AgentDetection {
+            state: AgentState::Unknown,
+            visible_blocker: false,
+            visible_idle: false,
+            visible_working: false,
+            skip_state_update: true,
         }
     }
 
@@ -770,6 +851,129 @@ mod tests {
         // Repeated idle frames must not silently re-mark it seen.
         pane.observe_screen(Some(Agent::Codex), detection(AgentState::Idle), now);
         assert!(!pane.seen);
+    }
+
+    // ---- skip-state-update (overlay screens hold the previous state) ----
+
+    #[test]
+    fn skip_detection_holds_previous_state() {
+        let now = Instant::now();
+        let mut pane = PaneAgentState::new();
+        pane.observe_screen(Some(Agent::Claude), detection(AgentState::Working), now);
+        assert_eq!(pane.state, AgentState::Working);
+
+        // The transcript viewer replaces the screen — state must hold.
+        let changed = pane.observe_screen(Some(Agent::Claude), skip_detection(), now);
+        assert!(!changed);
+        assert_eq!(pane.state, AgentState::Working);
+
+        // Ticks over the overlay must not decay the held state either.
+        assert!(!pane.tick(now + CLAUDE_WORKING_HOLD + Duration::from_secs(1)));
+        assert_eq!(pane.state, AgentState::Working);
+    }
+
+    #[test]
+    fn skip_detection_does_not_mark_completion() {
+        let now = Instant::now();
+        let mut pane = PaneAgentState::new();
+        pane.observe_screen(Some(Agent::Claude), detection(AgentState::Working), now);
+        pane.observe_screen(Some(Agent::Claude), skip_detection(), now);
+        // No Working → Idle transition happened, so no Done-unseen notification.
+        assert!(pane.seen);
+    }
+
+    // ---- agent-missing release (process exit while the pane stays open) ----
+
+    #[test]
+    fn missing_agent_is_released_after_grace() {
+        let now = Instant::now();
+        let mut pane = PaneAgentState::new();
+        pane.set_detected_agent(Some(Agent::Claude), now);
+        pane.observe_screen(Some(Agent::Claude), detection(AgentState::Working), now);
+        assert!(pane.is_agent());
+
+        // The host reports the shell has no foreground child (claude exited).
+        pane.mark_agent_missing(now);
+        // Inside the grace window nothing changes yet.
+        assert!(!pane.tick(now + AGENT_GONE_GRACE - Duration::from_millis(1)));
+        assert!(pane.is_agent());
+
+        // Once the window expires the agent is fully released.
+        let changed = pane.tick(now + AGENT_GONE_GRACE);
+        assert!(changed);
+        assert!(!pane.is_agent());
+        assert_eq!(pane.state, AgentState::Unknown);
+        assert_eq!(pane.fallback_state, AgentState::Unknown);
+    }
+
+    #[test]
+    fn fresh_detection_cancels_missing_window() {
+        let now = Instant::now();
+        let mut pane = PaneAgentState::new();
+        pane.set_detected_agent(Some(Agent::Claude), now);
+        pane.mark_agent_missing(now);
+
+        // The next scan finds the process again — same identity, so
+        // set_detected_agent reports no change, but the window must drop.
+        pane.set_detected_agent(Some(Agent::Claude), now + Duration::from_secs(1));
+
+        assert!(!pane.tick(now + AGENT_GONE_GRACE + Duration::from_secs(1)));
+        assert!(pane.is_agent());
+        assert_eq!(pane.detected_agent, Some(Agent::Claude));
+    }
+
+    #[test]
+    fn release_also_drops_hook_authority() {
+        let now = Instant::now();
+        let mut pane = PaneAgentState::new();
+        pane.set_detected_agent(Some(Agent::Claude), now);
+        pane.set_hook_authority("claude".into(), AgentState::Working, now);
+        assert_eq!(pane.state, AgentState::Working);
+
+        // Killed agents never send `state=release`; the native process-exit
+        // signal must clear the hook authority too or the pane stays an agent.
+        pane.mark_agent_missing(now);
+        let changed = pane.tick(now + AGENT_GONE_GRACE);
+        assert!(changed);
+        assert!(pane.hook_authority.is_none());
+        assert!(!pane.is_agent());
+        assert_eq!(pane.state, AgentState::Unknown);
+    }
+
+    #[test]
+    fn hook_only_agent_is_released_when_process_gone() {
+        let now = Instant::now();
+        let mut pane = PaneAgentState::new();
+        pane.set_hook_authority("custom-agent".into(), AgentState::Working, now);
+        assert!(pane.is_agent());
+
+        pane.mark_agent_missing(now);
+        let changed = pane.tick(now + AGENT_GONE_GRACE);
+        assert!(changed);
+        assert!(!pane.is_agent());
+    }
+
+    #[test]
+    fn missing_report_for_non_agent_pane_is_a_no_op() {
+        let now = Instant::now();
+        let mut pane = PaneAgentState::new();
+        pane.mark_agent_missing(now);
+        assert!(!pane.tick(now + AGENT_GONE_GRACE));
+        assert!(!pane.is_agent());
+        assert_eq!(pane.state, AgentState::Unknown);
+    }
+
+    #[test]
+    fn missing_window_keeps_first_timestamp() {
+        let now = Instant::now();
+        let mut pane = PaneAgentState::new();
+        pane.set_detected_agent(Some(Agent::Claude), now);
+        pane.mark_agent_missing(now);
+        // A repeated report must not push the release out.
+        pane.mark_agent_missing(now + Duration::from_secs(2));
+        let changed = pane.tick(now + AGENT_GONE_GRACE);
+        assert!(changed);
+        assert!(!pane.is_agent());
     }
 
     #[test]
