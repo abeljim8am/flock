@@ -705,7 +705,17 @@ impl WasmBridge {
         for plugin_id in self.plugin_map.lock().unwrap().plugin_ids() {
             new_plugins.insert(plugin_id);
         }
+        let mut rebound_plugin_ids = vec![];
         for plugin_id in new_plugins {
+            // A detached client's instances stay warm in the plugin map. Adopt
+            // one instead of instantiating and `load()`ing the plugin from
+            // scratch: the rebound instance keeps its state, permissions and
+            // subscriptions, so a session switch re-renders it instantly
+            // rather than replaying its whole startup.
+            if self.rebind_orphaned_instance(plugin_id, client_id) {
+                rebound_plugin_ids.push(plugin_id);
+                continue;
+            }
             let Some(run_plugin) = self.run_plugin_of_plugin_id(plugin_id).map(|r| r.clone())
             else {
                 log::error!("Failed to find plugin with id: {}", plugin_id);
@@ -789,7 +799,73 @@ impl WasmBridge {
             )
         }
         self.connected_clients.lock().unwrap().push(client_id);
+        if !rebound_plugin_ids.is_empty() {
+            self.clear_plugin_map_cache();
+            // rebound instances skipped the load path, so nothing asked screen
+            // to replay state for them; one request refreshes them all (and
+            // triggers their first render for the newly bound client)
+            let _ = self
+                .senders
+                .send_to_screen(ScreenInstruction::RequestStateUpdateForPlugins);
+        }
         Ok(())
+    }
+    /// Move an existing instance of `plugin_id` belonging to a detached client
+    /// over to `new_client_id`, if one exists. The wasm instance itself is
+    /// untouched — only its client binding and per-client input context
+    /// change. In-flight `set_timeout` chains follow along because they read
+    /// the instance's live client id at fire time. Returns false when every
+    /// instance belongs to a still-connected client (a genuine second
+    /// concurrent client), in which case the caller falls back to loading a
+    /// fresh instance.
+    fn rebind_orphaned_instance(&mut self, plugin_id: PluginId, new_client_id: ClientId) -> bool {
+        // a plugin still mid-load can't be adopted: its instance mutex is held
+        // by `load()` on the executor thread (locking it here would stall the
+        // plugin thread) and its cached events are still tied to the loading
+        // flow — fall back to the regular load path for this client
+        if self
+            .cached_events_for_pending_plugins
+            .contains_key(&plugin_id)
+        {
+            return false;
+        }
+        let connected_clients: HashSet<ClientId> = self
+            .connected_clients
+            .lock()
+            .unwrap()
+            .iter()
+            .copied()
+            .collect();
+        let running_plugin = {
+            let mut plugin_map = self.plugin_map.lock().unwrap();
+            let Some(orphaned_client_id) =
+                plugin_map.orphaned_client_of_plugin(plugin_id, &connected_clients)
+            else {
+                return false;
+            };
+            match plugin_map.rebind_plugin_instance(plugin_id, orphaned_client_id, new_client_id) {
+                Some(running_plugin) => running_plugin,
+                None => return false,
+            }
+        };
+        let mut running_plugin = running_plugin.lock().unwrap();
+        let plugin_env = running_plugin.store.data_mut();
+        plugin_env.client_id = new_client_id;
+        plugin_env
+            .live_client_id
+            .store(new_client_id, std::sync::atomic::Ordering::SeqCst);
+        // the input context is per-client; the instance follows its new client
+        plugin_env.default_mode = self
+            .base_modes
+            .get(&new_client_id)
+            .copied()
+            .unwrap_or(self.default_mode);
+        plugin_env.keybinds = self
+            .keybinds
+            .get(&new_client_id)
+            .cloned()
+            .unwrap_or_else(|| self.default_keybinds.clone());
+        true
     }
     pub fn resize_plugin(
         &mut self,
@@ -1251,6 +1327,24 @@ impl WasmBridge {
             .lock()
             .unwrap()
             .retain(|c| c != &client_id);
+
+        // The detaching client's instances are deliberately kept in the plugin
+        // map: they stay warm (still receiving broadcast events and timers) so
+        // the next attaching client can adopt them instead of reloading — see
+        // `rebind_orphaned_instance`. Older detached generations are dropped
+        // here so only one rebind candidate lingers per plugin.
+        let connected_clients: HashSet<ClientId> = self
+            .connected_clients
+            .lock()
+            .unwrap()
+            .iter()
+            .copied()
+            .collect();
+        self.plugin_map
+            .lock()
+            .unwrap()
+            .remove_orphans_except(client_id, &connected_clients);
+        self.clear_plugin_map_cache();
 
         // Remove client from cached pane render report
         if let Some(ref mut prev_report) = self.previous_pane_render_report {
@@ -1818,6 +1912,13 @@ impl WasmBridge {
             .store
             .data_mut()
             .set_permissions(HashSet::from_iter(permissions.clone()));
+
+        if running_plugin.store.data().plugin.is_builtin() {
+            // built-in plugins are auto-granted without prompting; persisting
+            // their grants would only rewrite the permission cache file on
+            // every client attach
+            return Ok(());
+        }
 
         let mut permission_cache = PermissionCache::from_path_or_default(cache_path);
         permission_cache.cache(

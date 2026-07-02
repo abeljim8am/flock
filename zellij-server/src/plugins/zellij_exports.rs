@@ -2476,7 +2476,11 @@ fn switch_tab_to(env: &PluginEnv, tab_idx: u32) {
 fn set_timeout(env: &PluginEnv, secs: f64) {
     let send_plugin_instructions = env.senders.to_plugin.clone();
     let update_target = Some(env.plugin_id);
-    let client_id = env.client_id;
+    // read the instance's client binding at fire time, not arm time: a client
+    // re-attach can rebind the instance to a new client id while the timer is
+    // sleeping, and an event addressed to the old id would be dropped —
+    // permanently killing self re-arming timer chains
+    let live_client_id = env.live_client_id.clone();
     let plugin_name = env.name();
     // Use tokio runtime for async I/O (timer operation)
     get_tokio_runtime().spawn(async move {
@@ -2485,6 +2489,7 @@ fn set_timeout(env: &PluginEnv, secs: f64) {
         // FIXME: The way that elapsed time is being calculated here is not exact; it doesn't take into account the
         // time it takes an event to actually reach the plugin after it's sent to the `wasm` thread.
         let elapsed_time = Instant::now().duration_since(start_time).as_secs_f64();
+        let client_id = live_client_id.load(std::sync::atomic::Ordering::SeqCst);
 
         send_plugin_instructions
             .ok_or(anyhow!("found no sender to send plugin instruction to"))
@@ -4225,15 +4230,63 @@ fn get_session_list(env: &PluginEnv) {
                 (name, info.available_layouts, plugins)
             };
 
-            let (live_sessions_map, resurrectable_sessions_map) =
-                scan_session_list_default_dirs(&session_name, &available_layouts, &plugin_list);
-
-            let _ = env
-                .senders
-                .send_to_screen(ScreenInstruction::UpdateSessionInfos(
-                    live_sessions_map.clone(),
-                    resurrectable_sessions_map.clone(),
-                ));
+            let cached_scan = state.last_scan_result.lock().unwrap().clone();
+            let (live_sessions_map, resurrectable_sessions_map) = match cached_scan {
+                Some(last_scan) => {
+                    // serve the last scan immediately and refresh it
+                    // off-thread: the scan's socket liveness handshakes can
+                    // block, and this runs on the calling plugin's event
+                    // thread. The refreshed scan reaches plugins through the
+                    // UpdateSessionInfos -> SessionUpdate broadcast and the
+                    // next poll of this command.
+                    if !state
+                        .scan_in_flight
+                        .swap(true, std::sync::atomic::Ordering::SeqCst)
+                    {
+                        let state = state.clone();
+                        let senders = env.senders.clone();
+                        get_tokio_runtime().spawn(async move {
+                            let scan = tokio::task::spawn_blocking(move || {
+                                scan_session_list_default_dirs(
+                                    &session_name,
+                                    &available_layouts,
+                                    &plugin_list,
+                                )
+                            })
+                            .await;
+                            if let Ok((live_sessions, resurrectable_sessions)) = scan {
+                                *state.last_scan_result.lock().unwrap() =
+                                    Some((live_sessions.clone(), resurrectable_sessions.clone()));
+                                let _ =
+                                    senders.send_to_screen(ScreenInstruction::UpdateSessionInfos(
+                                        live_sessions,
+                                        resurrectable_sessions,
+                                    ));
+                            }
+                            state
+                                .scan_in_flight
+                                .store(false, std::sync::atomic::Ordering::SeqCst);
+                        });
+                    }
+                    last_scan
+                },
+                None => {
+                    // first call in this session: prime the cache synchronously
+                    let scan = scan_session_list_default_dirs(
+                        &session_name,
+                        &available_layouts,
+                        &plugin_list,
+                    );
+                    *state.last_scan_result.lock().unwrap() = Some(scan.clone());
+                    let _ = env
+                        .senders
+                        .send_to_screen(ScreenInstruction::UpdateSessionInfos(
+                            scan.0.clone(),
+                            scan.1.clone(),
+                        ));
+                    scan
+                },
+            };
 
             let snapshot = SessionListSnapshot {
                 live_sessions: live_sessions_map.into_values().collect(),

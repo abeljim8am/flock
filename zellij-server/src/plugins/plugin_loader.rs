@@ -10,7 +10,7 @@ use std::{
     collections::{HashMap, HashSet, VecDeque},
     fs,
     path::PathBuf,
-    sync::{Arc, Mutex},
+    sync::{atomic::AtomicU16, Arc, Mutex},
 };
 use wasmi::{Engine, Instance, Linker, Module, Store, StoreLimits};
 use wasmi_wasi::sync::WasiCtxBuilder;
@@ -25,8 +25,13 @@ use crate::{
 
 use zellij_utils::plugin_api::action::ProtobufPluginConfiguration;
 use zellij_utils::{
-    consts::ZELLIJ_TMP_DIR, data::InputMode, errors::prelude::*, input::command::TerminalAction,
-    input::keybinds::Keybinds, input::plugins::PluginConfig, pane_size::Size,
+    consts::ZELLIJ_TMP_DIR,
+    data::{InputMode, PermissionType},
+    errors::prelude::*,
+    input::command::TerminalAction,
+    input::keybinds::Keybinds,
+    input::plugins::PluginConfig,
+    pane_size::Size,
 };
 
 /// Open a directory as a `File` handle for WASI pre-opening.
@@ -233,6 +238,18 @@ impl<'a> PluginLoader<'a> {
 
         Ok(())
     }
+    /// Built-in plugins are auto-granted every permission without prompting
+    /// (see `check_command_permission` / `request_permission`), so their
+    /// instances start pre-granted: no event is dropped for lack of
+    /// permissions while the formal grant round-trips through the plugin
+    /// thread during startup.
+    fn initial_permissions(&self) -> Option<HashSet<PermissionType>> {
+        if self.plugin_config.is_builtin() {
+            Some(PermissionType::all().collect())
+        } else {
+            None
+        }
+    }
     pub fn create_plugin_environment(
         &self,
         module: Module,
@@ -260,8 +277,9 @@ impl<'a> PluginLoader<'a> {
         let plugin_env = PluginEnv {
             plugin_id: self.plugin_id,
             client_id: self.client_id,
+            live_client_id: Arc::new(AtomicU16::new(self.client_id)),
             plugin: self.plugin_config.clone(), // TODO: change field name in PluginEnv to plugin_config
-            permissions: Arc::new(Mutex::new(None)),
+            permissions: Arc::new(Mutex::new(self.initial_permissions())),
             senders: self.senders.clone(),
             wasi_ctx,
             plugin_own_data_dir: self.plugin_own_data_dir.clone(),
@@ -372,8 +390,9 @@ impl<'a> PluginLoader<'a> {
         let plugin_env = PluginEnv {
             plugin_id: self.plugin_id,
             client_id: self.client_id,
+            live_client_id: Arc::new(AtomicU16::new(self.client_id)),
             plugin: plugin_config,
-            permissions: Arc::new(Mutex::new(None)),
+            permissions: Arc::new(Mutex::new(self.initial_permissions())),
             senders: self.senders.clone(),
             wasi_ctx,
             plugin_own_data_dir: self.plugin_own_data_dir.clone(),

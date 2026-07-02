@@ -1057,7 +1057,9 @@ pub enum WebServerStatus {
     PartialOrd,
     Ord,
 )]
-#[strum_discriminants(derive(EnumString, Hash, Serialize, Deserialize, Display, PartialOrd, Ord))]
+#[strum_discriminants(derive(
+    EnumString, EnumIter, Hash, Serialize, Deserialize, Display, PartialOrd, Ord
+))]
 #[strum_discriminants(name(PermissionType))]
 #[non_exhaustive]
 pub enum Permission {
@@ -1081,6 +1083,11 @@ pub enum Permission {
 }
 
 impl PermissionType {
+    /// Every permission type, eg. for pre-granting built-in plugins.
+    pub fn all() -> impl Iterator<Item = PermissionType> {
+        use strum::IntoEnumIterator;
+        PermissionType::iter()
+    }
     pub fn display_name(&self) -> String {
         match self {
             PermissionType::ReadApplicationState => {
