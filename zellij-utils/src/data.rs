@@ -1937,6 +1937,14 @@ pub struct SessionInfo {
     /// when unknown. Used as the session's stable workspace identity so plugins
     /// can group sessions by the project folder they belong to.
     pub workspace_root: PathBuf,
+    /// The session's `default_command` option (command + args every new
+    /// pane/tab runs instead of the default shell), when one was injected at
+    /// session creation — e.g. the flock codespace binding
+    /// `["gh", "codespace", "ssh", "-c", "<name>"]`. `None` for ordinary
+    /// sessions. Carried on `SessionInfo` so plugins can recognize bound
+    /// sessions (selector: switch-vs-create; sidebar: listing/badging).
+    #[serde(default)]
+    pub default_command: Option<Vec<String>>,
     /// Per-pane agent status published by this session's flock-sidebar plugin
     /// (via `PublishAgentState`). Carried on `SessionInfo` so it rides the
     /// existing cross-session metadata transport: another session's sidebar

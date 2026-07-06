@@ -336,6 +336,10 @@ message SessionManifest {
   string workspace_root = 13;
   repeated PaneAgentStatus agent_states = 14;
   optional FlockSidebarState flock_sidebar_state = 15;
+  // The session's injected default command (command + args every new pane/tab
+  // runs instead of the default shell), e.g. a flock codespace binding.
+  // Empty means unset.
+  repeated string default_command = 16;
 }
 
 message PaneAgentStatus {

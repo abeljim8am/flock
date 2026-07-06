@@ -275,6 +275,9 @@ pub(crate) enum Row {
         name: String,
         activity: SessionActivity,
         is_current: bool,
+        /// Whether the session is codespace-bound (its `default_command`
+        /// carries the `gh codespace ssh` binding) — badged in the row.
+        is_codespace: bool,
     },
     Agent(AgentEntry),
 }
@@ -420,6 +423,11 @@ pub(crate) fn build_rows(
             name: session.name.clone(),
             activity: session_activity(session, agents),
             is_current: session.is_current_session,
+            is_codespace: session
+                .default_command
+                .as_deref()
+                .and_then(crate::codespace::parse_codespace_ssh)
+                .is_some(),
         });
     }
     // Bottom section: the current session's own agents, one row each. Only the
@@ -870,30 +878,31 @@ fn draw_row(
             name,
             activity,
             is_current,
+            is_codespace,
         } => {
             let (dot, dot_color) = activity_dot(*activity, p);
             let emphasized = cursor || *is_current;
             let name_color = if emphasized { p.text } else { p.muted };
-            let label = truncate_text(name, content_width.saturating_sub(3));
+            // The codespace badge takes two extra cells before the name.
+            let name_budget = content_width.saturating_sub(if *is_codespace { 5 } else { 3 });
+            let label = truncate_text(name, name_budget);
             let mut name_span = Span::new(label, name_color);
             name_span = if emphasized {
                 name_span.bold()
             } else {
                 name_span.dim()
             };
-            render_row(
-                out,
-                0,
-                row_y,
-                content_width,
-                row_bg,
-                &[
-                    Span::new(" ", p.text),
-                    Span::new(dot, dot_color),
-                    Span::new(" ", p.text),
-                    name_span,
-                ],
-            );
+            let mut spans = vec![
+                Span::new(" ", p.text),
+                Span::new(dot, dot_color),
+                Span::new(" ", p.text),
+            ];
+            if *is_codespace {
+                spans.push(Span::new("⚡", p.blue));
+                spans.push(Span::new(" ", p.text));
+            }
+            spans.push(name_span);
+            render_row(out, 0, row_y, content_width, row_bg, &spans);
         },
         Row::Agent(entry) => {
             let (icon, icon_color) = agent_icon(entry.state, entry.seen, spinner_tick, p);

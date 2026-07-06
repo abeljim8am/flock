@@ -2670,6 +2670,24 @@ impl Options {
         let default_shell =
             kdl_property_first_arg_as_string_or_error!(kdl_options, "default_shell")
                 .map(|(string, _entry)| PathBuf::from(string));
+        let default_command = match kdl_options.get("default_command") {
+            Some(node) => {
+                let args: Vec<String> = kdl_string_arguments!(node)
+                    .iter()
+                    .map(|s| s.to_string())
+                    .collect();
+                if args.is_empty() {
+                    return Err(ConfigError::new_kdl_error(
+                        "default_command must have at least one argument (the command to run)"
+                            .into(),
+                        node.span().offset(),
+                        node.span().len(),
+                    ));
+                }
+                Some(args)
+            },
+            None => None,
+        };
         let default_cwd = kdl_property_first_arg_as_string_or_error!(kdl_options, "default_cwd")
             .map(|(string, _entry)| PathBuf::from(string));
         let pane_frames =
@@ -2833,6 +2851,7 @@ impl Options {
             theme_light,
             default_mode,
             default_shell,
+            default_command,
             default_cwd,
             default_layout,
             layout_dir,
@@ -3076,6 +3095,16 @@ impl Options {
         } else {
             None
         }
+    }
+    fn default_command_to_kdl(&self, _add_comments: bool) -> Option<KdlNode> {
+        // No commented-out sample: this option exists for programmatic
+        // per-session injection (layout-embedded), not the user config file.
+        let default_command = self.default_command.as_ref()?;
+        let mut node = KdlNode::new("default_command");
+        for arg in default_command {
+            node.push(arg.to_owned());
+        }
+        Some(node)
     }
     fn default_cwd_to_kdl(&self, add_comments: bool) -> Option<KdlNode> {
         let comment_text = format!(
@@ -4267,6 +4296,9 @@ impl Options {
         }
         if let Some(default_shell) = self.default_shell_to_kdl(add_comments) {
             nodes.push(default_shell);
+        }
+        if let Some(default_command) = self.default_command_to_kdl(add_comments) {
+            nodes.push(default_command);
         }
         if let Some(default_cwd) = self.default_cwd_to_kdl(add_comments) {
             nodes.push(default_cwd);
@@ -5654,6 +5686,19 @@ impl SessionInfo {
             .and_then(|e| e.value().as_string())
             .map(PathBuf::from)
             .unwrap_or_default();
+        let default_command = kdl_document.get("default_command").and_then(|n| {
+            let args: Vec<String> = n
+                .entries()
+                .iter()
+                .filter_map(|e| e.value().as_string())
+                .map(|s| s.to_owned())
+                .collect();
+            if args.is_empty() {
+                None
+            } else {
+                Some(args)
+            }
+        });
         let mut agent_states = BTreeMap::new();
         if let Some(kdl_agent_states) =
             kdl_document.get("agent_states").and_then(|p| p.children())
@@ -5745,6 +5790,7 @@ impl SessionInfo {
             pane_history,
             creation_time,
             workspace_root,
+            default_command,
             agent_states,
             flock_sidebar_state,
         })
@@ -5857,6 +5903,14 @@ impl SessionInfo {
         let mut workspace_root_node = KdlNode::new("workspace_root");
         workspace_root_node.push(self.workspace_root.display().to_string());
         kdl_document.nodes_mut().push(workspace_root_node);
+
+        if let Some(default_command) = &self.default_command {
+            let mut default_command_node = KdlNode::new("default_command");
+            for arg in default_command {
+                default_command_node.push(arg.clone());
+            }
+            kdl_document.nodes_mut().push(default_command_node);
+        }
 
         let mut agent_states_node = KdlNode::new("agent_states");
         let mut agent_states_children = KdlDocument::new();
@@ -6471,6 +6525,7 @@ fn serialize_and_deserialize_session_info_with_data() {
         pane_history: Default::default(),
         creation_time: Duration::from_secs(300),
         workspace_root: PathBuf::from("/home/aviram/my-project"),
+        default_command: None,
         agent_states: {
             let mut agent_states = BTreeMap::new();
             agent_states.insert(
@@ -7272,6 +7327,87 @@ fn config_options_to_string() {
         "Deserialized serialized config equals original config"
     );
     insta::assert_snapshot!(fake_document.to_string());
+}
+
+#[test]
+fn default_command_option_round_trips() {
+    let fake_config = r##"
+        default_command "gh" "codespace" "ssh" "-c" "my-codespace"
+    "##;
+    let document: KdlDocument = fake_config.parse().unwrap();
+    let deserialized = Options::from_kdl(&document).unwrap();
+    assert_eq!(
+        deserialized.default_command,
+        Some(vec![
+            "gh".to_owned(),
+            "codespace".to_owned(),
+            "ssh".to_owned(),
+            "-c".to_owned(),
+            "my-codespace".to_owned()
+        ])
+    );
+    let mut serialized = Options::to_kdl(&deserialized, false);
+    let mut fake_document = KdlDocument::new();
+    fake_document.nodes_mut().append(&mut serialized);
+    let deserialized_from_serialized =
+        Options::from_kdl(&fake_document.to_string().parse::<KdlDocument>().unwrap()).unwrap();
+    assert_eq!(
+        deserialized_from_serialized.default_command,
+        deserialized.default_command,
+    );
+}
+
+#[test]
+fn default_command_option_requires_arguments() {
+    let fake_config = r##"
+        default_command
+    "##;
+    let document: KdlDocument = fake_config.parse().unwrap();
+    assert!(Options::from_kdl(&document).is_err());
+}
+
+#[test]
+fn stringified_layout_options_carry_default_command() {
+    // The flock-selector codespace binding path: a generated stringified
+    // layout doc carries `default_command` (and `session_serialization false`)
+    // as top-level option nodes which must merge over the base config.
+    let stringified_layout = r##"
+layout {
+    pane
+}
+default_command "gh" "codespace" "ssh" "-c" "my-codespace"
+session_serialization false
+"##;
+    let base_config = crate::input::config::Config::default();
+    let (_layout, config) =
+        crate::input::layout::Layout::from_stringified_layout(stringified_layout, base_config)
+            .unwrap();
+    assert_eq!(
+        config.options.default_command,
+        Some(vec![
+            "gh".to_owned(),
+            "codespace".to_owned(),
+            "ssh".to_owned(),
+            "-c".to_owned(),
+            "my-codespace".to_owned()
+        ])
+    );
+    assert_eq!(config.options.session_serialization, Some(false));
+}
+
+#[test]
+fn session_info_default_command_round_trips() {
+    let mut session_info = SessionInfo::new("bound".to_owned());
+    session_info.default_command = Some(vec![
+        "gh".to_owned(),
+        "codespace".to_owned(),
+        "ssh".to_owned(),
+        "-c".to_owned(),
+        "my-codespace".to_owned(),
+    ]);
+    let serialized = session_info.to_string();
+    let deserialized = SessionInfo::from_string(&serialized, "not this session").unwrap();
+    assert_eq!(deserialized.default_command, session_info.default_command);
 }
 
 #[test]

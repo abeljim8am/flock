@@ -39,6 +39,20 @@ pub struct SelectorConfig {
     /// one. Left `None` for a keybind launch, where renaming the user's working
     /// session would be wrong.
     pub session_name: Option<String>,
+    /// The raw arg pairs the flock-sidebar shares with this plugin
+    /// (`individual_dirs` / `root_dirs` / `cwd`), exactly as received. The
+    /// generated codespace-session layout embeds them into its sidebar plugin
+    /// blocks so the spawned sidebar filters workspaces the same way the
+    /// user's regular flock sessions do.
+    pub sidebar_args: Vec<(String, String)>,
+    /// Path to a layout file used as the base for codespace-bound sessions
+    /// (`codespace_session_layout` arg; `~`-expanded). When set and readable,
+    /// bound sessions get this layout's chrome with the SSH binding options
+    /// appended, instead of the built-in flock mirror. The file's content
+    /// panes must NOT carry explicit `command`s — an explicit command
+    /// overrides the session's `default_command`, so such a pane would open
+    /// locally instead of SSHing into the codespace.
+    pub codespace_session_layout: Option<PathBuf>,
 }
 
 impl Default for SelectorConfig {
@@ -49,6 +63,8 @@ impl Default for SelectorConfig {
             session_layout: DEFAULT_SESSION_LAYOUT.to_string(),
             cwd: PathBuf::from("/"),
             session_name: None,
+            sidebar_args: Vec::new(),
+            codespace_session_layout: None,
         }
     }
 }
@@ -70,12 +86,26 @@ impl SelectorConfig {
             .get("session_name")
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty());
+        let sidebar_args = ["individual_dirs", "root_dirs", "cwd"]
+            .iter()
+            .filter_map(|key| {
+                config
+                    .get(*key)
+                    .filter(|value| !value.trim().is_empty())
+                    .map(|value| (key.to_string(), value.clone()))
+            })
+            .collect();
+        let codespace_session_layout = config
+            .get("codespace_session_layout")
+            .and_then(|raw| resolve_path(raw, &cwd));
         SelectorConfig {
             individual_dirs: split_paths(config.get("individual_dirs"), &cwd),
             root_dirs: split_paths(config.get("root_dirs"), &cwd),
             session_layout,
             cwd,
             session_name,
+            sidebar_args,
+            codespace_session_layout,
         }
     }
 }

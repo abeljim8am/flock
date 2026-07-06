@@ -36,6 +36,12 @@ const STALE_HOOK_IDLE_GRACE: Duration = Duration::from_secs(2);
 /// detection inside the window cancels it. The host rescans about once a
 /// second, so this rides out ~3 missed scans.
 pub(crate) const AGENT_GONE_GRACE: Duration = Duration::from_secs(3);
+/// The release grace for *remote* panes (codespace SSH transports), whose
+/// "agent missing" signal is screen-derived — the agent's chrome stopped
+/// rendering — rather than a process-table answer. Screens flap more than
+/// process tables (scrolling output, redraws, transient overlays a detector
+/// doesn't know), so the window is wider before the agent is released.
+pub(crate) const REMOTE_AGENT_GONE_GRACE: Duration = Duration::from_secs(10);
 
 /// An agent's self-reported state, delivered via the Phase 5 hook channel
 /// (`zellij pipe`). This is the authority for the agent's internal state unless
@@ -81,6 +87,12 @@ pub struct PaneAgentState {
     /// a completion while focused is seen immediately; a completion while
     /// unfocused becomes Done-unseen until the user focuses the pane.
     focused: bool,
+    /// Whether this pane is a remote transport (a codespace `gh codespace ssh`
+    /// pane): its local argv carries no agent identity, so identification and
+    /// the agent-missing signal are screen-derived, and release uses the wider
+    /// [`REMOTE_AGENT_GONE_GRACE`]. Survives agent release — the transport
+    /// stays remote for whatever runs in it next.
+    pub remote: bool,
 }
 
 /// A Working/Blocked → Idle transition: the agent finished or stopped waiting.
@@ -109,6 +121,7 @@ impl Default for PaneAgentState {
             state: AgentState::Unknown,
             seen: true,
             focused: false,
+            remote: false,
         }
     }
 }
@@ -277,9 +290,14 @@ impl PaneAgentState {
         // An expired agent-missing window wins over everything else: the last
         // screen detection belongs to a process that no longer exists, so
         // re-applying it would only keep the ghost alive.
+        let gone_grace = if self.remote {
+            REMOTE_AGENT_GONE_GRACE
+        } else {
+            AGENT_GONE_GRACE
+        };
         if self
             .agent_missing_since
-            .is_some_and(|since| now.duration_since(since) >= AGENT_GONE_GRACE)
+            .is_some_and(|since| now.duration_since(since) >= gone_grace)
         {
             return self.release_agent(now);
         }
@@ -949,6 +967,25 @@ mod tests {
 
         pane.mark_agent_missing(now);
         let changed = pane.tick(now + AGENT_GONE_GRACE);
+        assert!(changed);
+        assert!(!pane.is_agent());
+    }
+
+    #[test]
+    fn remote_pane_uses_wider_gone_grace() {
+        let now = Instant::now();
+        let mut pane = PaneAgentState::new();
+        pane.remote = true;
+        pane.set_detected_agent(Some(Agent::Claude), now);
+        pane.mark_agent_missing(now);
+
+        // The local grace elapsing must not release a remote pane — its
+        // missing signal is screen-derived and flappier.
+        assert!(!pane.tick(now + AGENT_GONE_GRACE));
+        assert!(pane.is_agent());
+
+        // The remote grace does.
+        let changed = pane.tick(now + REMOTE_AGENT_GONE_GRACE);
         assert!(changed);
         assert!(!pane.is_agent());
     }

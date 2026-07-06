@@ -26,6 +26,7 @@
 //! rooted at that folder, or launch a new one there with the configured
 //! `session_layout` — and bumps the frecency db.
 
+mod codespaces;
 mod config;
 mod discovery;
 mod frecency;
@@ -38,16 +39,23 @@ mod ui;
 use std::collections::{BTreeMap, HashSet};
 use std::path::PathBuf;
 
+use codespaces::{Codespace, GhError};
 use config::SelectorConfig;
 use discovery::{merge_candidates, parse_scan_output, scan_argv, scan_context, Project, SCAN_CONTEXT_KEY};
 use frecency::{now_secs, FrecencyDb};
 use palette::Theme;
 use session::{ExistingSession, OpenAction};
+use ui::PickerMode;
 use zellij_tile::prelude::*;
 
 /// How often to re-scan the root dirs so newly-created project folders surface
 /// without reopening the picker.
 const REFRESH_SECS: f64 = 10.0;
+
+/// Refresh the codespace list every this-many refresh ticks (× [`REFRESH_SECS`]
+/// = ~30s) while the Codespaces mode is showing — `gh codespace list` is a
+/// network call, so it shouldn't ride the 10s project-scan cadence.
+const CODESPACE_REFRESH_TICKS: u8 = 3;
 
 /// Session name used by the cold-shell entry layout (its `session_name` arg).
 /// Sessions with this name are selector throwaways, not project sessions: their
@@ -85,6 +93,24 @@ struct State {
     row_map: Vec<(usize, usize)>,
     /// Whether the refresh timer is currently armed.
     timer_running: bool,
+    /// Which list is showing (Tab toggles).
+    mode: PickerMode,
+    /// The latest codespace list — the `/data` cache at load, then live `gh`
+    /// results as they land.
+    codespaces: Vec<Codespace>,
+    /// The latest `gh` failure, surfaced as a hint line in Codespaces mode.
+    codespaces_error: Option<GhError>,
+    /// Whether a live `gh codespace list` is in flight.
+    codespaces_refreshing: bool,
+    /// The codespace a `gh codespace stop` is in flight for, if any.
+    pending_stop: Option<String>,
+    /// Ticks left until the next codespace list refresh (see
+    /// [`CODESPACE_REFRESH_TICKS`]).
+    codespace_refresh_ticks: u8,
+    /// The user's codespace layout base (the `codespace_session_layout` file's
+    /// content), once read off the host. `None` (unset, unreadable, or not yet
+    /// loaded) falls back to the built-in flock chrome mirror.
+    codespace_layout_base: Option<String>,
 }
 
 register_plugin!(State);
@@ -100,6 +126,9 @@ impl ZellijPlugin for State {
             rename_session(name);
         }
         self.frecency = FrecencyDb::load();
+        // The cached list renders the Codespaces mode instantly; a live
+        // refresh replaces it once permissions land.
+        self.codespaces = codespaces::load_cache();
         // Individual dirs are projects directly, so show them immediately; a
         // root scan fills in the subdirectories once permissions land.
         self.rebuild_projects();
@@ -133,6 +162,10 @@ impl ZellijPlugin for State {
                 self.permissions_granted = matches!(result, PermissionStatus::Granted);
                 if self.permissions_granted {
                     self.fire_scans();
+                    // Pre-warm the codespace list so Tab-ing over doesn't wait
+                    // on a cold `gh` network call.
+                    self.fire_codespace_list();
+                    self.fire_codespace_layout_read();
                     self.arm_refresh_timer();
                 }
                 should_render = true;
@@ -149,10 +182,19 @@ impl ZellijPlugin for State {
                 self.timer_running = false;
                 if self.permissions_granted {
                     self.fire_scans();
+                    // The codespace list refreshes on a slower cadence, and
+                    // only while its mode is showing.
+                    if self.mode == PickerMode::Codespaces {
+                        self.codespace_refresh_ticks =
+                            self.codespace_refresh_ticks.saturating_sub(1);
+                        if self.codespace_refresh_ticks == 0 {
+                            self.fire_codespace_list();
+                        }
+                    }
                     self.arm_refresh_timer();
                 }
             },
-            Event::RunCommandResult(exit_code, stdout, _stderr, context) => {
+            Event::RunCommandResult(exit_code, stdout, stderr, context) => {
                 if let Some(root) = context.get(SCAN_CONTEXT_KEY) {
                     if exit_code == Some(0) {
                         let subdirs = parse_scan_output(&String::from_utf8_lossy(&stdout));
@@ -162,6 +204,47 @@ impl ZellijPlugin for State {
                         self.scanned.insert(root.clone(), Vec::new());
                     }
                     self.rebuild_projects();
+                    should_render = true;
+                } else if context.contains_key(codespaces::LIST_CONTEXT_KEY) {
+                    self.codespaces_refreshing = false;
+                    if exit_code == Some(0) {
+                        match codespaces::parse_list_json(&String::from_utf8_lossy(&stdout)) {
+                            Ok(list) => {
+                                self.codespaces = list;
+                                self.codespaces_error = None;
+                                codespaces::save_cache(&self.codespaces);
+                            },
+                            Err(detail) => {
+                                self.codespaces_error = Some(GhError::Other(detail));
+                            },
+                        }
+                    } else {
+                        self.codespaces_error = Some(codespaces::classify_error(
+                            exit_code,
+                            &String::from_utf8_lossy(&stderr),
+                        ));
+                    }
+                    should_render = true;
+                } else if context.contains_key(codespaces::LAYOUT_CONTEXT_KEY) {
+                    // The user's codespace layout base. A failed read (missing
+                    // file, bad path) just leaves the built-in mirror in place.
+                    if exit_code == Some(0) {
+                        let content = String::from_utf8_lossy(&stdout).to_string();
+                        if !content.trim().is_empty() {
+                            self.codespace_layout_base = Some(content);
+                        }
+                    }
+                } else if context.contains_key(codespaces::STOP_CONTEXT_KEY) {
+                    self.pending_stop = None;
+                    if exit_code != Some(0) {
+                        self.codespaces_error = Some(codespaces::classify_error(
+                            exit_code,
+                            &String::from_utf8_lossy(&stderr),
+                        ));
+                    }
+                    // Whatever happened, re-list so the shown state reconciles
+                    // with reality.
+                    self.fire_codespace_list();
                     should_render = true;
                 }
             },
@@ -177,18 +260,29 @@ impl ZellijPlugin for State {
         let now = now_secs();
         let results = ranking::rank(&self.projects, &self.query, &self.frecency, now);
         let open_paths = self.open_session_paths();
+        let codespace_results = codespaces::rank(&self.codespaces, &self.query);
+        let bound_codespaces = self.bound_codespace_names();
 
         let output = ui::render(ui::RenderInput {
             permissions_granted: self.permissions_granted,
             configured: !self.config.individual_dirs.is_empty()
                 || !self.config.root_dirs.is_empty(),
             query: &self.query,
+            mode: self.mode,
             results: &results,
             open_paths: &open_paths,
+            codespace_results: &codespace_results,
+            bound_codespaces: &bound_codespaces,
+            codespaces_error: self.codespaces_error.as_ref(),
+            codespaces_refreshing: self.codespaces_refreshing,
+            pending_stop: self.pending_stop.as_deref(),
             palette: &self.palette,
             selected: self.selected,
             scroll: self.scroll,
-            total_candidates: self.projects.len(),
+            total_candidates: match self.mode {
+                PickerMode::Projects => self.projects.len(),
+                PickerMode::Codespaces => self.codespaces.len(),
+            },
             rows,
             cols,
         });
@@ -273,6 +367,10 @@ impl State {
                     self.confirm_selection();
                     return true;
                 },
+                BareKey::Tab => {
+                    self.toggle_mode();
+                    return true;
+                },
                 BareKey::Esc => {
                     close_self();
                     return false;
@@ -317,15 +415,27 @@ impl State {
                     close_self();
                     return false;
                 },
+                BareKey::Char('x') if self.mode == PickerMode::Codespaces => {
+                    return self.stop_selected_codespace();
+                },
                 _ => return false,
             }
         }
         false
     }
 
+    /// How many candidates the active mode has (the render pass clamps the
+    /// cursor to the *filtered* result count).
+    fn candidate_count(&self) -> usize {
+        match self.mode {
+            PickerMode::Projects => self.projects.len(),
+            PickerMode::Codespaces => self.codespaces.len(),
+        }
+    }
+
     /// Move the cursor toward a worse (higher-on-screen) result.
     fn select_worse(&mut self) {
-        let max = self.projects.len().saturating_sub(1);
+        let max = self.candidate_count().saturating_sub(1);
         if self.selected < max {
             self.selected += 1;
         }
@@ -353,11 +463,153 @@ impl State {
         }
     }
 
+    /// Flip between the Projects and Codespaces lists, resetting the query and
+    /// cursor (a filter typed against one list is meaningless on the other).
+    fn toggle_mode(&mut self) {
+        self.mode = match self.mode {
+            PickerMode::Projects => PickerMode::Codespaces,
+            PickerMode::Codespaces => PickerMode::Projects,
+        };
+        self.query.clear();
+        self.reset_selection();
+        if self.mode == PickerMode::Codespaces && self.permissions_granted {
+            self.fire_codespace_list();
+        }
+    }
+
+    /// Kick off a `gh codespace list` refresh. The result arrives as a
+    /// `RunCommandResult` tagged with [`codespaces::LIST_CONTEXT_KEY`].
+    fn fire_codespace_list(&mut self) {
+        let argv = codespaces::list_argv();
+        let argv_refs: Vec<&str> = argv.iter().map(|s| s.as_str()).collect();
+        run_command(&argv_refs, codespaces::list_context());
+        self.codespaces_refreshing = true;
+        self.codespace_refresh_ticks = CODESPACE_REFRESH_TICKS;
+    }
+
+    /// Read the configured `codespace_session_layout` file off the host, if
+    /// any. Local file read — lands well before a user can pick a codespace.
+    fn fire_codespace_layout_read(&self) {
+        let Some(path) = &self.config.codespace_session_layout else {
+            return;
+        };
+        let argv = codespaces::layout_read_argv(path);
+        let argv_refs: Vec<&str> = argv.iter().map(|s| s.as_str()).collect();
+        run_command(&argv_refs, codespaces::layout_read_context());
+    }
+
+    /// Codespace names that currently have a live bound session (recognized by
+    /// each session's `default_command`), for the open badge.
+    fn bound_codespace_names(&self) -> HashSet<String> {
+        self.sessions
+            .iter()
+            .filter_map(|s| {
+                s.default_command
+                    .as_deref()
+                    .and_then(codespaces::parse_codespace_ssh)
+                    .map(str::to_owned)
+            })
+            .collect()
+    }
+
+    /// The live sessions reduced to what the codespace resolution needs: every
+    /// name (taken for collision-avoidance) plus the parsed binding, if any.
+    fn existing_codespace_sessions(&self) -> Vec<codespaces::ExistingSession> {
+        self.sessions
+            .iter()
+            .map(|s| codespaces::ExistingSession {
+                name: s.name.clone(),
+                bound_codespace: s
+                    .default_command
+                    .as_deref()
+                    .and_then(codespaces::parse_codespace_ssh)
+                    .map(str::to_owned),
+            })
+            .collect()
+    }
+
+    /// Open the selected codespace: switch to its bound session if one is
+    /// live, otherwise create one from a generated layout that binds every new
+    /// pane/tab to `gh codespace ssh` (and disables serialization, so a dead
+    /// bound session is never resurrectable). Then closes the picker.
+    fn confirm_codespace_selection(&mut self) {
+        let ranked = codespaces::rank(&self.codespaces, &self.query);
+        let Some(codespace) = ranked.get(self.selected).map(|r| r.codespace.clone()) else {
+            return;
+        };
+
+        let action = codespaces::resolve_open(&codespace, &self.existing_codespace_sessions());
+
+        let current_session_name = self
+            .sessions
+            .iter()
+            .find(|s| s.is_current_session)
+            .map(|s| s.name.clone());
+
+        match action {
+            // Already in the bound session: switching would be refused by the
+            // server ("Cannot attach to same session"), so just dismiss.
+            codespaces::OpenAction::Switch { name }
+                if Some(&name) == current_session_name.as_ref() => {},
+            codespaces::OpenAction::Switch { name } => {
+                switch_session(Some(&name));
+                self.discard_throwaway_session(current_session_name.as_deref());
+            },
+            codespaces::OpenAction::Create { name } => {
+                let layout = LayoutInfo::Stringified(codespaces::layout_doc_for(
+                    &codespace.name,
+                    &self.config.sidebar_args,
+                    self.codespace_layout_base.as_deref(),
+                ));
+                switch_session_with_layout(Some(&name), layout, None);
+                self.discard_throwaway_session(current_session_name.as_deref());
+            },
+        }
+        close_self();
+    }
+
+    /// Stop the selected codespace (`Ctrl-x`): kill its bound live session (if
+    /// any, and not the one we're running in), then fire `gh codespace stop`.
+    /// The picker stays open; the row shows "stopping…" until the re-list
+    /// reconciles.
+    fn stop_selected_codespace(&mut self) -> bool {
+        if self.pending_stop.is_some() {
+            return false; // one stop at a time — the re-list will catch up
+        }
+        let ranked = codespaces::rank(&self.codespaces, &self.query);
+        let Some(codespace) = ranked.get(self.selected).map(|r| r.codespace.clone()) else {
+            return false;
+        };
+
+        if let Some(bound) = self.sessions.iter().find(|s| {
+            s.default_command
+                .as_deref()
+                .and_then(codespaces::parse_codespace_ssh)
+                == Some(codespace.name.as_str())
+        }) {
+            // Killing the session we're attached to would sever this client
+            // mid-picker; leave it — its panes just lose their connection.
+            if !bound.is_current_session {
+                let _ = kill_sessions(&[bound.name.as_str()]);
+            }
+        }
+
+        let argv = codespaces::stop_argv(&codespace.name);
+        let argv_refs: Vec<&str> = argv.iter().map(|s| s.as_str()).collect();
+        run_command(&argv_refs, codespaces::stop_context(&codespace.name));
+        self.pending_stop = Some(codespace.name);
+        true
+    }
+
     /// Open the selected project: switch to its session if one already roots at
     /// that folder, otherwise create a new session there with the configured
     /// `session_layout`. Bumps the frecency db on the open, then closes the
     /// picker.
     fn confirm_selection(&mut self) {
+        if self.mode == PickerMode::Codespaces {
+            self.confirm_codespace_selection();
+            return;
+        }
         let now = now_secs();
         let results = ranking::rank(&self.projects, &self.query, &self.frecency, now);
         // Clone the path so the borrow of `self.projects` (via `results`) ends

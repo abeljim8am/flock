@@ -16,11 +16,21 @@
 use unicode_width::UnicodeWidthStr;
 use zellij_tile::prelude::PaletteColor;
 
+use crate::codespaces::{GhError, RankedCodespace, StateKind};
 use crate::palette::{bg, fg, goto, Theme, BOLD, DIM, NORMAL_INTENSITY, RESET};
 use crate::ranking::Ranked;
 
-/// The badge glyph marking a project that already has a live session.
+/// The badge glyph marking a project/codespace that already has a live session.
 const OPEN_BADGE: &str = "●";
+
+/// Which list the picker is showing. Tab toggles between them; each keeps the
+/// same reverse-layout fuzzy list, differing only in rows and data source.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PickerMode {
+    #[default]
+    Projects,
+    Codespaces,
+}
 
 /// A styled run of text on one row.
 struct Span {
@@ -54,11 +64,24 @@ pub struct RenderInput<'a> {
     pub permissions_granted: bool,
     pub configured: bool,
     pub query: &'a str,
+    /// Which list is showing; selects between `results` and `codespace_results`.
+    pub mode: PickerMode,
     pub results: &'a [Ranked<'a>],
     /// Absolute project paths that currently have a live session.
     pub open_paths: &'a std::collections::HashSet<String>,
+    /// Ranked codespaces (Codespaces mode).
+    pub codespace_results: &'a [RankedCodespace<'a>],
+    /// Codespace names that currently have a live bound session.
+    pub bound_codespaces: &'a std::collections::HashSet<String>,
+    /// The latest `gh` failure, rendered as an actionable hint line.
+    pub codespaces_error: Option<&'a GhError>,
+    /// Whether a live `gh codespace list` is in flight.
+    pub codespaces_refreshing: bool,
+    /// The codespace name a stop is pending for, if any.
+    pub pending_stop: Option<&'a str>,
     pub palette: &'a Theme,
-    /// Selection cursor: absolute index into `results` (0 = best, bottom-most).
+    /// Selection cursor: absolute index into the active results (0 = best,
+    /// bottom-most).
     pub selected: usize,
     /// Scroll offset: index of the bottom-most visible result.
     pub scroll: usize,
@@ -82,8 +105,14 @@ pub fn render(input: RenderInput) -> RenderOutput {
         permissions_granted,
         configured,
         query,
+        mode,
         results,
         open_paths,
+        codespace_results,
+        bound_codespaces,
+        codespaces_error,
+        codespaces_refreshing,
+        pending_stop,
         palette: p,
         rows,
         cols,
@@ -105,13 +134,24 @@ pub fn render(input: RenderInput) -> RenderOutput {
 
     let input_y = rows - 1;
 
+    // The mode header (Projects · Codespaces) takes the top row when there's
+    // room for it alongside the input row and at least one result row.
+    let has_header = rows >= 3;
+    if has_header {
+        render_header_row(&mut out, cols, mode, p);
+    }
+
     // Clamp the selection + scroll to the current result set, keeping the
     // selected row inside the visible window above the input.
-    // Rows above the input line. 0 when the pane is a single row tall, in
-    // which case no result rows render (the loop below would otherwise
-    // compute `input_y - 1 - k` with input_y == 0 and underflow).
-    let total = results.len();
-    let capacity = rows.saturating_sub(1);
+    // `capacity` is the rows available for results: everything except the
+    // input line and (when shown) the header. 0 when the pane is a single row
+    // tall, in which case no result rows render (the loop below would
+    // otherwise compute `input_y - 1 - k` with input_y == 0 and underflow).
+    let total = match mode {
+        PickerMode::Projects => results.len(),
+        PickerMode::Codespaces => codespace_results.len(),
+    };
+    let capacity = rows.saturating_sub(if has_header { 2 } else { 1 });
     let selected = if total == 0 {
         0
     } else {
@@ -125,7 +165,7 @@ pub fn render(input: RenderInput) -> RenderOutput {
         scroll = selected;
     }
 
-    // Hint states: no permissions, or nothing configured / discovered yet.
+    // Hint states: no permissions, a gh failure, or an empty list.
     if !permissions_granted {
         render_row(
             &mut out,
@@ -136,42 +176,71 @@ pub fn render(input: RenderInput) -> RenderOutput {
             &[Span::new(" waiting for permissions…", p.muted).dim()],
         );
     } else if total == 0 {
-        let msg = if !configured {
-            " no project folders configured"
-        } else if query.trim().is_empty() {
-            " no projects found"
-        } else {
-            " no matches"
+        let spans = match mode {
+            PickerMode::Projects => {
+                let msg = if !configured {
+                    " no project folders configured"
+                } else if query.trim().is_empty() {
+                    " no projects found"
+                } else {
+                    " no matches"
+                };
+                vec![Span::new(msg, p.muted).dim()]
+            },
+            PickerMode::Codespaces => match codespaces_error {
+                Some(err) => codespaces_error_spans(err, p),
+                None => {
+                    let msg = if codespaces_refreshing {
+                        " loading codespaces…"
+                    } else if query.trim().is_empty() {
+                        " no codespaces"
+                    } else {
+                        " no matches"
+                    };
+                    vec![Span::new(msg, p.muted).dim()]
+                },
+            },
         };
-        render_row(
-            &mut out,
-            0,
-            input_y.saturating_sub(1),
-            cols,
-            None,
-            &[Span::new(msg, p.muted).dim()],
-        );
+        render_row(&mut out, 0, input_y.saturating_sub(1), cols, None, &spans);
     }
 
-    // A project's parent path is only worth showing to disambiguate a name
-    // collision, so count how many results share each basename; rows whose name
-    // is unique render the name alone.
-    let mut name_counts: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
-    for r in results {
-        *name_counts.entry(r.project.name.as_str()).or_insert(0) += 1;
-    }
-
-    // Results, best (results[scroll]) just above the input, worse ones higher up.
     let mut row_map = Vec::new();
     let visible_end = (scroll + capacity).min(total);
-    for (k, idx) in (scroll..visible_end).enumerate() {
-        let y = input_y - 1 - k;
-        let r = &results[idx];
-        let is_selected = idx == selected;
-        let is_open = open_paths.contains(&r.project.path.to_string_lossy().to_string());
-        let show_path = name_counts.get(r.project.name.as_str()).copied().unwrap_or(0) > 1;
-        render_result_row(&mut out, y, cols, r, is_selected, is_open, show_path, p);
-        row_map.push((y, idx));
+    match mode {
+        PickerMode::Projects => {
+            // A project's parent path is only worth showing to disambiguate a
+            // name collision, so count how many results share each basename;
+            // rows whose name is unique render the name alone.
+            let mut name_counts: std::collections::HashMap<&str, usize> =
+                std::collections::HashMap::new();
+            for r in results {
+                *name_counts.entry(r.project.name.as_str()).or_insert(0) += 1;
+            }
+
+            // Results, best (results[scroll]) just above the input, worse ones
+            // higher up.
+            for (k, idx) in (scroll..visible_end).enumerate() {
+                let y = input_y - 1 - k;
+                let r = &results[idx];
+                let is_selected = idx == selected;
+                let is_open = open_paths.contains(&r.project.path.to_string_lossy().to_string());
+                let show_path =
+                    name_counts.get(r.project.name.as_str()).copied().unwrap_or(0) > 1;
+                render_result_row(&mut out, y, cols, r, is_selected, is_open, show_path, p);
+                row_map.push((y, idx));
+            }
+        },
+        PickerMode::Codespaces => {
+            for (k, idx) in (scroll..visible_end).enumerate() {
+                let y = input_y - 1 - k;
+                let r = &codespace_results[idx];
+                let is_selected = idx == selected;
+                let is_bound = bound_codespaces.contains(&r.codespace.name);
+                let is_stopping = pending_stop == Some(r.codespace.name.as_str());
+                render_codespace_row(&mut out, y, cols, r, is_selected, is_bound, is_stopping, p);
+                row_map.push((y, idx));
+            }
+        },
     }
 
     // The input line on the bottom row: prompt + query + a block cursor, with a
@@ -186,6 +255,147 @@ pub fn render(input: RenderInput) -> RenderOutput {
         scroll,
         row_map,
     }
+}
+
+/// The top header row: both mode names with the active one highlighted, plus a
+/// right-aligned key hint.
+fn render_header_row(out: &mut String, cols: usize, mode: PickerMode, p: &Theme) {
+    let active = Style {
+        fg: p.accent,
+        bold: true,
+        dim: false,
+    };
+    let inactive = Style {
+        fg: p.text,
+        bold: false,
+        dim: true,
+    };
+    let (projects_style, codespaces_style) = match mode {
+        PickerMode::Projects => (active, inactive),
+        PickerMode::Codespaces => (inactive, active),
+    };
+    let mut spans = vec![
+        Span::new(" ", p.text),
+        styled("Projects", projects_style),
+        Span::new(" · ", p.text).dim(),
+        styled("Codespaces", codespaces_style),
+    ];
+
+    let hint = match mode {
+        PickerMode::Projects => "Tab ",
+        PickerMode::Codespaces => "Tab switch · Ctrl-x stop ",
+    };
+    let left_w: usize = spans.iter().map(|s| s.text.width()).sum();
+    let hint_w = hint.width();
+    if left_w + hint_w < cols {
+        spans.push(Span::new(" ".repeat(cols - left_w - hint_w), p.text));
+        spans.push(Span::new(hint, p.muted).dim());
+    }
+    render_row(out, 0, 0, cols, None, &spans);
+}
+
+/// The hint line for a gh failure: a red marker plus an actionable message.
+fn codespaces_error_spans(err: &GhError, p: &Theme) -> Vec<Span> {
+    let msg = match err {
+        GhError::GhMissing => " gh not found — install the GitHub CLI".to_owned(),
+        GhError::NotAuthed => " gh not authenticated — run: gh auth login".to_owned(),
+        GhError::MissingScope => {
+            " missing codespace scope — run: gh auth refresh -h github.com -s codespace".to_owned()
+        },
+        GhError::Other(detail) => format!(" gh error: {}", detail),
+    };
+    vec![Span::new(" ✗", p.red), Span::new(msg, p.muted).dim()]
+}
+
+/// Render one codespace row: `<badge> <display name>  <repo>  <state>`. The
+/// badge column mirrors the projects list (a green dot when a live session is
+/// bound); the state renders as a colored word so "will boot on connect" vs.
+/// "ready" is visible at a glance.
+fn render_codespace_row(
+    out: &mut String,
+    y: usize,
+    cols: usize,
+    r: &RankedCodespace,
+    selected: bool,
+    is_bound: bool,
+    is_stopping: bool,
+    p: &Theme,
+) {
+    let row_bg = if selected { Some(p.selection_bg) } else { None };
+    let mut spans = Vec::new();
+
+    // Badge column (2 cells): a green dot for an already-bound live session.
+    if is_bound {
+        spans.push(Span::new(" ", p.text));
+        spans.push(Span::new(OPEN_BADGE, p.green));
+    } else {
+        spans.push(Span::new("  ", p.text));
+    }
+    spans.push(Span::new(" ", p.text));
+
+    // Display name, highlighted like a project name.
+    let name_budget = cols.saturating_sub(4).min(cols / 2 + 8).max(4);
+    let name = truncate_text(&r.codespace.display_name, name_budget);
+    let name_style = Style {
+        fg: p.text,
+        bold: true,
+        dim: false,
+    };
+    push_highlighted(
+        &mut spans,
+        &name,
+        &clip_ranges(&r.name_ranges, &name),
+        name_style,
+        name_style,
+    );
+
+    // The state word (colored) goes at the end; reserve its width so the repo
+    // truncates before the state does.
+    let (state_text, state_color, state_dim) = if is_stopping {
+        ("stopping…".to_owned(), p.yellow, false)
+    } else {
+        match r.codespace.state_kind() {
+            StateKind::Running => (r.codespace.state.clone(), p.green, false),
+            StateKind::Stopped => (r.codespace.state.clone(), p.text, true),
+            StateKind::Busy => (r.codespace.state.clone(), p.yellow, false),
+            StateKind::Unknown => (r.codespace.state.clone(), p.muted, true),
+        }
+    };
+    let state_w = state_text.width() + 2;
+
+    // The dimmed repository, truncated to what's left.
+    if !r.codespace.repository.is_empty() {
+        let used: usize = spans.iter().map(|s| s.text.width()).sum();
+        let repo_budget = cols.saturating_sub(used + state_w + 2);
+        if repo_budget > 1 {
+            let repo_style = Style {
+                fg: p.text,
+                bold: false,
+                dim: true,
+            };
+            spans.push(styled("  ", repo_style));
+            let repo = truncate_text(&r.codespace.repository, repo_budget);
+            push_highlighted(
+                &mut spans,
+                &repo,
+                &clip_ranges(&r.repo_ranges, &repo),
+                repo_style,
+                repo_style,
+            );
+        }
+    }
+
+    if !state_text.is_empty() {
+        let used: usize = spans.iter().map(|s| s.text.width()).sum();
+        if used + state_w <= cols {
+            spans.push(Span::new("  ", p.text));
+            let mut state_span = Span::new(state_text, state_color);
+            state_span.dim = state_dim;
+            spans.push(state_span);
+        }
+    }
+
+    render_row(out, 0, y, cols, row_bg, &spans);
 }
 
 /// Render one result row: `<badge> <name>` plus a `<dim path>` only when
@@ -481,8 +691,14 @@ mod tests {
             permissions_granted: true,
             configured: true,
             query: "p",
+            mode: PickerMode::Projects,
             results: &results,
             open_paths: &std::collections::HashSet::new(),
+            codespace_results: &[],
+            bound_codespaces: &std::collections::HashSet::new(),
+            codespaces_error: None,
+            codespaces_refreshing: false,
+            pending_stop: None,
             palette: &theme,
             selected: 0,
             scroll: 0,

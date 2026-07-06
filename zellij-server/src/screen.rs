@@ -1481,6 +1481,11 @@ pub(crate) struct Screen {
     /// so plugins can group sessions by the project folder they belong to.
     /// Empty until set (in `screen_thread_main`).
     workspace_root: PathBuf,
+    /// The `default_command` option this session was created with (command +
+    /// args every new pane/tab runs instead of the default shell — e.g. a
+    /// layout-injected flock codespace binding). Surfaced on `SessionInfo` so
+    /// plugins can recognize bound sessions. `None` for ordinary sessions.
+    session_default_command: Option<Vec<String>>,
     /// The latest per-pane agent status published by this session's
     /// flock-sidebar plugin (via `PluginCommand::PublishAgentState`). Stored
     /// here and copied onto every `SessionInfo` we generate, so it rides the
@@ -1645,6 +1650,7 @@ impl Screen {
             host_theme_dark_styling: None,
             host_theme_light_styling: None,
             workspace_root: PathBuf::new(),
+            session_default_command: None,
             published_agent_states: BTreeMap::new(),
             published_flock_sidebar_state: None,
         }
@@ -3421,6 +3427,7 @@ impl Screen {
                 .collect(),
             creation_time,
             workspace_root: self.workspace_root.clone(),
+            default_command: self.session_default_command.clone(),
             agent_states: self.published_agent_states.clone(),
             flock_sidebar_state: self.published_flock_sidebar_state,
         };
@@ -5659,6 +5666,7 @@ pub(crate) fn screen_thread_main(
         );
     }
 
+    let session_default_command = config.options.default_command.clone();
     let config_options = config.options;
     let arrow_fonts = !config_options.simplified_ui.unwrap_or_default();
     let draw_pane_frames = config_options.pane_frames.unwrap_or(true);
@@ -5767,6 +5775,7 @@ pub(crate) fn screen_thread_main(
     screen.workspace_root = session_cwd
         .filter(|p| !p.as_os_str().is_empty())
         .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")));
+    screen.session_default_command = session_default_command;
 
     let mut pending_tab_ids: HashSet<usize> = HashSet::new();
     let mut pending_tab_switches: HashSet<(usize, ClientId)> = HashSet::new(); // usize is the
@@ -8702,6 +8711,7 @@ pub(crate) fn screen_thread_main(
                         .collect(),
                     creation_time,
                     workspace_root: screen.workspace_root.clone(),
+                    default_command: screen.session_default_command.clone(),
                     agent_states: screen.published_agent_states.clone(),
                     flock_sidebar_state: screen.published_flock_sidebar_state,
                 };

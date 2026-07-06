@@ -319,9 +319,48 @@ impl SessionConfiguration {
     }
 }
 
+/// The `TerminalAction` new panes/tabs run when no explicit command is given:
+/// the session's `default_command` (command + args, e.g. a flock codespace
+/// binding like `gh codespace ssh -c <name>`) when set, else the configured
+/// `default_shell`.
+fn session_default_terminal_action(
+    default_command: Option<&[String]>,
+    default_shell: Option<&PathBuf>,
+    cwd: Option<PathBuf>,
+) -> Option<TerminalAction> {
+    if let Some(command) = default_command.filter(|c| !c.is_empty()) {
+        return Some(TerminalAction::RunCommand(RunCommand {
+            command: PathBuf::from(&command[0]),
+            args: command[1..].to_vec(),
+            cwd,
+            // A finished command closes its pane, exactly like a shell exit
+            // would — `exit` inside a codespace SSH pane should dismiss the
+            // pane, not park it on the re-run prompt (which turns the next
+            // keypress into a surprise reconnect).
+            hold_on_close: false,
+            use_terminal_title: true,
+            ..Default::default()
+        }));
+    }
+    default_shell.map(|shell| {
+        TerminalAction::RunCommand(RunCommand {
+            command: shell.clone(),
+            cwd,
+            use_terminal_title: true,
+            ..Default::default()
+        })
+    })
+}
+
 pub(crate) struct SessionMetaData {
     pub senders: ThreadSenders,
     pub default_shell: Option<TerminalAction>,
+    // The `default_command` this session was created with (command + args
+    // every new pane/tab runs instead of the default shell — e.g. a
+    // layout-injected flock codespace binding). Kept separately from
+    // `default_shell` so a config reload, which re-derives `default_shell`
+    // from the on-disk config, cannot clobber the creation-time binding.
+    session_default_command: Option<Vec<String>>,
     pub current_input_modes: HashMap<ClientId, InputMode>,
     pub session_configuration: SessionConfiguration,
     pub web_sharing: WebSharing, // this is a special attribute explicitly set on session
@@ -371,14 +410,23 @@ impl SessionMetaData {
                 new_plugin_config = Some(new_config.plugins.clone());
             }
 
-            self.default_shell = new_config.options.default_shell.as_ref().map(|shell| {
-                TerminalAction::RunCommand(RunCommand {
-                    command: shell.clone(),
-                    cwd: new_config.options.default_cwd.clone(),
-                    use_terminal_title: true,
-                    ..Default::default()
-                })
-            });
+            self.default_shell = if self.session_default_command.is_some() {
+                // The session was created with an injected default_command
+                // (e.g. a codespace binding); the reloaded disk config knows
+                // nothing about layout-injected options, so re-derive from
+                // the preserved binding instead of clobbering it.
+                session_default_terminal_action(
+                    self.session_default_command.as_deref(),
+                    new_config.options.default_shell.as_ref(),
+                    new_config.options.default_cwd.clone(),
+                )
+            } else {
+                session_default_terminal_action(
+                    new_config.options.default_command.as_deref(),
+                    new_config.options.default_shell.as_ref(),
+                    new_config.options.default_cwd.clone(),
+                )
+            };
             let host_theme_dark = new_config
                 .options
                 .theme_dark
@@ -1013,14 +1061,11 @@ pub fn start_server(mut os_input: Box<dyn ServerOsApi>, socket_path: PathBuf) {
                     is_web_client,
                 );
 
-                let default_shell = runtime_config_options.default_shell.map(|shell| {
-                    TerminalAction::RunCommand(RunCommand {
-                        command: shell,
-                        cwd: config.options.default_cwd.clone(),
-                        use_terminal_title: true,
-                        ..Default::default()
-                    })
-                });
+                let default_shell = session_default_terminal_action(
+                    runtime_config_options.default_command.as_deref(),
+                    runtime_config_options.default_shell.as_ref(),
+                    config.options.default_cwd.clone(),
+                );
                 let cwd = cli_assets
                     .cwd
                     .or_else(|| runtime_config_options.default_cwd);
@@ -1993,13 +2038,12 @@ fn init_session(
         config_options.web_server_cert.is_some() && config_options.web_server_key.is_some();
     let enforce_https_for_localhost = config_options.enforce_https_for_localhost.unwrap_or(false);
 
-    let default_shell = config_options.default_shell.clone().map(|command| {
-        TerminalAction::RunCommand(RunCommand {
-            command,
-            use_terminal_title: true,
-            ..Default::default()
-        })
-    });
+    let session_default_command = config_options.default_command.clone();
+    let default_shell = session_default_terminal_action(
+        config_options.default_command.as_deref(),
+        config_options.default_shell.as_ref(),
+        None,
+    );
     let path_to_default_shell = config_options
         .default_shell
         .clone()
@@ -2200,6 +2244,7 @@ fn init_session(
             should_silently_fail: false,
         },
         default_shell,
+        session_default_command,
         session_configuration: Default::default(),
         current_input_modes: HashMap::new(),
         screen_thread: Some(screen_thread),

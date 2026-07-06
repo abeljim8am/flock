@@ -5987,6 +5987,7 @@ Config {
         theme_light: None,
         default_mode: None,
         default_shell: None,
+        default_command: None,
         default_cwd: None,
         default_layout: None,
         layout_dir: None,

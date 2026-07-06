@@ -1215,6 +1215,7 @@ impl TryFrom<SessionInfo> for ProtobufSessionManifest {
                 .collect(),
             creation_time: session_info.creation_time.as_secs(),
             workspace_root: session_info.workspace_root.display().to_string(),
+            default_command: session_info.default_command.unwrap_or_default(),
             agent_states: session_info
                 .agent_states
                 .into_iter()
@@ -1362,6 +1363,11 @@ impl TryFrom<ProtobufSessionManifest> for SessionInfo {
             pane_history,
             creation_time: Duration::from_secs(protobuf_session_manifest.creation_time),
             workspace_root: PathBuf::from(protobuf_session_manifest.workspace_root),
+            default_command: if protobuf_session_manifest.default_command.is_empty() {
+                None
+            } else {
+                Some(protobuf_session_manifest.default_command)
+            },
             agent_states,
             flock_sidebar_state: protobuf_session_manifest
                 .flock_sidebar_state
@@ -2838,6 +2844,13 @@ fn serialize_session_update_event_with_non_default_values() {
         pane_history: Default::default(),
         creation_time: Duration::from_secs(100),
         workspace_root: PathBuf::from("/home/aviram/session-1"),
+        default_command: Some(vec![
+            "gh".to_owned(),
+            "codespace".to_owned(),
+            "ssh".to_owned(),
+            "-c".to_owned(),
+            "my-codespace".to_owned(),
+        ]),
         agent_states: {
             let mut agent_states = BTreeMap::new();
             agent_states.insert(
@@ -2889,6 +2902,7 @@ fn serialize_session_update_event_with_non_default_values() {
         pane_history: Default::default(),
         creation_time: Duration::from_secs(200),
         workspace_root: PathBuf::from("/home/aviram/session-2"),
+        default_command: None,
         agent_states: Default::default(),
         flock_sidebar_state: None,
     };

@@ -183,6 +183,48 @@ pub fn detect_agent(agent: Option<Agent>, screen_content: &str) -> AgentDetectio
     }
 }
 
+/// Identify which agent's UI is on screen, for panes whose argv carries no
+/// agent identity — codespace SSH panes, where the local command is just the
+/// `gh` transport and the agent runs remotely. Only chrome that is
+/// *structurally specific* to one agent participates: a wrong identification
+/// would drive all further state arbitration for the wrong agent, so precision
+/// wins over coverage. Ambiguous frames return `None` — a later frame (or the
+/// scrollback pull) gets another shot once distinctive chrome renders.
+///
+/// Currently identifies Claude Code and Codex, the two agents with structural
+/// screen chrome (bordered prompt boxes, status headers) rather than
+/// generic-wording heuristics. Add an agent here only with markers that no
+/// other TUI in [`Agent`] renders.
+pub fn identify_agent_from_screen(content: &str) -> Option<Agent> {
+    // Claude first: its bordered ❯-prompt box and overlay screens are the most
+    // structural signals. (Generic markers like "esc to interrupt" are shared
+    // with codex and deliberately NOT used for identification.)
+    if claude_chrome_on_screen(content) {
+        return Some(Agent::Claude);
+    }
+    if codex_chrome_on_screen(content) {
+        return Some(Agent::Codex);
+    }
+    None
+}
+
+/// Claude-specific structural chrome: the live prompt box (two `───` rules
+/// with a `❯` line between), its permission/select forms, or the
+/// transcript-viewer/model-picker overlays.
+fn claude_chrome_on_screen(content: &str) -> bool {
+    has_claude_prompt_box(content)
+        || has_claude_visible_blocker(content)
+        || claude_skips_state_update(content)
+}
+
+/// Codex-specific structural chrome: the `• Working (…` / background-terminal
+/// status header, its confirm footers, or the `›` input prompt.
+fn codex_chrome_on_screen(content: &str) -> bool {
+    has_codex_working_header(content)
+        || has_codex_visible_blocker(content)
+        || has_codex_prompt(content)
+}
+
 // ---------------------------------------------------------------------------
 // Per-agent detectors
 // ---------------------------------------------------------------------------
@@ -1532,6 +1574,45 @@ fn is_generic_runtime_or_shell(name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ---- Screen-based identification (remote codespace panes) ----
+
+    #[test]
+    fn screen_identifies_claude_by_prompt_box() {
+        let idle = "some output\n─────────\n❯ \n─────────";
+        assert_eq!(identify_agent_from_screen(idle), Some(Agent::Claude));
+        let working = "✳ Simplifying recompute_tangents…\n─────────\n❯ \n─────────";
+        assert_eq!(identify_agent_from_screen(working), Some(Agent::Claude));
+    }
+
+    #[test]
+    fn screen_identifies_claude_by_permission_form() {
+        let blocked = "Bash command\nrm -rf build\nDo you want to proceed?\n❯ 1. Yes\n  2. No\nesc to cancel";
+        assert_eq!(identify_agent_from_screen(blocked), Some(Agent::Claude));
+    }
+
+    #[test]
+    fn screen_identifies_codex_by_working_header() {
+        let working = "• Working (12s • esc to interrupt)\n  └ cargo test";
+        assert_eq!(identify_agent_from_screen(working), Some(Agent::Codex));
+    }
+
+    #[test]
+    fn screen_identifies_codex_by_prompt() {
+        assert_eq!(identify_agent_from_screen("› "), Some(Agent::Codex));
+        assert_eq!(
+            identify_agent_from_screen("• Ran git status\n\n› Implement {feature}"),
+            Some(Agent::Codex)
+        );
+    }
+
+    #[test]
+    fn screen_identifies_nothing_on_a_plain_shell() {
+        assert_eq!(identify_agent_from_screen("~/project $ ls\nsrc  Cargo.toml"), None);
+        assert_eq!(identify_agent_from_screen(""), None);
+        // Generic working words shared across agents must not identify anyone.
+        assert_eq!(identify_agent_from_screen("building…\nesc to interrupt"), None);
+    }
 
     // ---- Agent identification ----
 

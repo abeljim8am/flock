@@ -36,6 +36,7 @@
 //! the sidebar groups sessions under that folder (see [`ui::group_sessions`])
 //! instead of guessing from pane cwds.
 
+mod codespace;
 mod detect;
 mod hook;
 mod palette;
@@ -46,7 +47,7 @@ mod ui;
 use std::collections::{BTreeMap, HashSet};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
-use detect::{detect_agent, identify_agent_from_command, AgentState};
+use detect::{detect_agent, identify_agent_from_command, identify_agent_from_screen, AgentState};
 use hook::{parse_hook_report, HookReport, HOOK_PIPE_NAME};
 use palette::Theme;
 use sessionizer::SessionizerConfig;
@@ -282,10 +283,7 @@ impl ZellijPlugin for State {
                 self.last_render_report_at = Some(now);
                 for (pane_id, contents) in pane_contents {
                     let screen = screen_text(&contents);
-                    let entry = self.agents.entry(pane_id).or_default();
-                    let agent = entry.detected_agent;
-                    let detection = detect_agent(agent, &screen);
-                    if entry.observe_screen(agent, detection, now) {
+                    if self.observe_pane_screen(pane_id, &screen, now) {
                         should_render = true;
                     }
                 }
@@ -477,10 +475,13 @@ impl State {
     /// agent's state changed. Panes that have since closed return an error and
     /// are skipped (pruning removes them on the next `PaneUpdate`).
     fn pull_agent_screens(&mut self, now: Instant) -> bool {
+        // Remote panes are pulled even before an agent is identified — the
+        // screen is their only identification source, so a backgrounded bound
+        // session must keep probing or a remote agent never appears.
         let pane_ids: Vec<PaneId> = self
             .agents
             .iter()
-            .filter(|(_, st)| st.is_agent())
+            .filter(|(_, st)| st.is_agent() || st.remote)
             .map(|(pane_id, _)| *pane_id)
             .collect();
         let mut changed = false;
@@ -489,15 +490,39 @@ impl State {
                 continue;
             };
             let screen = screen_text(&contents);
-            if let Some(entry) = self.agents.get_mut(&pane_id) {
-                let agent = entry.detected_agent;
-                let detection = detect_agent(agent, &screen);
-                if entry.observe_screen(agent, detection, now) {
-                    changed = true;
-                }
+            if self.observe_pane_screen(pane_id, &screen, now) {
+                changed = true;
             }
         }
         changed
+    }
+
+    /// Feed one pane's screen text through identification (remote panes) and
+    /// state detection. For a remote (codespace SSH) pane the screen is the
+    /// only agent-identity source: confident agent chrome (re)identifies the
+    /// pane's agent and cancels any pending absence window, while a live frame
+    /// with no recognizable chrome opens it (release happens in `tick` after
+    /// the remote grace). Returns whether the arbitrated state changed.
+    fn observe_pane_screen(&mut self, pane_id: PaneId, screen: &str, now: Instant) -> bool {
+        let entry = self.agents.entry(pane_id).or_default();
+        let mut agent = entry.detected_agent;
+        if entry.remote {
+            match identify_agent_from_screen(screen) {
+                Some(identified) => {
+                    agent = Some(identified);
+                    entry.set_detected_agent(agent, now);
+                },
+                None => {
+                    // An overlay screen (transcript viewer, model picker)
+                    // hides the chrome without saying the agent is gone.
+                    if agent.is_some() && !detect_agent(agent, screen).skip_state_update {
+                        entry.mark_agent_missing(now);
+                    }
+                },
+            }
+        }
+        let detection = detect_agent(agent, screen);
+        entry.observe_screen(agent, detection, now)
     }
 
     /// Whether enough time has elapsed to refresh the cross-session list. Kept
@@ -558,7 +583,9 @@ impl State {
     /// entry session (named [`HIDDEN_SESSION_NAME`]) is always hidden — it's the
     /// picker's throwaway host, not a workspace. With no sessionizer config, every
     /// other live session remains visible for backwards-compatible default
-    /// behavior; otherwise only sessions whose workspace is in the configured set.
+    /// behavior; otherwise only sessions whose workspace is in the configured set —
+    /// plus codespace-bound sessions, whose `workspace_root` is never a configured
+    /// project folder (the workspace lives inside the codespace).
     fn visible_sessions(&self) -> Vec<SessionInfo> {
         self.sessions
             .iter()
@@ -566,6 +593,11 @@ impl State {
             .filter(|session| {
                 !self.sessionizer.is_configured()
                     || self.sessionizer.contains_workspace(&session.workspace_root)
+                    || session
+                        .default_command
+                        .as_deref()
+                        .and_then(codespace::parse_codespace_ssh)
+                        .is_some()
             })
             .cloned()
             .collect()
@@ -902,7 +934,21 @@ impl State {
             // The foreground command is the program actually running in the
             // pane; only it determines the agent.
             let agent = identify_agent_from_command(command);
+            let remote_transport = agent.is_none() && self.command_is_remote_transport(command);
             let entry = self.agents.entry(pane_id).or_default();
+            if agent.is_none() && (remote_transport || entry.remote) {
+                // A remote transport's local argv (`gh codespace ssh …`, or an
+                // ssh child of it) carries no agent identity — identification
+                // and release are screen-driven (see `observe_pane_screen`),
+                // so argv must neither set nor clear the agent here.
+                entry.remote = true;
+                return false;
+            }
+            if agent.is_some() {
+                // A local agent took the pane's foreground over (e.g. run
+                // directly inside a bound session) — argv identity wins again.
+                entry.remote = false;
+            }
             if agent.is_none() && entry.detected_agent.is_some() {
                 // A non-agent foreground report while an agent is tracked can
                 // be a transient scan miss: under a resident env wrapper
@@ -933,12 +979,40 @@ impl State {
 
     fn seed_agent_command(&mut self, pane_id: PaneId, command: &[String], now: Instant) -> bool {
         let Some(agent) = identify_agent_from_command(command) else {
+            // A remote transport snapshot marks the pane remote so screen
+            // identification takes over; any other non-agent snapshot is
+            // ignored (it must not clear an already-tracked agent either).
+            if self.command_is_remote_transport(command) {
+                self.agents.entry(pane_id).or_default().remote = true;
+            }
             return false;
         };
         self.agents
             .entry(pane_id)
             .or_default()
             .set_detected_agent(Some(agent), now)
+    }
+
+    /// Whether a pane's argv is a remote-transport command rather than a local
+    /// program: the codespace SSH binding itself, or — inside a bound session,
+    /// where every default pane is the transport (possibly reported as an ssh
+    /// child with rewritten argv) — any command that isn't a recognized agent.
+    fn command_is_remote_transport(&self, command: &[String]) -> bool {
+        codespace::parse_codespace_ssh(command).is_some()
+            || (self.current_session_is_bound() && identify_agent_from_command(command).is_none())
+    }
+
+    /// Whether the session this sidebar runs in is codespace-bound (its
+    /// `default_command` carries the SSH binding).
+    fn current_session_is_bound(&self) -> bool {
+        self.sessions.iter().any(|session| {
+            session.is_current_session
+                && session
+                    .default_command
+                    .as_deref()
+                    .and_then(codespace::parse_codespace_ssh)
+                    .is_some()
+        })
     }
 
     /// Remove tracked agent state for panes that are no longer in the manifest.
@@ -1051,6 +1125,120 @@ fn strip_ansi_into(line: &str, out: &mut String) {
 mod tests {
     use super::*;
     use crate::detect::Agent;
+
+    fn argv(args: &[&str]) -> Vec<String> {
+        args.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn transport_argv_marks_pane_remote_without_agent() {
+        let mut state = State::default();
+        let now = Instant::now();
+        let pane_id = PaneId::Terminal(3);
+
+        let changed = state.apply_command_changed(
+            pane_id,
+            &argv(&["gh", "codespace", "ssh", "-c", "my-cs"]),
+            true,
+            now,
+        );
+        assert!(!changed);
+        let entry = state.agents.get(&pane_id).unwrap();
+        assert!(entry.remote);
+        assert!(!entry.is_agent());
+    }
+
+    #[test]
+    fn remote_pane_identifies_agent_from_screen_and_releases_on_absence() {
+        let mut state = State::default();
+        let now = Instant::now();
+        let pane_id = PaneId::Terminal(3);
+        state.apply_command_changed(
+            pane_id,
+            &argv(&["gh", "codespace", "ssh", "-c", "my-cs"]),
+            true,
+            now,
+        );
+
+        // Claude's chrome renders over the SSH transport → identified + tracked.
+        let claude_screen = "✳ Simplifying…\n─────────\n❯ \n─────────";
+        assert!(state.observe_pane_screen(pane_id, claude_screen, now));
+        let entry = state.agents.get(&pane_id).unwrap();
+        assert_eq!(entry.detected_agent, Some(Agent::Claude));
+        assert_eq!(entry.state, AgentState::Working);
+
+        // The chrome disappears (agent exited to the remote shell): the
+        // absence window opens, and the remote grace releases the agent.
+        state.observe_pane_screen(pane_id, "user@codespace:~/repo$ ", now);
+        let entry = state.agents.get_mut(&pane_id).unwrap();
+        assert!(entry.is_agent(), "still tracked inside the grace window");
+        assert!(entry.tick(now + state::REMOTE_AGENT_GONE_GRACE));
+        let entry = state.agents.get(&pane_id).unwrap();
+        assert!(!entry.is_agent());
+        assert!(entry.remote, "the transport stays remote for re-identification");
+    }
+
+    #[test]
+    fn remote_pane_constant_transport_argv_never_clears_identified_agent() {
+        let mut state = State::default();
+        let now = Instant::now();
+        let pane_id = PaneId::Terminal(3);
+        let transport = argv(&["gh", "codespace", "ssh", "-c", "my-cs"]);
+        state.apply_command_changed(pane_id, &transport, true, now);
+        let claude_screen = "some output\n─────────\n❯ \n─────────";
+        state.observe_pane_screen(pane_id, claude_screen, now);
+        assert_eq!(
+            state.agents.get(&pane_id).and_then(|e| e.detected_agent),
+            Some(Agent::Claude)
+        );
+
+        // The host keeps reporting the transport argv — that says nothing
+        // about the remote agent and must not open the missing window.
+        assert!(!state.apply_command_changed(pane_id, &transport, true, now));
+        assert!(!state
+            .agents
+            .get_mut(&pane_id)
+            .unwrap()
+            .tick(now + state::REMOTE_AGENT_GONE_GRACE));
+        assert_eq!(
+            state.agents.get(&pane_id).and_then(|e| e.detected_agent),
+            Some(Agent::Claude)
+        );
+    }
+
+    #[test]
+    fn local_agent_argv_wins_back_a_remote_pane() {
+        let mut state = State::default();
+        let now = Instant::now();
+        let pane_id = PaneId::Terminal(3);
+        state.apply_command_changed(
+            pane_id,
+            &argv(&["gh", "codespace", "ssh", "-c", "my-cs"]),
+            true,
+            now,
+        );
+        assert!(state.agents.get(&pane_id).unwrap().remote);
+
+        // A local agent takes the foreground (e.g. run from a local shell
+        // pane) — argv identity applies again and the remote flag drops.
+        assert!(state.apply_command_changed(pane_id, &argv(&["claude"]), true, now));
+        let entry = state.agents.get(&pane_id).unwrap();
+        assert!(!entry.remote);
+        assert_eq!(entry.detected_agent, Some(Agent::Claude));
+    }
+
+    #[test]
+    fn seed_marks_transport_snapshot_remote() {
+        let mut state = State::default();
+        let now = Instant::now();
+        let pane_id = PaneId::Terminal(9);
+        assert!(!state.seed_agent_command(
+            pane_id,
+            &argv(&["gh", "codespace", "ssh", "-c", "my-cs"]),
+            now
+        ));
+        assert!(state.agents.get(&pane_id).unwrap().remote);
+    }
 
     #[test]
     fn seed_agent_command_recreates_missing_agent_entry() {
