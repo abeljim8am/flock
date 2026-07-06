@@ -903,6 +903,18 @@ impl State {
             // pane; only it determines the agent.
             let agent = identify_agent_from_command(command);
             let entry = self.agents.entry(pane_id).or_default();
+            if agent.is_none() && entry.detected_agent.is_some() {
+                // A non-agent foreground report while an agent is tracked can
+                // be a transient scan miss: under a resident env wrapper
+                // (devenv/nix develop) the host falls back to reporting the
+                // wrapper process when the agent's line is missed. Confirm
+                // through the same grace window as process exit instead of
+                // clearing outright — a fresh agent report cancels it, and a
+                // real exit (the wrapper's inner shell becomes the foreground
+                // leader) expires the window and releases the agent.
+                entry.mark_agent_missing(now);
+                return false;
+            }
             entry.set_detected_agent(agent, now)
         } else {
             // `is_foreground == false` means the pane's shell has no foreground
@@ -1106,6 +1118,73 @@ mod tests {
         let entry = state.agents.get_mut(&pane_id).expect("tracked pane");
         assert!(entry.tick(now + crate::state::AGENT_GONE_GRACE));
         assert!(!entry.is_agent());
+    }
+
+    #[test]
+    fn non_agent_foreground_report_opens_grace_for_detected_agent() {
+        use std::time::Duration;
+        let mut state = State::default();
+        let now = Instant::now();
+        let pane_id = PaneId::Terminal(7);
+        assert!(state.apply_command_changed(pane_id, &["claude".to_string()], true, now));
+
+        // The host transiently reports the resident devenv wrapper instead of
+        // the agent (a scan miss) — the agent must survive the grace window.
+        assert!(!state.apply_command_changed(
+            pane_id,
+            &["devenv".to_string(), "shell".to_string()],
+            true,
+            now
+        ));
+        assert!(state.agents.get(&pane_id).is_some_and(|pane| pane.is_agent()));
+
+        // A fresh agent report cancels the pending release.
+        state.apply_command_changed(
+            pane_id,
+            &["claude".to_string()],
+            true,
+            now + Duration::from_secs(1),
+        );
+        let entry = state.agents.get_mut(&pane_id).expect("tracked pane");
+        assert!(!entry.tick(now + crate::state::AGENT_GONE_GRACE + Duration::from_secs(1)));
+        assert!(entry.is_agent());
+    }
+
+    #[test]
+    fn non_agent_foreground_report_releases_agent_after_grace() {
+        let mut state = State::default();
+        let now = Instant::now();
+        let pane_id = PaneId::Terminal(7);
+        state.apply_command_changed(pane_id, &["claude".to_string()], true, now);
+
+        // Claude exits inside the devenv shell: the wrapper's inner shell is
+        // now the foreground leader, so the host keeps reporting a foreground
+        // command that is not an agent.
+        assert!(!state.apply_command_changed(pane_id, &["bash".to_string()], true, now));
+
+        let entry = state.agents.get_mut(&pane_id).expect("tracked pane");
+        assert!(entry.tick(now + crate::state::AGENT_GONE_GRACE));
+        assert!(!entry.is_agent());
+    }
+
+    #[test]
+    fn non_agent_foreground_report_keeps_hook_only_agent() {
+        let mut state = State::default();
+        let now = Instant::now();
+        let pane_id = PaneId::Terminal(7);
+        state
+            .agents
+            .entry(pane_id)
+            .or_default()
+            .set_hook_authority("custom-agent".into(), AgentState::Working, now);
+
+        // A hook-only agent has no detected process identity; an unrelated
+        // foreground command must not open the release window for it.
+        assert!(!state.apply_command_changed(pane_id, &["vim".to_string()], true, now));
+
+        let entry = state.agents.get_mut(&pane_id).expect("tracked pane");
+        assert!(!entry.tick(now + crate::state::AGENT_GONE_GRACE));
+        assert!(entry.is_agent());
     }
 
     #[test]

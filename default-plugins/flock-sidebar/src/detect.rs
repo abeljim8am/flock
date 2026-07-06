@@ -1368,19 +1368,22 @@ fn is_horizontal_rule(line: &str) -> bool {
 pub fn identify_agent_from_command(command: &[String]) -> Option<Agent> {
     let argv0 = command.first()?;
     let effective = path_basename(argv0);
-    let lower_effective = effective.to_lowercase();
+    // Normalize before every lookup so nix wrapper names (`.node-wrapped`,
+    // `.claude-unwrapped`) and launcher suffixes match their plain forms.
+    let normalized_effective = normalized_agent_lookup_name(effective);
 
     // A generic runtime/shell may be wrapping an agent script, e.g.
     // `node …/claude.js` or `sh -c 'pi …'`. Unwrap it first.
-    if is_generic_runtime_or_shell(&lower_effective) {
-        if let Some(name) = wrapped_agent_name_from_runtime_argv(&lower_effective, Some(command)) {
+    if is_generic_runtime_or_shell(&normalized_effective) {
+        if let Some(name) = wrapped_agent_name_from_runtime_argv(&normalized_effective, Some(command))
+        {
             return parse_agent_label(&name);
         }
     }
 
     // Direct binary match on the basename (`claude`, `/opt/homebrew/bin/codex`,
-    // `claude.exe`), with launcher suffixes stripped.
-    if let Some(agent) = identify_agent(&normalized_agent_lookup_name(effective)) {
+    // `claude.exe`, nix's `.claude-unwrapped`).
+    if let Some(agent) = identify_agent(&normalized_effective) {
         return Some(agent);
     }
 
@@ -1484,16 +1487,28 @@ fn agent_name_from_basename(basename: &str) -> Option<String> {
     Some(agent_label(agent).to_string())
 }
 
-/// Strip launcher/script suffixes (`claude.js`, `codex.exe`, `pi.cmd`) so the
-/// basename maps to the agent name (herdr HEAD `normalized_agent_lookup_name`).
+/// Strip launcher/script suffixes (`claude.js`, `codex.exe`, `pi.cmd`) and
+/// nix wrapper decorations (`.claude-unwrapped`, `.claude-wrapped`) so the
+/// basename maps to the agent name (herdr HEAD `normalized_agent_lookup_name`;
+/// nix wrappers are herdr #803 — the `claude` on a nix/devenv PATH is a
+/// wrapper script that `exec`s a hidden sibling, so the *running* process is
+/// named `.claude-unwrapped`).
 fn normalized_agent_lookup_name(basename: &str) -> String {
-    let lower = basename.to_lowercase();
+    let mut name = basename.to_lowercase();
+    name = name.trim_start_matches('.').to_string();
     for suffix in [".exe", ".cmd", ".bat", ".ps1", ".js"] {
-        if let Some(stripped) = lower.strip_suffix(suffix) {
-            return stripped.to_string();
+        if let Some(stripped) = name.strip_suffix(suffix) {
+            name = stripped.to_string();
+            break;
         }
     }
-    lower
+    for suffix in ["-unwrapped", "-wrapped"] {
+        if let Some(stripped) = name.strip_suffix(suffix) {
+            name = stripped.to_string();
+            break;
+        }
+    }
+    name
 }
 
 fn path_basename(path: &str) -> &str {
@@ -1613,6 +1628,42 @@ mod tests {
         assert_eq!(
             identify_agent_from_command(&cmd(&["node", "/path/to/bin/codex"])),
             Some(Agent::Codex)
+        );
+    }
+
+    #[test]
+    fn command_identifies_nix_wrapper_process_names() {
+        // The nix-built `claude` is a wrapper script that execs a hidden
+        // sibling, so the running process is `.claude-unwrapped` (herdr #803);
+        // makeWrapper's convention is `.claude-wrapped`.
+        assert_eq!(
+            identify_agent_from_command(&cmd(&[
+                "/nix/store/abc123-claude-code-2.0.14/bin/.claude-unwrapped",
+                "--continue"
+            ])),
+            Some(Agent::Claude)
+        );
+        assert_eq!(
+            identify_agent_from_command(&cmd(&[".claude-wrapped"])),
+            Some(Agent::Claude)
+        );
+        assert_eq!(
+            identify_agent_from_command(&cmd(&[".codex-unwrapped"])),
+            Some(Agent::Codex)
+        );
+        // A nix-wrapped runtime still unwraps its script argument.
+        assert_eq!(
+            identify_agent_from_command(&cmd(&[".node-wrapped", "/path/to/bin/codex"])),
+            Some(Agent::Codex)
+        );
+    }
+
+    #[test]
+    fn command_does_not_identify_env_wrappers_as_agents() {
+        assert_eq!(identify_agent_from_command(&cmd(&["devenv", "shell"])), None);
+        assert_eq!(
+            identify_agent_from_command(&cmd(&["nix", "develop"])),
+            None
         );
     }
 

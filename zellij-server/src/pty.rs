@@ -2124,17 +2124,24 @@ impl Pty {
             }
         }
 
-        let ppids_to_cmds = self
+        let shell_pids: Vec<u32> = active_terminal_ids
+            .iter()
+            .filter_map(|id| self.id_to_child_pid.get(id))
+            .copied()
+            .collect();
+        let foreground_cmds = self
             .bus
             .os_input
             .as_ref()
-            .map(|os_input| os_input.get_all_cmds_by_ppid(&self.post_command_discovery_hook))
+            .map(|os_input| {
+                os_input.get_foreground_cmds(&shell_pids, &self.post_command_discovery_hook)
+            })
             .unwrap_or_default();
 
         for terminal_id in &active_terminal_ids {
             let process_id = self.id_to_child_pid.get(terminal_id);
             let foreground_cmd: Vec<String> = process_id
-                .and_then(|pid| ppids_to_cmds.get(&pid.to_string()))
+                .and_then(|pid| foreground_cmds.get(pid))
                 .cloned()
                 .unwrap_or_default();
 
@@ -2308,9 +2315,11 @@ impl Pty {
         };
         let post_command_discovery_hook = self.post_command_discovery_hook.clone();
         async_runtime().spawn_blocking(move || {
-            // First, try to get child process command (e.g., nvim running in bash)
-            let ppids_to_cmds = os_input.get_all_cmds_by_ppid(&post_command_discovery_hook);
-            let cmd_ps = ppids_to_cmds.get(&format!("{}", child_pid));
+            // First, try to get the pane's foreground command (e.g., nvim
+            // running in bash — resolved through env wrappers like devenv)
+            let foreground_cmds =
+                os_input.get_foreground_cmds(&[child_pid], &post_command_discovery_hook);
+            let cmd_ps = foreground_cmds.get(&child_pid);
 
             // If no child process, fall back to parent process (e.g., the shell itself)
             let (_cwds, cmds) = os_input.get_cwds(vec![child_pid]);
