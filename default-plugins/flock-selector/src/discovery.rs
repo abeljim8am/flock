@@ -131,7 +131,7 @@ pub fn merge_candidates(
 }
 
 /// Render `path` with a leading `$HOME` replaced by `~`, for compact display.
-fn shorten_home(path: &Path) -> String {
+pub fn shorten_home(path: &Path) -> String {
     let full = path.to_string_lossy().to_string();
     if let Ok(home) = std::env::var("HOME") {
         if !home.is_empty() {

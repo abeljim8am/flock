@@ -17,17 +17,20 @@ use unicode_width::UnicodeWidthStr;
 use zellij_tile::prelude::PaletteColor;
 
 use crate::codespaces::{GhError, RankedCodespace, StateKind};
+use crate::live_sessions::RankedSession;
 use crate::palette::{bg, fg, goto, Theme, BOLD, DIM, NORMAL_INTENSITY, RESET};
 use crate::ranking::Ranked;
 
-/// The badge glyph marking a project/codespace that already has a live session.
+/// The badge glyph marking a project/codespace that already has a live session
+/// (or, in Sessions mode, the session the picker is running in).
 const OPEN_BADGE: &str = "●";
 
-/// Which list the picker is showing. Tab toggles between them; each keeps the
+/// Which list the picker is showing. Tab cycles through them; each keeps the
 /// same reverse-layout fuzzy list, differing only in rows and data source.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum PickerMode {
     #[default]
+    Sessions,
     Projects,
     Codespaces,
 }
@@ -64,8 +67,11 @@ pub struct RenderInput<'a> {
     pub permissions_granted: bool,
     pub configured: bool,
     pub query: &'a str,
-    /// Which list is showing; selects between `results` and `codespace_results`.
+    /// Which list is showing; selects between `session_results`, `results`,
+    /// and `codespace_results`.
     pub mode: PickerMode,
+    /// Ranked live sessions (Sessions mode).
+    pub session_results: &'a [RankedSession<'a>],
     pub results: &'a [Ranked<'a>],
     /// Absolute project paths that currently have a live session.
     pub open_paths: &'a std::collections::HashSet<String>,
@@ -106,6 +112,7 @@ pub fn render(input: RenderInput) -> RenderOutput {
         configured,
         query,
         mode,
+        session_results,
         results,
         open_paths,
         codespace_results,
@@ -148,6 +155,7 @@ pub fn render(input: RenderInput) -> RenderOutput {
     // tall, in which case no result rows render (the loop below would
     // otherwise compute `input_y - 1 - k` with input_y == 0 and underflow).
     let total = match mode {
+        PickerMode::Sessions => session_results.len(),
         PickerMode::Projects => results.len(),
         PickerMode::Codespaces => codespace_results.len(),
     };
@@ -177,6 +185,14 @@ pub fn render(input: RenderInput) -> RenderOutput {
         );
     } else if total == 0 {
         let spans = match mode {
+            PickerMode::Sessions => {
+                let msg = if query.trim().is_empty() {
+                    " no open sessions"
+                } else {
+                    " no matches"
+                };
+                vec![Span::new(msg, p.muted).dim()]
+            },
             PickerMode::Projects => {
                 let msg = if !configured {
                     " no project folders configured"
@@ -207,6 +223,15 @@ pub fn render(input: RenderInput) -> RenderOutput {
     let mut row_map = Vec::new();
     let visible_end = (scroll + capacity).min(total);
     match mode {
+        PickerMode::Sessions => {
+            for (k, idx) in (scroll..visible_end).enumerate() {
+                let y = input_y - 1 - k;
+                let r = &session_results[idx];
+                let is_selected = idx == selected;
+                render_session_row(&mut out, y, cols, r, is_selected, p);
+                row_map.push((y, idx));
+            }
+        },
         PickerMode::Projects => {
             // A project's parent path is only worth showing to disambiguate a
             // name collision, so count how many results share each basename;
@@ -257,7 +282,7 @@ pub fn render(input: RenderInput) -> RenderOutput {
     }
 }
 
-/// The top header row: both mode names with the active one highlighted, plus a
+/// The top header row: every mode name with the active one highlighted, plus a
 /// right-aligned key hint.
 fn render_header_row(out: &mut String, cols: usize, mode: PickerMode, p: &Theme) {
     let active = Style {
@@ -270,19 +295,18 @@ fn render_header_row(out: &mut String, cols: usize, mode: PickerMode, p: &Theme)
         bold: false,
         dim: true,
     };
-    let (projects_style, codespaces_style) = match mode {
-        PickerMode::Projects => (active, inactive),
-        PickerMode::Codespaces => (inactive, active),
-    };
+    let style_for = |m: PickerMode| if m == mode { active } else { inactive };
     let mut spans = vec![
         Span::new(" ", p.text),
-        styled("Projects", projects_style),
+        styled("Sessions", style_for(PickerMode::Sessions)),
         Span::new(" · ", p.text).dim(),
-        styled("Codespaces", codespaces_style),
+        styled("Projects", style_for(PickerMode::Projects)),
+        Span::new(" · ", p.text).dim(),
+        styled("Codespaces", style_for(PickerMode::Codespaces)),
     ];
 
     let hint = match mode {
-        PickerMode::Projects => "Tab ",
+        PickerMode::Sessions | PickerMode::Projects => "Tab ",
         PickerMode::Codespaces => "Tab switch · Ctrl-x stop ",
     };
     let left_w: usize = spans.iter().map(|s| s.text.width()).sum();
@@ -305,6 +329,75 @@ fn codespaces_error_spans(err: &GhError, p: &Theme) -> Vec<Span> {
         GhError::Other(detail) => format!(" gh error: {}", detail),
     };
     vec![Span::new(" ✗", p.red), Span::new(msg, p.muted).dim()]
+}
+
+/// Render one session row: `<badge> <name>  <dim workspace path>`. The badge
+/// column mirrors the other modes (a green dot marks the session the picker is
+/// running in — every listed session is live).
+fn render_session_row(
+    out: &mut String,
+    y: usize,
+    cols: usize,
+    r: &RankedSession,
+    selected: bool,
+    p: &Theme,
+) {
+    let row_bg = if selected { Some(p.selection_bg) } else { None };
+    let mut spans = Vec::new();
+
+    // Badge column (2 cells): a green dot for the current session.
+    if r.entry.is_current {
+        spans.push(Span::new(" ", p.text));
+        spans.push(Span::new(OPEN_BADGE, p.green));
+    } else {
+        spans.push(Span::new("  ", p.text));
+    }
+    spans.push(Span::new(" ", p.text));
+
+    // Session name, highlighted like a project name. When a path follows, keep
+    // it to ~half width so the path has room.
+    let name_budget = if r.entry.display_path.is_empty() {
+        cols.saturating_sub(4).max(4)
+    } else {
+        cols.saturating_sub(4).min(cols / 2 + 8).max(4)
+    };
+    let name = truncate_text(&r.entry.name, name_budget);
+    let name_style = Style {
+        fg: p.text,
+        bold: true,
+        dim: false,
+    };
+    push_highlighted(
+        &mut spans,
+        &name,
+        &clip_ranges(&r.name_ranges, &name),
+        name_style,
+        name_style,
+    );
+
+    // The dimmed workspace path, truncated to what's left.
+    if !r.entry.display_path.is_empty() {
+        let used: usize = spans.iter().map(|s| s.text.width()).sum();
+        let path_budget = cols.saturating_sub(used + 2);
+        if path_budget > 1 {
+            let path_style = Style {
+                fg: p.text,
+                bold: false,
+                dim: true,
+            };
+            spans.push(styled("  ", path_style));
+            let path = truncate_text(&r.entry.display_path, path_budget);
+            push_highlighted(
+                &mut spans,
+                &path,
+                &clip_ranges(&r.path_ranges, &path),
+                path_style,
+                path_style,
+            );
+        }
+    }
+
+    render_row(out, 0, y, cols, row_bg, &spans);
 }
 
 /// Render one codespace row: `<badge> <display name>  <repo>  <state>`. The
@@ -692,6 +785,7 @@ mod tests {
             configured: true,
             query: "p",
             mode: PickerMode::Projects,
+            session_results: &[],
             results: &results,
             open_paths: &std::collections::HashSet::new(),
             codespace_results: &[],

@@ -31,6 +31,7 @@ mod config;
 mod discovery;
 mod frecency;
 mod fuzzy;
+mod live_sessions;
 mod palette;
 mod ranking;
 mod session;
@@ -41,8 +42,12 @@ use std::path::PathBuf;
 
 use codespaces::{Codespace, GhError};
 use config::SelectorConfig;
-use discovery::{merge_candidates, parse_scan_output, scan_argv, scan_context, Project, SCAN_CONTEXT_KEY};
+use discovery::{
+    merge_candidates, parse_scan_output, scan_argv, scan_context, shorten_home, Project,
+    SCAN_CONTEXT_KEY,
+};
 use frecency::{now_secs, FrecencyDb};
+use live_sessions::SessionEntry;
 use palette::Theme;
 use session::{ExistingSession, OpenAction};
 use ui::PickerMode;
@@ -93,7 +98,7 @@ struct State {
     row_map: Vec<(usize, usize)>,
     /// Whether the refresh timer is currently armed.
     timer_running: bool,
-    /// Which list is showing (Tab toggles).
+    /// Which list is showing (Tab cycles Sessions → Projects → Codespaces).
     mode: PickerMode,
     /// The latest codespace list — the `/data` cache at load, then live `gh`
     /// results as they land.
@@ -260,6 +265,8 @@ impl ZellijPlugin for State {
         let now = now_secs();
         let results = ranking::rank(&self.projects, &self.query, &self.frecency, now);
         let open_paths = self.open_session_paths();
+        let session_entries = self.session_entries();
+        let session_results = live_sessions::rank(&session_entries, &self.query);
         let codespace_results = codespaces::rank(&self.codespaces, &self.query);
         let bound_codespaces = self.bound_codespace_names();
 
@@ -269,6 +276,7 @@ impl ZellijPlugin for State {
                 || !self.config.root_dirs.is_empty(),
             query: &self.query,
             mode: self.mode,
+            session_results: &session_results,
             results: &results,
             open_paths: &open_paths,
             codespace_results: &codespace_results,
@@ -280,6 +288,7 @@ impl ZellijPlugin for State {
             selected: self.selected,
             scroll: self.scroll,
             total_candidates: match self.mode {
+                PickerMode::Sessions => session_entries.len(),
                 PickerMode::Projects => self.projects.len(),
                 PickerMode::Codespaces => self.codespaces.len(),
             },
@@ -428,6 +437,7 @@ impl State {
     /// cursor to the *filtered* result count).
     fn candidate_count(&self) -> usize {
         match self.mode {
+            PickerMode::Sessions => self.session_entries().len(),
             PickerMode::Projects => self.projects.len(),
             PickerMode::Codespaces => self.codespaces.len(),
         }
@@ -463,12 +473,14 @@ impl State {
         }
     }
 
-    /// Flip between the Projects and Codespaces lists, resetting the query and
-    /// cursor (a filter typed against one list is meaningless on the other).
+    /// Cycle through the Sessions, Projects, and Codespaces lists, resetting
+    /// the query and cursor (a filter typed against one list is meaningless on
+    /// another).
     fn toggle_mode(&mut self) {
         self.mode = match self.mode {
+            PickerMode::Sessions => PickerMode::Projects,
             PickerMode::Projects => PickerMode::Codespaces,
-            PickerMode::Codespaces => PickerMode::Projects,
+            PickerMode::Codespaces => PickerMode::Sessions,
         };
         self.query.clear();
         self.reset_selection();
@@ -526,6 +538,48 @@ impl State {
                     .map(str::to_owned),
             })
             .collect()
+    }
+
+    /// The live session list reduced to Sessions-mode entries: selector
+    /// throwaway sessions are excluded (switching into one strands the user in
+    /// a pane-less shell), everything else lists with its home-shortened
+    /// workspace root.
+    fn session_entries(&self) -> Vec<SessionEntry> {
+        self.sessions
+            .iter()
+            .filter(|s| !self.is_selector_session(s))
+            .map(|s| SessionEntry {
+                name: s.name.clone(),
+                display_path: if s.workspace_root.as_os_str().is_empty() {
+                    String::new()
+                } else {
+                    shorten_home(&config::normalize(&s.workspace_root))
+                },
+                is_current: s.is_current_session,
+            })
+            .collect()
+    }
+
+    /// Switch to the selected live session (a no-op beyond dismissing the
+    /// picker when it is the session we're already in — the server refuses
+    /// attaching to the same session). Then closes the picker.
+    fn confirm_session_selection(&mut self) {
+        let entries = self.session_entries();
+        let ranked = live_sessions::rank(&entries, &self.query);
+        let Some(entry) = ranked.get(self.selected).map(|r| r.entry) else {
+            return;
+        };
+
+        if !entry.is_current {
+            let current_session_name = self
+                .sessions
+                .iter()
+                .find(|s| s.is_current_session)
+                .map(|s| s.name.clone());
+            switch_session(Some(&entry.name));
+            self.discard_throwaway_session(current_session_name.as_deref());
+        }
+        close_self();
     }
 
     /// Open the selected codespace: switch to its bound session if one is
@@ -606,9 +660,16 @@ impl State {
     /// `session_layout`. Bumps the frecency db on the open, then closes the
     /// picker.
     fn confirm_selection(&mut self) {
-        if self.mode == PickerMode::Codespaces {
-            self.confirm_codespace_selection();
-            return;
+        match self.mode {
+            PickerMode::Sessions => {
+                self.confirm_session_selection();
+                return;
+            },
+            PickerMode::Codespaces => {
+                self.confirm_codespace_selection();
+                return;
+            },
+            PickerMode::Projects => {},
         }
         let now = now_secs();
         let results = ranking::rank(&self.projects, &self.query, &self.frecency, now);
