@@ -17,12 +17,11 @@ use unicode_width::UnicodeWidthStr;
 use zellij_tile::prelude::PaletteColor;
 
 use crate::codespaces::{GhError, RankedCodespace, StateKind};
-use crate::live_sessions::RankedSession;
+use crate::live_sessions::{RankedSession, SessionActivity};
 use crate::palette::{bg, fg, goto, Theme, BOLD, DIM, NORMAL_INTENSITY, RESET};
 use crate::ranking::Ranked;
 
-/// The badge glyph marking a project/codespace that already has a live session
-/// (or, in Sessions mode, the session the picker is running in).
+/// The badge glyph marking a project/codespace that already has a live session.
 const OPEN_BADGE: &str = "●";
 
 /// Which list the picker is showing. Tab cycles through them; each keeps the
@@ -331,9 +330,29 @@ fn codespaces_error_spans(err: &GhError, p: &Theme) -> Vec<Span> {
     vec![Span::new(" ✗", p.red), Span::new(msg, p.muted).dim()]
 }
 
-/// Render one session row: `<badge> <name>  <dim workspace path>`. The badge
-/// column mirrors the other modes (a green dot marks the session the picker is
-/// running in — every listed session is live).
+/// The dim `(current)` marker suffixing the session the picker runs in — its
+/// badge column carries the attention dot like every other row, so "current"
+/// moves into the name column.
+const CURRENT_SUFFIX: &str = " (current)";
+
+/// A session's agent-attention dot, mirroring the flock-sidebar's session
+/// overview dot so both UIs read the same: a blocked agent is the red ◉,
+/// done-unseen teal, running green, idle yellow, no agents a dim ○.
+fn activity_dot(activity: SessionActivity, p: &Theme) -> Span {
+    match activity {
+        SessionActivity::Blocked => Span::new("◉", p.red),
+        SessionActivity::DoneUnseen => Span::new("●", p.teal),
+        SessionActivity::Running => Span::new("●", p.green),
+        SessionActivity::Stopped => Span::new("●", p.yellow),
+        SessionActivity::None => Span::new("○", p.muted).dim(),
+    }
+}
+
+/// Render one session row: `<dot> <name>  <dim workspace path>`. The badge
+/// column holds the session's agent-attention dot (see [`activity_dot`] — it
+/// is also what the attention-first ordering sorts by); the session the picker
+/// runs in is marked with a dim `(current)` suffix on its name instead of a
+/// badge.
 fn render_session_row(
     out: &mut String,
     y: usize,
@@ -345,21 +364,25 @@ fn render_session_row(
     let row_bg = if selected { Some(p.selection_bg) } else { None };
     let mut spans = Vec::new();
 
-    // Badge column (2 cells): a green dot for the current session.
-    if r.entry.is_current {
-        spans.push(Span::new(" ", p.text));
-        spans.push(Span::new(OPEN_BADGE, p.green));
-    } else {
-        spans.push(Span::new("  ", p.text));
-    }
+    // Badge column (2 cells): the agent-attention dot.
+    spans.push(Span::new(" ", p.text));
+    spans.push(activity_dot(r.entry.activity, p));
     spans.push(Span::new(" ", p.text));
 
     // Session name, highlighted like a project name. When a path follows, keep
-    // it to ~half width so the path has room.
-    let name_budget = if r.entry.display_path.is_empty() {
-        cols.saturating_sub(4).max(4)
+    // it to ~half width so the path has room; the current session's suffix
+    // spends part of the name budget so the row still fits.
+    let suffix_width = if r.entry.is_current {
+        CURRENT_SUFFIX.width()
     } else {
-        cols.saturating_sub(4).min(cols / 2 + 8).max(4)
+        0
+    };
+    let name_budget = if r.entry.display_path.is_empty() {
+        cols.saturating_sub(4 + suffix_width).max(4)
+    } else {
+        cols.saturating_sub(4 + suffix_width)
+            .min(cols / 2 + 8)
+            .max(4)
     };
     let name = truncate_text(&r.entry.name, name_budget);
     let name_style = Style {
@@ -374,6 +397,9 @@ fn render_session_row(
         name_style,
         name_style,
     );
+    if r.entry.is_current {
+        spans.push(Span::new(CURRENT_SUFFIX, p.text).dim());
+    }
 
     // The dimmed workspace path, truncated to what's left.
     if !r.entry.display_path.is_empty() {

@@ -66,15 +66,12 @@ pub struct Theme {
     /// Primary accent (prompt, match highlights, cursor).
     pub accent: PaletteColor,
     /// Needs-attention / blocked state.
-    #[allow(dead_code)]
     pub red: PaletteColor,
     /// Working / running state.
-    #[allow(dead_code)]
     pub yellow: PaletteColor,
-    /// Open-session badge.
+    /// Open-session badge; running state.
     pub green: PaletteColor,
     /// Done-unseen state.
-    #[allow(dead_code)]
     pub teal: PaletteColor,
     /// Secondary accent.
     #[allow(dead_code)]

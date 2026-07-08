@@ -556,6 +556,7 @@ impl State {
                     shorten_home(&config::normalize(&s.workspace_root))
                 },
                 is_current: s.is_current_session,
+                activity: live_sessions::session_activity(&s.agent_states),
             })
             .collect()
     }
