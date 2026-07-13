@@ -53,6 +53,23 @@ You can get started by [installing](https://zellij.dev/documentation/installatio
 
 For more details about our future plans, read about upcoming features in our [roadmap](#roadmap).
 
+## Flock: AI-agent status integrations (this fork)
+
+This fork ships the `flock-sidebar` / `flock-selector` plugins, which track AI
+coding agents running in your panes and show whether each one is working,
+blocked on you, or done. Detection works out of the box from screen content;
+for authoritative state, agents can self-report through the bundled hook
+integrations under `default-plugins/flock-sidebar/assets/`.
+
+To install the opencode integration:
+
+```sh
+cp default-plugins/flock-sidebar/assets/opencode/flock-agent-state.js ~/.config/opencode/plugins/
+```
+
+The Claude Code and Codex hook scripts live beside it (`assets/claude/`,
+`assets/codex/`) and are wired into each agent's own hook configuration.
+
 ## How do I install it?
 
 The easiest way to install Zellij is through a [package for your OS](./docs/THIRD_PARTY_INSTALL.md).
