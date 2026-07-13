@@ -2,7 +2,7 @@
 // managed by flock-sidebar; reinstalling or updating the integration overwrites this file.
 // add custom hooks/plugins beside this file instead of editing it.
 // FLOCK_INTEGRATION_ID=opencode
-// FLOCK_INTEGRATION_VERSION=1
+// FLOCK_INTEGRATION_VERSION=2
 //
 // Ported from herdr's opencode integration plugin (herdr-agent-state.js,
 // HERDR_INTEGRATION_VERSION=8). Instead of writing herdr's unix socket, it
@@ -17,11 +17,61 @@
 // dropped — flock has no session-resume consumer — but the subagent-suppression
 // logic is herdr's, kept verbatim so task-tool sessions can't clobber the pane's
 // root-agent state.
+//
+// v2 adds a devcontainer channel: inside a container the `zellij` binary and
+// server socket don't exist, but flock's devcontainer sessions forward the
+// pane id in via `devcontainer exec --remote-env ZELLIJ_PANE_ID=…`. When
+// `zellij` is unreachable at plugin init, each report is instead written to
+// /tmp/flock-state/pane-<id> (one line, the same key=value format as the pipe
+// args, plus ts=<epoch secs>), which the flock-sidebar polls from the host via
+// `docker exec … cat`. Locally nothing changes — the pipe stays the channel.
 
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
+import { mkdirSync, writeFileSync, renameSync } from "node:fs";
+import { join } from "node:path";
 
 const SOURCE = "flock:opencode";
 const AGENT = "opencode";
+
+// Where the file channel writes, and the sidebar's `docker exec` poll reads.
+// Must stay in sync with `hooks_cat_argv` in flock-sidebar/src/devcontainer.rs.
+const STATE_DIR = "/tmp/flock-state";
+
+// Set at plugin init: file channel only when `zellij` can't be spawned.
+let useFileChannel = false;
+
+function zellijReachable() {
+  try {
+    const probe = spawnSync("zellij", ["--version"], {
+      stdio: "ignore",
+      timeout: 2000,
+    });
+    return !probe.error && probe.status === 0;
+  } catch {
+    return false;
+  }
+}
+
+// Best-effort atomic write (tmp + rename) so the sidebar's poll never reads a
+// half-written line. The pane id lands in the filename, so only the server's
+// bare-integer $ZELLIJ_PANE_ID shape is accepted.
+function writeStateFile(paneId, state) {
+  if (!/^\d+$/.test(paneId)) {
+    return;
+  }
+  const line = `pane_id=${paneId},state=${state},agent=${AGENT},source=${SOURCE},ts=${Math.floor(
+    Date.now() / 1000,
+  )}\n`;
+  try {
+    mkdirSync(STATE_DIR, { recursive: true });
+    const path = join(STATE_DIR, `pane-${paneId}`);
+    const tmp = `${path}.tmp-${process.pid}`;
+    writeFileSync(tmp, line);
+    renameSync(tmp, path);
+  } catch {
+    // Reporting is best-effort, like the pipe channel.
+  }
+}
 
 // Subagent (task tool) sessions carry a parentID; the main agent session does
 // not. Their lifecycle events would otherwise clobber the pane's real state, so
@@ -60,6 +110,11 @@ function reportState(state) {
     return Promise.resolve();
   }
 
+  if (useFileChannel) {
+    writeStateFile(paneId, state);
+    return Promise.resolve();
+  }
+
   const args = `pane_id=${paneId},state=${state},agent=${AGENT},source=${SOURCE}`;
 
   return new Promise((resolve) => {
@@ -84,6 +139,10 @@ export const FlockAgentStatePlugin = async () => {
   if (!process.env.ZELLIJ_PANE_ID) {
     return {};
   }
+
+  // Channel pick, once: the pipe when zellij is reachable (local), the state
+  // file otherwise (inside a devcontainer).
+  useFileChannel = !zellijReachable();
 
   return {
     "chat.message": async ({ sessionID }) => {

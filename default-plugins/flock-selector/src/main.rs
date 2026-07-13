@@ -28,6 +28,7 @@
 
 mod codespaces;
 mod config;
+mod devcontainers;
 mod discovery;
 mod frecency;
 mod fuzzy;
@@ -38,10 +39,11 @@ mod session;
 mod ui;
 
 use std::collections::{BTreeMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use codespaces::{Codespace, GhError};
 use config::SelectorConfig;
+use devcontainers::{DevcontainerPhase, PendingDevcontainer};
 use discovery::{
     merge_candidates, parse_scan_output, scan_argv, scan_context, shorten_home, Project,
     SCAN_CONTEXT_KEY,
@@ -114,8 +116,15 @@ struct State {
     codespace_refresh_ticks: u8,
     /// The user's codespace layout base (the `codespace_session_layout` file's
     /// content), once read off the host. `None` (unset, unreadable, or not yet
-    /// loaded) falls back to the built-in flock chrome mirror.
+    /// loaded) falls back to the built-in flock chrome mirror. Devcontainer
+    /// sessions share this base — both bindings want the same chrome.
     codespace_layout_base: Option<String>,
+    /// Projects whose folder carries a `.devcontainer` marker, per scan scope
+    /// (see [`devcontainers::SCAN_CONTEXT_KEY`]), so the Enter-time prompt
+    /// check is a set lookup.
+    devcontainer_projects: BTreeMap<String, HashSet<PathBuf>>,
+    /// The devcontainer prompt/up currently owning the picker's keyboard.
+    pending_devcontainer: Option<PendingDevcontainer>,
 }
 
 register_plugin!(State);
@@ -167,6 +176,7 @@ impl ZellijPlugin for State {
                 self.permissions_granted = matches!(result, PermissionStatus::Granted);
                 if self.permissions_granted {
                     self.fire_scans();
+                    self.fire_devcontainer_scans();
                     // Pre-warm the codespace list so Tab-ing over doesn't wait
                     // on a cold `gh` network call.
                     self.fire_codespace_list();
@@ -187,6 +197,7 @@ impl ZellijPlugin for State {
                 self.timer_running = false;
                 if self.permissions_granted {
                     self.fire_scans();
+                    self.fire_devcontainer_scans();
                     // The codespace list refreshes on a slower cadence, and
                     // only while its mode is showing.
                     if self.mode == PickerMode::Codespaces {
@@ -251,6 +262,20 @@ impl ZellijPlugin for State {
                     // with reality.
                     self.fire_codespace_list();
                     should_render = true;
+                } else if let Some(scope) = context.get(devcontainers::SCAN_CONTEXT_KEY) {
+                    // Parsed regardless of exit code: `find` over several start
+                    // paths exits nonzero when any one is missing but still
+                    // prints valid hits for the rest.
+                    self.devcontainer_projects.insert(
+                        scope.clone(),
+                        devcontainers::parse_scan_output(&String::from_utf8_lossy(&stdout)),
+                    );
+                } else if let Some(path_str) = context.get(devcontainers::UP_CONTEXT_KEY) {
+                    should_render = self.handle_devcontainer_up_result(
+                        path_str,
+                        exit_code,
+                        &String::from_utf8_lossy(&stderr),
+                    );
                 }
             },
             Event::Key(key) => {
@@ -284,6 +309,7 @@ impl ZellijPlugin for State {
             codespaces_error: self.codespaces_error.as_ref(),
             codespaces_refreshing: self.codespaces_refreshing,
             pending_stop: self.pending_stop.as_deref(),
+            pending_devcontainer: self.pending_devcontainer.as_ref(),
             palette: &self.palette,
             selected: self.selected,
             scroll: self.scroll,
@@ -359,6 +385,11 @@ impl State {
     }
 
     fn handle_key(&mut self, key: KeyWithModifier) -> bool {
+        // A pending devcontainer prompt/up owns the keyboard: nothing leaks
+        // into the query or list navigation until it resolves.
+        if self.pending_devcontainer.is_some() {
+            return self.handle_devcontainer_key(key);
+        }
         // Navigation: in the reverse layout the best result sits at the bottom
         // (selected = 0), so Up moves toward worse results (higher on screen) and
         // Down moves toward the best (just above the input).
@@ -712,13 +743,41 @@ impl State {
             return;
         };
 
-        let action = session::resolve_open(&path, &self.existing_sessions());
-
         // Bump + persist frecency so this open floats the project toward the
         // input next time. Best-effort: a failed write is silently ignored.
+        // (An Esc-cancelled devcontainer prompt still counts as a use — Enter
+        // already expressed the intent.)
         self.frecency.bump(&path.to_string_lossy(), now);
         self.frecency.save();
 
+        // Devcontainer divert: only when the folder has no session yet (an
+        // existing session — bound or plain — always just switches) and it
+        // carries a `.devcontainer` marker. The prompt takes over the
+        // keyboard; the picker closes when the flow resolves.
+        let action = session::resolve_open(&path, &self.existing_sessions());
+        if matches!(action, OpenAction::Create { .. }) && self.project_has_devcontainer(&path) {
+            let display_name = path
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_else(|| path.to_string_lossy().to_string());
+            self.pending_devcontainer = Some(PendingDevcontainer {
+                path,
+                display_name,
+                phase: DevcontainerPhase::Prompt,
+            });
+            return;
+        }
+
+        self.open_project_locally(path);
+    }
+
+    /// Open `path` as a plain local project session: switch when a session
+    /// roots there, else create one with the configured `session_layout`.
+    /// Then closes the picker. (Resolution happens here — not at the earlier
+    /// prompt divert — because the devcontainer flow can take minutes and the
+    /// session list may have changed underneath it.)
+    fn open_project_locally(&mut self, path: PathBuf) {
+        let action = session::resolve_open(&path, &self.existing_sessions());
         let current_session_name = self
             .sessions
             .iter()
@@ -742,6 +801,147 @@ impl State {
             },
         }
         close_self();
+    }
+
+    /// Open `path` as a devcontainer-bound session, now that the picker's
+    /// `devcontainer up` succeeded: switch when a session appeared for the
+    /// folder while the up ran (a first build can take minutes), else create
+    /// one from the generated bound layout. The explicit cwd makes the new
+    /// session's `workspace_root` the project folder, so later picks switch to
+    /// it like any local session. Then closes the picker.
+    fn open_project_in_devcontainer(&mut self, path: PathBuf) {
+        let action = session::resolve_open(&path, &self.existing_sessions());
+        let current_session_name = self
+            .sessions
+            .iter()
+            .find(|s| s.is_current_session)
+            .map(|s| s.name.clone());
+
+        match action {
+            OpenAction::Switch { name } if Some(&name) == current_session_name.as_ref() => {},
+            OpenAction::Switch { name } => {
+                switch_session_with_cwd(Some(&name), Some(path));
+                self.discard_throwaway_session(current_session_name.as_deref());
+            },
+            OpenAction::Create { name } => {
+                let layout = LayoutInfo::Stringified(devcontainers::layout_doc_for(
+                    &path,
+                    &self.config.sidebar_args,
+                    self.codespace_layout_base.as_deref(),
+                ));
+                switch_session_with_layout(Some(&name), layout, Some(path));
+                self.discard_throwaway_session(current_session_name.as_deref());
+            },
+        }
+        close_self();
+    }
+
+    /// Keys while a devcontainer prompt/up owns the picker (see
+    /// [`Self::handle_key`]).
+    fn handle_devcontainer_key(&mut self, key: KeyWithModifier) -> bool {
+        let Some(pending) = self.pending_devcontainer.as_mut() else {
+            return false;
+        };
+        // Ctrl-c always abandons the picker, whatever the phase (an in-flight
+        // up finishes host-side harmlessly; the next pick's up is idempotent).
+        if key.has_modifiers(&[KeyModifier::Ctrl]) && key.bare_key == BareKey::Char('c') {
+            close_self();
+            return false;
+        }
+        match pending.phase.clone() {
+            DevcontainerPhase::Prompt => match key.bare_key {
+                BareKey::Char('y') | BareKey::Char('Y') if key.has_no_modifiers() => {
+                    pending.phase = DevcontainerPhase::Starting;
+                    let argv = devcontainers::up_argv(&pending.path);
+                    let context = devcontainers::up_context(&pending.path);
+                    let argv_refs: Vec<&str> = argv.iter().map(|s| s.as_str()).collect();
+                    run_command(&argv_refs, context);
+                    true
+                },
+                BareKey::Char('n') | BareKey::Char('N') if key.has_no_modifiers() => {
+                    let pending = self.pending_devcontainer.take().expect("checked above");
+                    self.open_project_locally(pending.path);
+                    true
+                },
+                BareKey::Esc => {
+                    self.pending_devcontainer = None;
+                    true
+                },
+                // Swallow everything else — the list underneath is frozen.
+                _ => true,
+            },
+            DevcontainerPhase::Starting => match key.bare_key {
+                // Esc abandons the picker but not the up: with no session
+                // created yet there is nothing to unwind, and a finished up
+                // just makes the next pick instant.
+                BareKey::Esc => {
+                    close_self();
+                    false
+                },
+                _ => true,
+            },
+            DevcontainerPhase::Failed(_) => {
+                // Any key dismisses the error back to the normal picker.
+                self.pending_devcontainer = None;
+                true
+            },
+        }
+    }
+
+    /// Route a `devcontainer up` result: create/switch on success, show the
+    /// classified error on failure. Ignores results that no longer match the
+    /// pending state (the user may have Esc'd and re-picked while it ran).
+    fn handle_devcontainer_up_result(
+        &mut self,
+        path_str: &str,
+        exit_code: Option<i32>,
+        stderr: &str,
+    ) -> bool {
+        let matches_pending = self.pending_devcontainer.as_ref().is_some_and(|p| {
+            p.phase == DevcontainerPhase::Starting && p.path.to_string_lossy() == path_str
+        });
+        if !matches_pending {
+            return false;
+        }
+        if exit_code == Some(0) {
+            let pending = self.pending_devcontainer.take().expect("checked above");
+            self.open_project_in_devcontainer(pending.path);
+        } else if let Some(pending) = self.pending_devcontainer.as_mut() {
+            pending.phase =
+                DevcontainerPhase::Failed(devcontainers::classify_error(exit_code, stderr));
+        }
+        true
+    }
+
+    /// Whether `path` (a project folder) carries a `.devcontainer` marker,
+    /// per the latest scans.
+    fn project_has_devcontainer(&self, path: &Path) -> bool {
+        let path = config::normalize(path);
+        self.devcontainer_projects
+            .values()
+            .any(|set| set.contains(&path))
+    }
+
+    /// Kick off the `.devcontainer` marker scans: one `find` over all root
+    /// dirs (markers one level under each project) and one over the
+    /// individual dirs, so the Enter-time prompt check is a set lookup.
+    fn fire_devcontainer_scans(&self) {
+        if !self.config.root_dirs.is_empty() {
+            let argv = devcontainers::scan_roots_argv(&self.config.root_dirs);
+            let argv_refs: Vec<&str> = argv.iter().map(|s| s.as_str()).collect();
+            run_command(
+                &argv_refs,
+                devcontainers::scan_context(devcontainers::SCAN_SCOPE_ROOTS),
+            );
+        }
+        if !self.config.individual_dirs.is_empty() {
+            let argv = devcontainers::scan_individual_argv(&self.config.individual_dirs);
+            let argv_refs: Vec<&str> = argv.iter().map(|s| s.as_str()).collect();
+            run_command(
+                &argv_refs,
+                devcontainers::scan_context(devcontainers::SCAN_SCOPE_INDIVIDUAL),
+            );
+        }
     }
 
     /// In cold-shell mode (`session_name` set) the session we ran in is a

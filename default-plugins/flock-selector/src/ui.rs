@@ -17,6 +17,7 @@ use unicode_width::UnicodeWidthStr;
 use zellij_tile::prelude::PaletteColor;
 
 use crate::codespaces::{GhError, RankedCodespace, StateKind};
+use crate::devcontainers::{DevcontainerError, DevcontainerPhase, PendingDevcontainer};
 use crate::live_sessions::{RankedSession, SessionActivity};
 use crate::palette::{bg, fg, goto, Theme, BOLD, DIM, NORMAL_INTENSITY, RESET};
 use crate::ranking::Ranked;
@@ -84,6 +85,9 @@ pub struct RenderInput<'a> {
     pub codespaces_refreshing: bool,
     /// The codespace name a stop is pending for, if any.
     pub pending_stop: Option<&'a str>,
+    /// The devcontainer prompt/up owning the picker, if any — rendered as a
+    /// full-width notice row just above the input.
+    pub pending_devcontainer: Option<&'a PendingDevcontainer>,
     pub palette: &'a Theme,
     /// Selection cursor: absolute index into the active results (0 = best,
     /// bottom-most).
@@ -119,6 +123,7 @@ pub fn render(input: RenderInput) -> RenderOutput {
         codespaces_error,
         codespaces_refreshing,
         pending_stop,
+        pending_devcontainer,
         palette: p,
         rows,
         cols,
@@ -267,6 +272,12 @@ pub fn render(input: RenderInput) -> RenderOutput {
         },
     }
 
+    // A pending devcontainer prompt/up owns the keyboard, so its notice row
+    // draws last — over the bottom-most result row — where the eye already is.
+    if let Some(pending) = pending_devcontainer {
+        render_devcontainer_notice(&mut out, input_y.saturating_sub(1), cols, pending, p);
+    }
+
     // The input line on the bottom row: prompt + query + a block cursor, with a
     // right-aligned shown/total count.
     render_input_row(&mut out, input_y, cols, query, total, total_candidates, p);
@@ -329,6 +340,53 @@ fn codespaces_error_spans(err: &GhError, p: &Theme) -> Vec<Span> {
         GhError::Other(detail) => format!(" gh error: {}", detail),
     };
     vec![Span::new(" ✗", p.red), Span::new(msg, p.muted).dim()]
+}
+
+/// The devcontainer prompt/starting/failed notice row (drawn over the
+/// bottom-most result row while the flow owns the keyboard).
+fn render_devcontainer_notice(
+    out: &mut String,
+    y: usize,
+    cols: usize,
+    pending: &PendingDevcontainer,
+    p: &Theme,
+) {
+    let spans = match &pending.phase {
+        DevcontainerPhase::Prompt => vec![
+            Span::new(" ⬢ ", p.teal),
+            Span::new(
+                format!("start \"{}\" in devcontainer?", pending.display_name),
+                p.text,
+            )
+            .bold(),
+            Span::new("  [y]es · [n]o · [esc] cancel", p.muted).dim(),
+        ],
+        DevcontainerPhase::Starting => vec![
+            Span::new(" ⬢ ", p.yellow),
+            Span::new(
+                format!("starting devcontainer for \"{}\"…", pending.display_name),
+                p.text,
+            ),
+            Span::new("  (first build can take a while)", p.muted).dim(),
+        ],
+        DevcontainerPhase::Failed(err) => {
+            let msg = match err {
+                DevcontainerError::CliMissing => {
+                    " devcontainer CLI not found — npm i -g @devcontainers/cli".to_owned()
+                },
+                DevcontainerError::DockerDown => {
+                    " cannot reach docker — is the daemon running?".to_owned()
+                },
+                DevcontainerError::Other(detail) => format!(" devcontainer: {}", detail),
+            };
+            vec![
+                Span::new(" ✗", p.red),
+                Span::new(msg, p.muted).dim(),
+                Span::new("  — press any key", p.muted).dim(),
+            ]
+        },
+    };
+    render_row(out, 0, y, cols, None, &spans);
 }
 
 /// The dim `(current)` marker suffixing the session the picker runs in — its
@@ -820,6 +878,7 @@ mod tests {
             codespaces_error: None,
             codespaces_refreshing: false,
             pending_stop: None,
+            pending_devcontainer: None,
             palette: &theme,
             selected: 0,
             scroll: 0,

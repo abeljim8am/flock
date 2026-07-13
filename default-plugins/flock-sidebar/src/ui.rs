@@ -275,9 +275,9 @@ pub(crate) enum Row {
         name: String,
         activity: SessionActivity,
         is_current: bool,
-        /// Whether the session is codespace-bound (its `default_command`
-        /// carries the `gh codespace ssh` binding) — badged in the row.
-        is_codespace: bool,
+        /// The session's remote binding, if any (parsed from its
+        /// `default_command`) — badged in the row: ⚡ codespace, ⬢ devcontainer.
+        binding: Option<crate::RemoteBinding>,
     },
     Agent(AgentEntry),
 }
@@ -423,11 +423,10 @@ pub(crate) fn build_rows(
             name: session.name.clone(),
             activity: session_activity(session, agents),
             is_current: session.is_current_session,
-            is_codespace: session
+            binding: session
                 .default_command
                 .as_deref()
-                .and_then(crate::codespace::parse_codespace_ssh)
-                .is_some(),
+                .and_then(crate::parse_remote_binding),
         });
     }
     // Bottom section: the current session's own agents, one row each. Only the
@@ -878,13 +877,13 @@ fn draw_row(
             name,
             activity,
             is_current,
-            is_codespace,
+            binding,
         } => {
             let (dot, dot_color) = activity_dot(*activity, p);
             let emphasized = cursor || *is_current;
             let name_color = if emphasized { p.text } else { p.muted };
-            // The codespace badge takes two extra cells before the name.
-            let name_budget = content_width.saturating_sub(if *is_codespace { 5 } else { 3 });
+            // A remote-binding badge takes two extra cells before the name.
+            let name_budget = content_width.saturating_sub(if binding.is_some() { 5 } else { 3 });
             let label = truncate_text(name, name_budget);
             let mut name_span = Span::new(label, name_color);
             name_span = if emphasized {
@@ -897,9 +896,16 @@ fn draw_row(
                 Span::new(dot, dot_color),
                 Span::new(" ", p.text),
             ];
-            if *is_codespace {
-                spans.push(Span::new("⚡", p.blue));
-                spans.push(Span::new(" ", p.text));
+            match binding {
+                Some(crate::RemoteBinding::Codespace) => {
+                    spans.push(Span::new("⚡", p.blue));
+                    spans.push(Span::new(" ", p.text));
+                },
+                Some(crate::RemoteBinding::Devcontainer) => {
+                    spans.push(Span::new("⬢", p.teal));
+                    spans.push(Span::new(" ", p.text));
+                },
+                None => {},
             }
             spans.push(name_span);
             render_row(out, 0, row_y, content_width, row_bg, &spans);
@@ -1145,6 +1151,44 @@ mod tests {
         let mut s = SessionInfo::new(name.to_string());
         s.workspace_root = std::path::PathBuf::from(root);
         s
+    }
+
+    #[test]
+    fn build_rows_badges_remote_bindings() {
+        let mut codespace = sess("cs", "");
+        codespace.default_command = Some(
+            ["gh", "codespace", "ssh", "-c", "my-cs"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
+        );
+        let mut devcontainer = sess("dc", "/work/app");
+        devcontainer.default_command = Some(vec![
+            "sh".to_string(),
+            "-c".to_string(),
+            crate::devcontainer::WRAPPER_SCRIPT.to_string(),
+            crate::devcontainer::WRAPPER_ARG0.to_string(),
+            "/work/app".to_string(),
+        ]);
+        let plain = sess("plain", "/work/other");
+
+        let rows = build_rows(
+            &PaneManifest::default(),
+            &[],
+            &BTreeMap::new(),
+            &[codespace, devcontainer, plain],
+        );
+        let binding_of = |wanted: &str| {
+            rows.iter()
+                .find_map(|row| match row {
+                    Row::Session { name, binding, .. } if name == wanted => Some(*binding),
+                    _ => None,
+                })
+                .expect("session row present")
+        };
+        assert_eq!(binding_of("cs"), Some(crate::RemoteBinding::Codespace));
+        assert_eq!(binding_of("dc"), Some(crate::RemoteBinding::Devcontainer));
+        assert_eq!(binding_of("plain"), None);
     }
 
     #[test]

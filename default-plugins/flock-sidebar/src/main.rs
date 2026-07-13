@@ -38,6 +38,7 @@
 
 mod codespace;
 mod detect;
+mod devcontainer;
 mod hook;
 mod palette;
 mod sessionizer;
@@ -76,6 +77,11 @@ const SESSION_REFRESH_SECS: f64 = 1.0;
 /// How often to reconcile pane command identity outside PaneUpdate. Session
 /// switches can leave the plugin rendering before a fresh command event arrives.
 const AGENT_COMMAND_SYNC_SECS: f64 = 1.0;
+/// How often to poll the devcontainer hook files (`docker exec … cat`) when
+/// this session is devcontainer-bound. Each poll forks a docker client, so it
+/// rides a slower cadence than the state tick; a few seconds of state latency
+/// is fine for a status dot.
+const DEVCONTAINER_HOOK_POLL_SECS: f64 = 3.0;
 
 /// Pipe message name (sent by a `MessagePlugin` keybind, e.g. Super b) that
 /// toggles the sidebar between its slim rail and an expanded width. We resize
@@ -182,6 +188,11 @@ struct State {
     /// geometry we resize to the fixed expanded width so the sidebar starts in
     /// the full labeled view rather than at whatever the percent happens to be.
     default_width_applied: bool,
+    /// When we last polled the devcontainer hook files (bound sessions only).
+    last_devcontainer_hook_poll: Option<Instant>,
+    /// The resolved container id of this session's devcontainer, cached
+    /// between polls; cleared when a poll says the container is gone.
+    devcontainer_container_id: Option<String>,
 }
 
 register_plugin!(State);
@@ -202,11 +213,14 @@ impl ZellijPlugin for State {
         // - ChangeApplicationState: switch session / focus pane on activation,
         //   resize our pane, and publish cross-session sidebar state
         // - ReadCliPipes: agent hook reports via `zellij pipe` (Phase 5)
+        // - RunCommands: polling devcontainer hook files via docker ps/exec
+        //   (the in-container agents can't reach `zellij pipe`)
         request_permission(&[
             PermissionType::ReadApplicationState,
             PermissionType::ReadPaneContents,
             PermissionType::ChangeApplicationState,
             PermissionType::ReadCliPipes,
+            PermissionType::RunCommands,
         ]);
 
         subscribe(&[
@@ -216,6 +230,7 @@ impl ZellijPlugin for State {
             EventType::SessionUpdate,
             EventType::CommandChanged,
             EventType::PaneRenderReportWithAnsi,
+            EventType::RunCommandResult,
             EventType::Mouse,
             EventType::Key,
             EventType::PermissionRequestResult,
@@ -288,6 +303,37 @@ impl ZellijPlugin for State {
                     }
                 }
             },
+            Event::RunCommandResult(exit_code, stdout, stderr, context) => {
+                if context.contains_key(devcontainer::PS_CONTEXT_KEY) {
+                    let id = String::from_utf8_lossy(&stdout)
+                        .lines()
+                        .next()
+                        .map(str::trim)
+                        .unwrap_or_default()
+                        .to_string();
+                    if exit_code == Some(0) && !id.is_empty() {
+                        // Read the hook files right away rather than waiting a
+                        // full poll cycle behind the id lookup.
+                        self.devcontainer_container_id = Some(id.clone());
+                        self.fire_devcontainer_hooks_read(&id);
+                    }
+                } else if context.contains_key(devcontainer::HOOKS_CONTEXT_KEY) {
+                    // Parse whatever printed regardless of exit code: a bound
+                    // session with no reports yet exits 1 (the glob matched
+                    // nothing) with empty output.
+                    should_render = self
+                        .apply_devcontainer_hook_lines(&String::from_utf8_lossy(&stdout));
+                    if exit_code != Some(0) {
+                        let stderr_lower = String::from_utf8_lossy(&stderr).to_lowercase();
+                        if stderr_lower.contains("container") {
+                            // docker says the container is gone/stopped —
+                            // re-resolve the id on the next poll (a pane's
+                            // self-healing `up` may bring it back).
+                            self.devcontainer_container_id = None;
+                        }
+                    }
+                }
+            },
             Event::Timer(_) => {
                 let now = Instant::now();
                 for entry in self.agents.values_mut() {
@@ -322,6 +368,9 @@ impl ZellijPlugin for State {
                 if self.should_refresh_session_list(now) {
                     should_render |= self.refresh_session_list(now);
                 }
+                // In a devcontainer-bound session, poll the in-container hook
+                // files (results arrive as RunCommandResult events).
+                self.maybe_poll_devcontainer_hooks(now);
                 // Catch the resize if permissions/geometry weren't ready when
                 // the first PaneUpdate arrived (runs once, gated by the flag).
                 self.maybe_set_default_width();
@@ -584,8 +633,10 @@ impl State {
     /// picker's throwaway host, not a workspace. With no sessionizer config, every
     /// other live session remains visible for backwards-compatible default
     /// behavior; otherwise only sessions whose workspace is in the configured set —
-    /// plus codespace-bound sessions, whose `workspace_root` is never a configured
-    /// project folder (the workspace lives inside the codespace).
+    /// plus remote-bound sessions: a codespace's `workspace_root` is never a
+    /// configured project folder (the workspace lives inside the codespace), and
+    /// a devcontainer session's usually is, but keeping the binding check makes
+    /// it visible even when the sidebar's dir args diverge from the selector's.
     fn visible_sessions(&self) -> Vec<SessionInfo> {
         self.sessions
             .iter()
@@ -596,7 +647,7 @@ impl State {
                     || session
                         .default_command
                         .as_deref()
-                        .and_then(codespace::parse_codespace_ssh)
+                        .and_then(parse_remote_binding)
                         .is_some()
             })
             .cloned()
@@ -994,25 +1045,125 @@ impl State {
     }
 
     /// Whether a pane's argv is a remote-transport command rather than a local
-    /// program: the codespace SSH binding itself, or — inside a bound session,
-    /// where every default pane is the transport (possibly reported as an ssh
-    /// child with rewritten argv) — any command that isn't a recognized agent.
+    /// program: a remote binding itself (codespace SSH or the devcontainer
+    /// wrapper), or — inside a bound session, where every default pane is the
+    /// transport (possibly reported with rewritten argv: an ssh child, or the
+    /// devcontainer CLI's node process after the wrapper's `exec`) — any
+    /// command that isn't a recognized agent.
     fn command_is_remote_transport(&self, command: &[String]) -> bool {
-        codespace::parse_codespace_ssh(command).is_some()
+        parse_remote_binding(command).is_some()
             || (self.current_session_is_bound() && identify_agent_from_command(command).is_none())
     }
 
-    /// Whether the session this sidebar runs in is codespace-bound (its
-    /// `default_command` carries the SSH binding).
+    /// Whether the session this sidebar runs in is remote-bound (its
+    /// `default_command` carries the codespace SSH or devcontainer binding).
     fn current_session_is_bound(&self) -> bool {
         self.sessions.iter().any(|session| {
             session.is_current_session
                 && session
                     .default_command
                     .as_deref()
-                    .and_then(codespace::parse_codespace_ssh)
+                    .and_then(parse_remote_binding)
                     .is_some()
         })
+    }
+
+    /// The workspace folder of this session's devcontainer binding, if the
+    /// current session is devcontainer-bound.
+    fn current_devcontainer_workspace(&self) -> Option<String> {
+        self.sessions
+            .iter()
+            .find(|session| session.is_current_session)
+            .and_then(|session| {
+                session
+                    .default_command
+                    .as_deref()
+                    .and_then(devcontainer::parse_devcontainer_command)
+                    .map(str::to_owned)
+            })
+    }
+
+    /// In a devcontainer-bound session, periodically read the in-container
+    /// hook files (see the bridge notes in [`devcontainer`]): resolve the
+    /// container id by its devcontainer label once, then `docker exec … cat`
+    /// on each poll. Results arrive as `RunCommandResult` events.
+    fn maybe_poll_devcontainer_hooks(&mut self, now: Instant) {
+        if !self.permissions_granted {
+            return;
+        }
+        let Some(workspace) = self.current_devcontainer_workspace() else {
+            return;
+        };
+        let due = self.last_devcontainer_hook_poll.is_none_or(|last| {
+            now.duration_since(last).as_secs_f64() >= DEVCONTAINER_HOOK_POLL_SECS
+        });
+        if !due {
+            return;
+        }
+        self.last_devcontainer_hook_poll = Some(now);
+        match self.devcontainer_container_id.clone() {
+            Some(id) => self.fire_devcontainer_hooks_read(&id),
+            None => {
+                let argv = devcontainer::ps_argv(&workspace);
+                let argv_refs: Vec<&str> = argv.iter().map(|s| s.as_str()).collect();
+                run_command(
+                    &argv_refs,
+                    BTreeMap::from_iter([(
+                        devcontainer::PS_CONTEXT_KEY.to_owned(),
+                        workspace.clone(),
+                    )]),
+                );
+            },
+        }
+    }
+
+    /// Fire the `docker exec … cat` that dumps the container's hook files.
+    fn fire_devcontainer_hooks_read(&self, container_id: &str) {
+        let argv = devcontainer::hooks_cat_argv(container_id);
+        let argv_refs: Vec<&str> = argv.iter().map(|s| s.as_str()).collect();
+        run_command(
+            &argv_refs,
+            BTreeMap::from_iter([(
+                devcontainer::HOOKS_CONTEXT_KEY.to_owned(),
+                container_id.to_owned(),
+            )]),
+        );
+    }
+
+    /// Apply the polled hook-file contents: each fresh line goes through the
+    /// ordinary hook parser and lands as hook authority, exactly like a
+    /// `zellij pipe` report. Lines for unknown panes (closed, or another
+    /// scope's leftovers) and stale non-idle reports are dropped.
+    fn apply_devcontainer_hook_lines(&mut self, stdout: &str) -> bool {
+        let live: HashSet<PaneId> = self
+            .panes
+            .panes
+            .values()
+            .flatten()
+            .filter(|pane| !pane.is_plugin)
+            .map(|pane| PaneId::Terminal(pane.id))
+            .collect();
+        let now_epoch_secs = now_millis() / 1000;
+        let mut changed = false;
+        for args in devcontainer::parse_state_lines(stdout) {
+            if !devcontainer::report_is_fresh(&args, now_epoch_secs) {
+                continue;
+            }
+            let Ok(report) = parse_hook_report(&args) else {
+                continue;
+            };
+            let pane_id = match &report {
+                HookReport::State { pane_id, .. } => *pane_id,
+                HookReport::Release { pane_id } => *pane_id,
+            };
+            if !live.contains(&pane_id) {
+                continue;
+            }
+            if self.apply_hook_report(report) {
+                changed = true;
+            }
+        }
+        changed
     }
 
     /// Remove tracked agent state for panes that are no longer in the manifest.
@@ -1036,6 +1187,27 @@ impl State {
         self.command_synced
             .retain(|pane_id| live.contains(pane_id));
     }
+}
+
+/// Which remote transport a session/pane binding uses. Both kinds behave the
+/// same everywhere in the sidebar (remote flag, screen-driven identity, wider
+/// gone-grace); the variant only picks the workspace-row badge.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RemoteBinding {
+    Codespace,
+    Devcontainer,
+}
+
+/// Recognize any remote binding in an argv (a session's `default_command` or
+/// a pane's command).
+pub(crate) fn parse_remote_binding(argv: &[String]) -> Option<RemoteBinding> {
+    if codespace::parse_codespace_ssh(argv).is_some() {
+        return Some(RemoteBinding::Codespace);
+    }
+    if devcontainer::parse_devcontainer_command(argv).is_some() {
+        return Some(RemoteBinding::Devcontainer);
+    }
+    None
 }
 
 fn argv_from_terminal_command(command: &str) -> Vec<String> {
@@ -1238,6 +1410,106 @@ mod tests {
             now
         ));
         assert!(state.agents.get(&pane_id).unwrap().remote);
+    }
+
+    fn devcontainer_binding(path: &str) -> Vec<String> {
+        argv(&[
+            "sh",
+            "-c",
+            devcontainer::WRAPPER_SCRIPT,
+            devcontainer::WRAPPER_ARG0,
+            path,
+        ])
+    }
+
+    #[test]
+    fn devcontainer_wrapper_argv_marks_pane_remote_without_agent() {
+        let mut state = State::default();
+        let now = Instant::now();
+        let pane_id = PaneId::Terminal(3);
+
+        let changed =
+            state.apply_command_changed(pane_id, &devcontainer_binding("/work/app"), true, now);
+        assert!(!changed);
+        let entry = state.agents.get(&pane_id).unwrap();
+        assert!(entry.remote);
+        assert!(!entry.is_agent());
+    }
+
+    /// After the wrapper's `exec`, the host process walk reports the
+    /// devcontainer CLI's node argv — not the binding shape — so the pane must
+    /// be marked remote through the bound-*session* branch (the session's
+    /// `default_command` still carries the wrapper).
+    #[test]
+    fn session_bound_devcontainer_marks_rewritten_node_argv_remote() {
+        let mut state = State::default();
+        let now = Instant::now();
+        let mut session = SessionInfo::new("app".to_string());
+        session.is_current_session = true;
+        session.default_command = Some(devcontainer_binding("/work/app"));
+        state.sessions = vec![session];
+
+        let pane_id = PaneId::Terminal(4);
+        let node_argv = argv(&[
+            "node",
+            "/usr/local/lib/node_modules/@devcontainers/cli/devcontainer.js",
+            "exec",
+            "--workspace-folder",
+            "/work/app",
+        ]);
+        assert!(!state.apply_command_changed(pane_id, &node_argv, true, now));
+        let entry = state.agents.get(&pane_id).unwrap();
+        assert!(entry.remote);
+        assert!(!entry.is_agent());
+    }
+
+    #[test]
+    fn seed_marks_devcontainer_transport_snapshot_remote() {
+        let mut state = State::default();
+        let now = Instant::now();
+        let pane_id = PaneId::Terminal(9);
+        assert!(!state.seed_agent_command(pane_id, &devcontainer_binding("/work/app"), now));
+        assert!(state.agents.get(&pane_id).unwrap().remote);
+    }
+
+    /// Polled hook-file lines act exactly like pipe reports: applied to live
+    /// panes, dropped for unknown panes and for stale non-idle reports.
+    #[test]
+    fn devcontainer_hook_lines_apply_to_live_panes_only() {
+        let mut state = State::default();
+        state.panes.panes.insert(
+            0,
+            vec![
+                PaneInfo {
+                    id: 3,
+                    is_plugin: false,
+                    ..Default::default()
+                },
+                PaneInfo {
+                    id: 5,
+                    is_plugin: false,
+                    ..Default::default()
+                },
+            ],
+        );
+        let now_epoch = now_millis() / 1000;
+        let stdout = format!(
+            "pane_id=3,state=blocked,agent=opencode,source=flock:opencode,ts={fresh}\n\
+             pane_id=5,state=working,agent=opencode,ts={stale}\n\
+             pane_id=42,state=working,agent=opencode,ts={fresh}\n",
+            fresh = now_epoch,
+            stale = now_epoch.saturating_sub(devcontainer::HOOK_STALE_SECS + 60),
+        );
+
+        assert!(state.apply_devcontainer_hook_lines(&stdout));
+        // Pane 3: fresh report applied as hook authority.
+        let entry = state.agents.get(&PaneId::Terminal(3)).unwrap();
+        assert!(entry.is_agent());
+        assert_eq!(entry.state, AgentState::Blocked);
+        // Pane 5: stale "working" dropped — no entry materializes.
+        assert!(state.agents.get(&PaneId::Terminal(5)).is_none());
+        // Pane 42 isn't in the manifest — dropped.
+        assert!(state.agents.get(&PaneId::Terminal(42)).is_none());
     }
 
     #[test]

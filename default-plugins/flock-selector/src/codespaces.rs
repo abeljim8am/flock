@@ -274,10 +274,20 @@ pub fn layout_doc_for(
     sidebar_args: &[(String, String)],
     base_layout: Option<&str>,
 ) -> String {
-    let quoted: Vec<String> = ssh_argv(codespace_name)
-        .iter()
-        .map(|arg| kdl_quote(arg))
-        .collect();
+    layout_doc_with_binding(&ssh_argv(codespace_name), sidebar_args, base_layout)
+}
+
+/// Build a bound session's layout doc for an arbitrary binding argv — the
+/// shared mechanics behind [`layout_doc_for`] and the devcontainer variant
+/// ([`crate::devcontainers::layout_doc_for`]): the user's base layout (or the
+/// built-in flock chrome mirror with the sidebar args injected), with the
+/// binding + no-resurrection options appended.
+pub fn layout_doc_with_binding(
+    binding_argv: &[String],
+    sidebar_args: &[(String, String)],
+    base_layout: Option<&str>,
+) -> String {
+    let quoted: Vec<String> = binding_argv.iter().map(|arg| kdl_quote(arg)).collect();
     let layout = match base_layout {
         Some(base) => format!("{}\n", base.trim_end()),
         None => FLOCK_LAYOUT_TEMPLATE
