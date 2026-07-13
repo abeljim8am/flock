@@ -305,7 +305,8 @@ fn render_header_row(out: &mut String, cols: usize, mode: PickerMode, p: &Theme)
     ];
 
     let hint = match mode {
-        PickerMode::Sessions | PickerMode::Projects => "Tab ",
+        PickerMode::Sessions => "Tab switch · Ctrl-x close ",
+        PickerMode::Projects => "Tab ",
         PickerMode::Codespaces => "Tab switch · Ctrl-x stop ",
     };
     let left_w: usize = spans.iter().map(|s| s.text.width()).sum();

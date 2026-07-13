@@ -427,6 +427,9 @@ impl State {
                 BareKey::Char('x') if self.mode == PickerMode::Codespaces => {
                     return self.stop_selected_codespace();
                 },
+                BareKey::Char('x') if self.mode == PickerMode::Sessions => {
+                    return self.kill_selected_session();
+                },
                 _ => return false,
             }
         }
@@ -581,6 +584,35 @@ impl State {
             self.discard_throwaway_session(current_session_name.as_deref());
         }
         close_self();
+    }
+
+    /// Close the selected live session (`Ctrl-x`, mirroring the Codespaces
+    /// tab's stop chord). A background session is killed
+    /// in place — the picker stays open and the next `SessionUpdate` drops the
+    /// row. Killing the session this client is attached to would sever it
+    /// mid-picker, so for the current session the client is first handed to
+    /// the next listed session (the switch shim blocks until the handoff
+    /// completes, same as [`Self::discard_throwaway_session`]), then the old
+    /// session is killed — taking this picker pane with it. With no other
+    /// session to land on, the key is a no-op.
+    fn kill_selected_session(&mut self) -> bool {
+        let entries = self.session_entries();
+        let ranked = live_sessions::rank(&entries, &self.query);
+        let Some(entry) = ranked.get(self.selected).map(|r| r.entry) else {
+            return false;
+        };
+
+        if !entry.is_current {
+            let _ = kill_sessions(&[entry.name.as_str()]);
+            return true;
+        }
+
+        let Some(next) = ranked.iter().find(|r| !r.entry.is_current) else {
+            return false;
+        };
+        switch_session(Some(&next.entry.name));
+        let _ = kill_sessions(&[entry.name.as_str()]);
+        true
     }
 
     /// Open the selected codespace: switch to its bound session if one is
