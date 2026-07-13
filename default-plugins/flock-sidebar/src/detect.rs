@@ -458,6 +458,9 @@ fn detect_opencode(content: &str) -> AgentState {
     if has_interrupt_pattern(&content.to_lowercase()) {
         return AgentState::Working;
     }
+    if has_opencode_progress_bar(content) {
+        return AgentState::Working;
+    }
 
     AgentState::Idle
 }
@@ -1188,6 +1191,24 @@ fn antigravity_task_count(line: &str) -> Option<u32> {
         }
     }
     None
+}
+
+/// opencode renders a progress bar of filled/dotted squares while a turn runs
+/// (herdr's `progress_bar_working` manifest rule, `(■|⬝){4,}`): a run of four
+/// or more such marks — mixed runs count — means working.
+fn has_opencode_progress_bar(content: &str) -> bool {
+    let mut run = 0;
+    for ch in content.chars() {
+        if ch == '■' || ch == '⬝' {
+            run += 1;
+            if run >= 4 {
+                return true;
+            }
+        } else {
+            run = 0;
+        }
+    }
+    false
 }
 
 fn has_opencode_question_prompt(content: &str) -> bool {
@@ -2555,6 +2576,33 @@ mod tests {
     #[test]
     fn opencode_idle() {
         assert_eq!(detect_opencode("> "), AgentState::Idle);
+    }
+
+    #[test]
+    fn opencode_working_progress_bar_filled() {
+        assert_eq!(
+            detect_opencode("■■■■■⬝⬝⬝⬝⬝  Building response"),
+            AgentState::Working
+        );
+    }
+
+    #[test]
+    fn opencode_working_progress_bar_dotted() {
+        // A just-started turn renders an all-dotted bar; mixed runs count too.
+        assert_eq!(detect_opencode("⬝⬝⬝⬝⬝⬝⬝⬝⬝⬝"), AgentState::Working);
+        assert_eq!(detect_opencode("■⬝■⬝"), AgentState::Working);
+    }
+
+    #[test]
+    fn opencode_short_square_run_is_not_a_progress_bar() {
+        // Fewer than four consecutive marks (e.g. a stray bullet like codex's
+        // "■ Conversation interrupted" line) must not read as working.
+        assert_eq!(
+            detect_opencode("■ Conversation interrupted - tell the model what to do differently"),
+            AgentState::Idle
+        );
+        // Runs broken by other characters don't accumulate.
+        assert_eq!(detect_opencode("■■■ done\n■■■ done"), AgentState::Idle);
     }
 
     // ---- GitHub Copilot ----
