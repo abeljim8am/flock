@@ -256,15 +256,23 @@ impl PluginMap {
     }
     /// Drop instances belonging to detached clients other than
     /// `kept_client_id`, so at most one warm (rebindable) generation lingers
-    /// per plugin after a detach.
+    /// per plugin after a detach. Returns the removed `(plugin, client)` pairs
+    /// so lifecycle cleanup is observable in the server log.
     pub fn remove_orphans_except(
         &mut self,
         kept_client_id: ClientId,
         connected_clients: &HashSet<ClientId>,
-    ) {
-        self.plugin_assets.retain(|(_p_id, c_id), _| {
-            *c_id == kept_client_id || connected_clients.contains(c_id)
+    ) -> Vec<(PluginId, ClientId)> {
+        let mut removed_plugin_instances = vec![];
+        self.plugin_assets.retain(|(plugin_id, client_id), _| {
+            let should_keep = *client_id == kept_client_id || connected_clients.contains(client_id);
+            if !should_keep {
+                removed_plugin_instances.push((*plugin_id, *client_id));
+            }
+            should_keep
         });
+        removed_plugin_instances.sort_unstable();
+        removed_plugin_instances
     }
     pub fn run_plugin_of_plugin_id(&self, plugin_id: PluginId) -> Option<RunPlugin> {
         self.plugin_assets

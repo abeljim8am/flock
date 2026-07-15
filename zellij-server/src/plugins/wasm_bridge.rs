@@ -800,6 +800,10 @@ impl WasmBridge {
         }
         self.connected_clients.lock().unwrap().push(client_id);
         if !rebound_plugin_ids.is_empty() {
+            rebound_plugin_ids.sort_unstable();
+            log::info!(
+                "Rebound warm plugin instances {rebound_plugin_ids:?} to UI client {client_id}"
+            );
             self.clear_plugin_map_cache();
             // rebound instances skipped the load path, so nothing asked screen
             // to replay state for them; one request refreshes them all (and
@@ -1323,28 +1327,49 @@ impl WasmBridge {
         Ok(())
     }
     pub fn remove_client(&mut self, client_id: ClientId) {
-        self.connected_clients
-            .lock()
-            .unwrap()
-            .retain(|c| c != &client_id);
+        let (was_connected_client, connected_clients) = {
+            let mut connected_clients = self.connected_clients.lock().unwrap();
+            let was_connected_client = connected_clients.contains(&client_id);
+            connected_clients.retain(|c| c != &client_id);
+            (
+                was_connected_client,
+                connected_clients.iter().copied().collect::<HashSet<_>>(),
+            )
+        };
 
-        // The detaching client's instances are deliberately kept in the plugin
-        // map: they stay warm (still receiving broadcast events and timers) so
-        // the next attaching client can adopt them instead of reloading — see
-        // `rebind_orphaned_instance`. Older detached generations are dropped
-        // here so only one rebind candidate lingers per plugin.
-        let connected_clients: HashSet<ClientId> = self
-            .connected_clients
-            .lock()
-            .unwrap()
-            .iter()
-            .copied()
-            .collect();
-        self.plugin_map
-            .lock()
-            .unwrap()
-            .remove_orphans_except(client_id, &connected_clients);
-        self.clear_plugin_map_cache();
+        if was_connected_client {
+            // The detaching client's instances are deliberately kept in the plugin
+            // map: they stay warm (still receiving broadcast events and timers) so
+            // the next attaching client can adopt them instead of reloading — see
+            // `rebind_orphaned_instance`. Older detached generations are dropped
+            // here so only one rebind candidate lingers per plugin.
+            //
+            // RemoveClient is also emitted when one-off CLI, pipe and watcher
+            // sockets close. Those ids were never added to `connected_clients` and
+            // must not prune warm UI instances from a detached session.
+            let removed_plugin_instances = self
+                .plugin_map
+                .lock()
+                .unwrap()
+                .remove_orphans_except(client_id, &connected_clients);
+            if removed_plugin_instances.is_empty() {
+                log::info!(
+                    "Plugin UI client {client_id} detached; retained its warm instances; \
+                     connected UI clients: {connected_clients:?}"
+                );
+            } else {
+                log::info!(
+                    "Plugin UI client {client_id} detached; pruned stale plugin instances \
+                     {removed_plugin_instances:?}; connected UI clients: {connected_clients:?}"
+                );
+            }
+            self.clear_plugin_map_cache();
+        } else {
+            log::debug!(
+                "Ignoring plugin cleanup for non-UI client {client_id}; connected UI clients: \
+                 {connected_clients:?}"
+            );
+        }
 
         // Remove client from cached pane render report
         if let Some(ref mut prev_report) = self.previous_pane_render_report {
