@@ -21,9 +21,11 @@
 /// `flock-selector/src/devcontainers.rs`.
 pub const WRAPPER_ARG0: &str = "flock-devcontainer";
 
-/// The constant wrapper script every pane in a bound session runs. Keep in
-/// sync with `flock-selector/src/devcontainers.rs`.
-pub const WRAPPER_SCRIPT: &str = r#"devcontainer up --workspace-folder "$1" >/dev/null && exec devcontainer exec --workspace-folder "$1" --remote-env ZELLIJ_PANE_ID="$ZELLIJ_PANE_ID" sh -c 'exec "${SHELL:-sh}" -l'"#;
+/// The constant wrapper script every pane in a bound session runs. It copies
+/// the host's managed OpenCode state plugin into the remote user's config when
+/// present, then forwards the pane id and selects the file bridge explicitly.
+/// Keep in sync with `flock-selector/src/devcontainers.rs`.
+pub const WRAPPER_SCRIPT: &str = r#"devcontainer up --workspace-folder "$1" >/dev/null || exit $?; hook="${XDG_CONFIG_HOME:-$HOME/.config}/opencode/plugins/flock-agent-state.js"; if [ -r "$hook" ]; then devcontainer exec --workspace-folder "$1" sh -c 'dir="${XDG_CONFIG_HOME:-$HOME/.config}/opencode/plugins"; mkdir -p "$dir" || exit 1; tmp="$dir/.flock-agent-state.js.tmp.$$"; cat >"$tmp" || exit 1; if cmp -s "$tmp" "$dir/flock-agent-state.js"; then rm -f "$tmp"; else mv -f "$tmp" "$dir/flock-agent-state.js"; fi' <"$hook" || printf '%s\n' 'flock: warning: could not install the OpenCode state plugin in the devcontainer' >&2; fi; exec devcontainer exec --workspace-folder "$1" --remote-env ZELLIJ_PANE_ID="$ZELLIJ_PANE_ID" --remote-env FLOCK_STATE_CHANNEL=file sh -c 'exec "${SHELL:-sh}" -l'"#;
 
 /// Recognize the devcontainer binding argv, returning the workspace folder.
 pub fn parse_devcontainer_command(argv: &[String]) -> Option<&str> {
@@ -148,10 +150,11 @@ mod tests {
 
     #[test]
     fn recognizes_the_binding_shape() {
-        assert_eq!(
-            parse_devcontainer_command(&binding_argv("/Users/me/my proj")),
-            Some("/Users/me/my proj")
-        );
+        let argv = binding_argv("/Users/me/my proj");
+        assert_eq!(parse_devcontainer_command(&argv), Some("/Users/me/my proj"));
+        assert!(argv[2].contains("opencode/plugins/flock-agent-state.js"));
+        assert!(argv[2].contains("--remote-env ZELLIJ_PANE_ID=\"$ZELLIJ_PANE_ID\""));
+        assert!(argv[2].contains("--remote-env FLOCK_STATE_CHANNEL=file"));
     }
 
     #[test]

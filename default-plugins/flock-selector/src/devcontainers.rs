@@ -53,12 +53,15 @@ pub const WRAPPER_ARG0: &str = "flock-devcontainer";
 /// created (the picker guarantees that before the session exists) it is a fast
 /// start/attach, and it revives a container stopped behind the session's back.
 /// Its stdout is silenced (a JSON success line per pane is noise); stderr is
-/// kept so a real failure prints before the pane closes. The inner
-/// single-quoted `sh -c` runs in the container, where `${SHELL}` (set by the
-/// devcontainer CLI's userEnvProbe when available) picks the login shell.
+/// kept so a real failure prints before the pane closes. Before entering the
+/// container it copies the host's managed OpenCode state plugin into the
+/// remote user's config when that plugin exists. The final exec forwards the
+/// pane id and explicitly selects Flock's file bridge; the inner single-quoted
+/// `sh -c` runs in the container, where `${SHELL}` (set by the devcontainer
+/// CLI's userEnvProbe when available) picks the login shell.
 ///
 /// Duplicated in `flock-sidebar/src/devcontainer.rs`; keep in sync.
-pub const WRAPPER_SCRIPT: &str = r#"devcontainer up --workspace-folder "$1" >/dev/null && exec devcontainer exec --workspace-folder "$1" --remote-env ZELLIJ_PANE_ID="$ZELLIJ_PANE_ID" sh -c 'exec "${SHELL:-sh}" -l'"#;
+pub const WRAPPER_SCRIPT: &str = r#"devcontainer up --workspace-folder "$1" >/dev/null || exit $?; hook="${XDG_CONFIG_HOME:-$HOME/.config}/opencode/plugins/flock-agent-state.js"; if [ -r "$hook" ]; then devcontainer exec --workspace-folder "$1" sh -c 'dir="${XDG_CONFIG_HOME:-$HOME/.config}/opencode/plugins"; mkdir -p "$dir" || exit 1; tmp="$dir/.flock-agent-state.js.tmp.$$"; cat >"$tmp" || exit 1; if cmp -s "$tmp" "$dir/flock-agent-state.js"; then rm -f "$tmp"; else mv -f "$tmp" "$dir/flock-agent-state.js"; fi' <"$hook" || printf '%s\n' 'flock: warning: could not install the OpenCode state plugin in the devcontainer' >&2; fi; exec devcontainer exec --workspace-folder "$1" --remote-env ZELLIJ_PANE_ID="$ZELLIJ_PANE_ID" --remote-env FLOCK_STATE_CHANNEL=file sh -c 'exec "${SHELL:-sh}" -l'"#;
 
 /// The binding argv: what every pane in a bound session runs. Single source of
 /// truth for the shape [`parse_devcontainer_command`] recognizes.
@@ -249,6 +252,9 @@ mod tests {
     fn wrapper_argv_round_trips_through_recognizer() {
         let argv = wrapper_argv(Path::new("/Users/me/my proj"));
         assert_eq!(parse_devcontainer_command(&argv), Some("/Users/me/my proj"));
+        assert!(argv[2].contains("opencode/plugins/flock-agent-state.js"));
+        assert!(argv[2].contains("--remote-env ZELLIJ_PANE_ID=\"$ZELLIJ_PANE_ID\""));
+        assert!(argv[2].contains("--remote-env FLOCK_STATE_CHANNEL=file"));
     }
 
     #[test]

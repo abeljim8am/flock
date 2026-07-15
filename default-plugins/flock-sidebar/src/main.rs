@@ -422,8 +422,9 @@ impl ZellijPlugin for State {
                             self.activate_selected();
                             should_render = true;
                         },
-                        // Esc closes the sidebar when it's focused (e.g. a float).
-                        BareKey::Esc => close_self(),
+                        // Do not close on Esc: one plugin instance backs the
+                        // sidebar panes across tabs, so close_self() here tears
+                        // down every sidebar and looks like a plugin crash.
                         _ => {},
                     }
                 }

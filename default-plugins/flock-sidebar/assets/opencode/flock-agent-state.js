@@ -2,7 +2,7 @@
 // managed by flock-sidebar; reinstalling or updating the integration overwrites this file.
 // add custom hooks/plugins beside this file instead of editing it.
 // FLOCK_INTEGRATION_ID=opencode
-// FLOCK_INTEGRATION_VERSION=2
+// FLOCK_INTEGRATION_VERSION=3
 //
 // Ported from herdr's opencode integration plugin (herdr-agent-state.js,
 // HERDR_INTEGRATION_VERSION=8). Instead of writing herdr's unix socket, it
@@ -18,15 +18,15 @@
 // logic is herdr's, kept verbatim so task-tool sessions can't clobber the pane's
 // root-agent state.
 //
-// v2 adds a devcontainer channel: inside a container the `zellij` binary and
-// server socket don't exist, but flock's devcontainer sessions forward the
-// pane id in via `devcontainer exec --remote-env ZELLIJ_PANE_ID=…`. When
-// `zellij` is unreachable at plugin init, each report is instead written to
-// /tmp/flock-state/pane-<id> (one line, the same key=value format as the pipe
-// args, plus ts=<epoch secs>), which the flock-sidebar polls from the host via
-// `docker exec … cat`. Locally nothing changes — the pipe stays the channel.
+// v2 added a devcontainer file channel. v3 makes the transport explicit:
+// flock's devcontainer wrappers forward both ZELLIJ_PANE_ID and
+// FLOCK_STATE_CHANNEL=file. Reports are written to /tmp/flock-state/pane-<id>
+// (one line, the same key=value format as the pipe args, plus ts=<epoch secs>),
+// which flock-sidebar polls from the host via `docker exec … cat`. For older
+// wrappers without the marker, a failed `zellij pipe` delivery switches the
+// plugin to the file channel. Locally the successful pipe remains the channel.
 
-import { spawn, spawnSync } from "node:child_process";
+import { spawn } from "node:child_process";
 import { mkdirSync, writeFileSync, renameSync } from "node:fs";
 import { join } from "node:path";
 
@@ -37,20 +37,15 @@ const AGENT = "opencode";
 // Must stay in sync with `hooks_cat_argv` in flock-sidebar/src/devcontainer.rs.
 const STATE_DIR = "/tmp/flock-state";
 
-// Set at plugin init: file channel only when `zellij` can't be spawned.
-let useFileChannel = false;
-
-function zellijReachable() {
-  try {
-    const probe = spawnSync("zellij", ["--version"], {
-      stdio: "ignore",
-      timeout: 2000,
-    });
-    return !probe.error && probe.status === 0;
-  } catch {
-    return false;
-  }
-}
+// Bound devcontainer sessions mark the file transport explicitly. The common
+// devcontainer markers cover older wrappers; absence of ZELLIJ_SESSION_NAME
+// lets a failed pipe below identify the older pane-id-only handoff without
+// turning a transient failure in a real local session into a permanent switch.
+const fileChannelRequested =
+  process.env.FLOCK_STATE_CHANNEL?.trim().toLowerCase() === "file" ||
+  Boolean(process.env.REMOTE_CONTAINERS || process.env.DEVCONTAINER);
+const fileFallbackAllowed = !process.env.ZELLIJ_SESSION_NAME;
+let useFileChannel = fileChannelRequested;
 
 // Best-effort atomic write (tmp + rename) so the sidebar's poll never reads a
 // half-written line. The pane id lands in the filename, so only the server's
@@ -127,11 +122,28 @@ function reportState(state) {
         timeout: 2000,
       });
     } catch {
+      if (fileFallbackAllowed) {
+        useFileChannel = true;
+        writeStateFile(paneId, state);
+      }
       resolve();
       return;
     }
-    child.on("error", () => resolve());
-    child.on("exit", () => resolve());
+    let settled = false;
+    const finish = (delivered) => {
+      if (settled) return;
+      settled = true;
+      if (!delivered && fileFallbackAllowed) {
+        // The command existing is not enough: inside a container it may have
+        // no route to the host server. Preserve this report and send future
+        // ones through the file bridge.
+        useFileChannel = true;
+        writeStateFile(paneId, state);
+      }
+      resolve();
+    };
+    child.once("error", () => finish(false));
+    child.once("exit", (code) => finish(code === 0));
   });
 }
 
@@ -139,10 +151,6 @@ export const FlockAgentStatePlugin = async () => {
   if (!process.env.ZELLIJ_PANE_ID) {
     return {};
   }
-
-  // Channel pick, once: the pipe when zellij is reachable (local), the state
-  // file otherwise (inside a devcontainer).
-  useFileChannel = !zellijReachable();
 
   return {
     "chat.message": async ({ sessionID }) => {
