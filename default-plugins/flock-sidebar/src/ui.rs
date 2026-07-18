@@ -933,8 +933,14 @@ fn draw_row(
             let (dot, dot_color) = activity_dot(*activity, p);
             let emphasized = cursor || *is_current;
             let name_color = if emphasized { p.text } else { p.muted };
-            // A remote-binding badge takes two extra cells before the name.
-            let name_budget = content_width.saturating_sub(if binding.is_some() { 5 } else { 3 });
+            // Cloud badges get two cells of breathing room before the session
+            // name; the devcontainer badge keeps the standard one-cell gap.
+            let badge_width = match binding {
+                Some(crate::RemoteBinding::Codespace | crate::RemoteBinding::Coder) => 3,
+                Some(crate::RemoteBinding::Devcontainer) => 2,
+                None => 0,
+            };
+            let name_budget = content_width.saturating_sub(3 + badge_width);
             let label = truncate_text(name, name_budget);
             let mut name_span = Span::new(label, name_color);
             name_span = if emphasized {
@@ -949,14 +955,14 @@ fn draw_row(
             ];
             match binding {
                 Some(crate::RemoteBinding::Codespace) => {
-                    spans.push(Span::new("☁︎ ", p.blue));
+                    spans.push(Span::new("☁︎  ", p.blue));
                 },
                 Some(crate::RemoteBinding::Devcontainer) => {
                     spans.push(Span::new("⬢", p.teal));
                     spans.push(Span::new(" ", p.text));
                 },
                 Some(crate::RemoteBinding::Coder) => {
-                    spans.push(Span::new("☁︎ ", p.blue));
+                    spans.push(Span::new("☁︎  ", p.blue));
                 },
                 None => {},
             }
@@ -1263,7 +1269,7 @@ mod tests {
             };
             let mut output = String::new();
             draw_row(&mut output, &row, 0, 20, false, 0, &Theme::default());
-            assert!(output.contains("☁︎ "));
+            assert!(output.contains("☁︎  "));
         }
     }
 
