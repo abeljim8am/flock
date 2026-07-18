@@ -122,6 +122,7 @@ struct State {
     coder_error: Option<coder::CoderError>,
     coder_refreshing: bool,
     pending_coder_stop: Option<String>,
+    pending_coder_open: Option<PendingCoderOpen>,
     coder_refresh_ticks: u8,
     /// Coder-only workspace creation flow, opened lazily with Ctrl-o.
     coder_create: Option<coder::CreateWizard>,
@@ -139,6 +140,13 @@ struct State {
     devcontainer_projects: BTreeMap<String, HashSet<PathBuf>>,
     /// The devcontainer prompt/up currently owning the picker's keyboard.
     pending_devcontainer: Option<PendingDevcontainer>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PendingCoderOpen {
+    identifier: String,
+    session_name: String,
+    previous_session: Option<String>,
 }
 
 fn enabled_modes_for(config: &SelectorConfig) -> Vec<PickerMode> {
@@ -317,7 +325,9 @@ impl ZellijPlugin for State {
             },
             Event::Timer(_) => {
                 self.timer_running = false;
-                self.coder_create_notice = None;
+                if self.pending_coder_open.is_none() {
+                    self.coder_create_notice = None;
+                }
                 if self.permissions_granted {
                     self.fire_scans();
                     if self.config.devcontainers_enabled {
@@ -400,6 +410,38 @@ impl ZellijPlugin for State {
                     // Whatever happened, re-list so the shown state reconciles
                     // with reality.
                     self.fire_codespace_list();
+                    should_render = true;
+                } else if self.config.coder_enabled
+                    && context.contains_key(coder::BOOTSTRAP_CONTEXT_KEY)
+                {
+                    let pending = self.pending_coder_open.take();
+                    if exit_code == Some(0) {
+                        if let Some(pending) = pending {
+                            let layout = LayoutInfo::Stringified(coder::layout_doc_for(
+                                &pending.identifier,
+                                &self.config.sidebar_args,
+                                None,
+                            ));
+                            switch_session_with_layout(
+                                Some(&pending.session_name),
+                                layout,
+                                None,
+                            );
+                            self.discard_throwaway_session(pending.previous_session.as_deref());
+                            close_self();
+                        }
+                    } else {
+                        self.coder_create_notice = None;
+                        self.coder_error = Some(coder::CoderError::Other(
+                            String::from_utf8_lossy(&stderr)
+                                .lines()
+                                .rev()
+                                .find(|line| !line.trim().is_empty())
+                                .unwrap_or("remote Zellij bootstrap failed")
+                                .trim()
+                                .to_owned(),
+                        ));
+                    }
                     should_render = true;
                 } else if self.config.coder_enabled
                     && context.contains_key(coder::TEMPLATE_LIST_CONTEXT_KEY)
@@ -632,6 +674,9 @@ impl State {
         }
         if self.coder_create.is_some() {
             return self.handle_coder_create_key(key);
+        }
+        if self.pending_coder_open.is_some() {
+            return true;
         }
         // Navigation: in the reverse layout the best result sits at the bottom
         // (selected = 0), so Up moves toward worse results (higher on screen) and
@@ -1234,13 +1279,19 @@ impl State {
                 self.discard_throwaway_session(current_session_name.as_deref());
             },
             coder::OpenAction::Create { name } => {
-                let layout = LayoutInfo::Stringified(coder::layout_doc_for(
-                    &identifier,
-                    &self.config.sidebar_args,
-                    self.remote_layout_base.as_deref(),
+                self.pending_coder_open = Some(PendingCoderOpen {
+                    identifier: identifier.clone(),
+                    session_name: name,
+                    previous_session: current_session_name,
+                });
+                self.coder_create_notice = Some(format!(
+                    "Preparing persistent session in {}…",
+                    identifier
                 ));
-                switch_session_with_layout(Some(&name), layout, None);
-                self.discard_throwaway_session(current_session_name.as_deref());
+                let argv = coder::bootstrap_argv(&identifier);
+                let refs: Vec<&str> = argv.iter().map(String::as_str).collect();
+                run_command(&refs, coder::bootstrap_context(&identifier));
+                return;
             },
         }
         close_self();

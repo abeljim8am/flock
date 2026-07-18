@@ -119,6 +119,8 @@ pub fn spinner_frame(tick: u32) -> &'static str {
 pub(crate) enum SessionActivity {
     /// No agents in the session.
     None,
+    /// A remote workspace is showing a cached snapshot and is unreachable.
+    Offline,
     /// One or more agents present, all idle and already seen — nothing to do.
     Stopped,
     /// At least one agent is actively working.
@@ -165,6 +167,15 @@ fn session_activity(
     session: &SessionInfo,
     agents: &BTreeMap<PaneId, PaneAgentState>,
 ) -> SessionActivity {
+    if session
+        .default_command
+        .as_deref()
+        .and_then(crate::parse_remote_binding)
+        == Some(crate::RemoteBinding::Coder)
+        && !session.agent_states.is_empty()
+    {
+        return session_activity_from_states(&session.agent_states);
+    }
     if session.is_current_session {
         let activity = current_session_activity(agents);
         if activity == SessionActivity::None {
@@ -192,6 +203,7 @@ fn activity_dot(activity: SessionActivity, p: &Theme) -> (&'static str, PaletteC
         SessionActivity::DoneUnseen => ("●", p.teal),
         SessionActivity::Running => ("●", p.green),
         SessionActivity::Stopped => ("●", p.yellow),
+        SessionActivity::Offline => ("◌", p.muted),
         SessionActivity::None => ("○", p.muted),
     }
 }
@@ -212,6 +224,12 @@ fn agent_icon(state: AgentState, seen: bool, tick: u32, p: &Theme) -> (&'static 
 /// dot, using the same attention priority as our own session — so a *blocked*
 /// agent in another workspace shows its red ◉ here, not a generic "stopped" dot.
 fn session_activity_from_states(states: &BTreeMap<PaneId, PaneAgentStatus>) -> SessionActivity {
+    if states
+        .values()
+        .any(|status| status.label.ends_with(" · offline"))
+    {
+        return SessionActivity::Offline;
+    }
     rollup_activity(
         states
             .values()
@@ -253,7 +271,7 @@ fn session_agent_count(session: &SessionInfo) -> usize {
 /// A single agent row in the panel: a state icon and a label. No status word —
 /// the icon's glyph and color carry the state.
 pub struct AgentEntry {
-    pub pane_id: PaneId,
+    pub target: Target,
     /// Display label: the agent name, or `tab·agent` when the session has more
     /// than one tab (matching herdr's multi-tab `pane_details` labelling).
     pub label: String,
@@ -290,6 +308,17 @@ pub enum Target {
     Session(String),
     /// Focus this agent pane.
     Pane(PaneId),
+    /// Focus a pane owned by the durable Zellij server in a Coder workspace.
+    RemotePane(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemoteAgentEntry {
+    pub pane_id: String,
+    pub label: String,
+    pub state: AgentState,
+    pub seen: bool,
+    pub is_active: bool,
 }
 
 /// A rendered row's click target: which absolute pane row it occupies and which
@@ -364,7 +393,7 @@ pub fn build_entries(
             };
             let is_active = pane.is_focused && tab_active.get(tab_idx).copied().unwrap_or(false);
             entries.push(AgentEntry {
-                pane_id,
+                target: Target::Pane(pane_id),
                 label,
                 state,
                 seen,
@@ -414,6 +443,7 @@ pub(crate) fn build_rows(
     tabs: &[TabInfo],
     agents: &BTreeMap<PaneId, PaneAgentState>,
     sessions: &[SessionInfo],
+    remote_agents: &[RemoteAgentEntry],
 ) -> Vec<Row> {
     let mut rows = Vec::new();
     // Top section: the workspaces overview — one dot-only row per session, no
@@ -434,8 +464,20 @@ pub(crate) fn build_rows(
     // current session's panes are observable from here, so this is the live
     // detail view for the workspace you're in.
     if let Some(current) = sessions.iter().find(|s| s.is_current_session) {
-        let entries = build_entries(panes, tabs, agents, &current.agent_states);
-        rows.extend(entries.into_iter().map(Row::Agent));
+        if remote_agents.is_empty() {
+            let entries = build_entries(panes, tabs, agents, &current.agent_states);
+            rows.extend(entries.into_iter().map(Row::Agent));
+        } else {
+            rows.extend(remote_agents.iter().map(|entry| {
+                Row::Agent(AgentEntry {
+                    target: Target::RemotePane(entry.pane_id.clone()),
+                    label: entry.label.clone(),
+                    state: entry.state,
+                    seen: entry.seen,
+                    is_active: entry.is_active,
+                })
+            }));
+        }
     }
     rows
 }
@@ -446,7 +488,7 @@ pub(crate) fn build_rows(
 fn row_target(row: &Row) -> Target {
     match row {
         Row::Session { name, .. } => Target::Session(name.clone()),
-        Row::Agent(entry) => Target::Pane(entry.pane_id),
+        Row::Agent(entry) => entry.target.clone(),
     }
 }
 
@@ -474,8 +516,9 @@ pub fn navigable_targets(
     tabs: &[TabInfo],
     agents: &BTreeMap<PaneId, PaneAgentState>,
     sessions: &[SessionInfo],
+    remote_agents: &[RemoteAgentEntry],
 ) -> Vec<Target> {
-    build_rows(panes, tabs, agents, sessions)
+    build_rows(panes, tabs, agents, sessions, remote_agents)
         .iter()
         .map(row_target)
         .collect()
@@ -588,6 +631,7 @@ pub struct RenderInput<'a> {
     pub panes: &'a PaneManifest,
     pub tabs: &'a [TabInfo],
     pub agents: &'a BTreeMap<PaneId, PaneAgentState>,
+    pub remote_agents: &'a [RemoteAgentEntry],
     pub sessions: &'a [SessionInfo],
     pub palette: &'a Theme,
     /// Shared open/closed state for both sidebar sections.
@@ -656,7 +700,13 @@ pub fn render(input: RenderInput) -> RenderOutput {
         };
     }
 
-    let rows_data = build_rows(input.panes, input.tabs, input.agents, input.sessions);
+    let rows_data = build_rows(
+        input.panes,
+        input.tabs,
+        input.agents,
+        input.sessions,
+        input.remote_agents,
+    );
     let selected = clamp_selection(input.selected, rows_data.len());
 
     // Closed mode uses the icon rail even if the pane has enough room for labels.
@@ -1186,6 +1236,7 @@ mod tests {
             &[],
             &BTreeMap::new(),
             &[codespace, devcontainer, coder, plain],
+            &[],
         );
         let binding_of = |wanted: &str| {
             rows.iter()
@@ -1244,6 +1295,7 @@ mod tests {
             panes: &panes,
             tabs: &tabs,
             agents: &agents,
+            remote_agents: &[],
             sessions: &sessions,
             palette: &palette,
             sidebar_mode: SidebarMode::Closed,
@@ -1274,6 +1326,7 @@ mod tests {
             panes: &panes,
             tabs: &tabs,
             agents: &agents,
+            remote_agents: &[],
             sessions: &sessions,
             palette: &palette,
             sidebar_mode: SidebarMode::Open,
@@ -1323,6 +1376,7 @@ mod tests {
             panes: &panes,
             tabs: &tabs,
             agents: &agents,
+            remote_agents: &[],
             sessions: &sessions,
             palette: &palette,
             sidebar_mode: SidebarMode::Closed,
@@ -1347,7 +1401,13 @@ mod tests {
             sess("c", ""),
             sess("d", "/home/u/other"),
         ];
-        let targets = navigable_targets(&PaneManifest::default(), &[], &BTreeMap::new(), &sessions);
+        let targets = navigable_targets(
+            &PaneManifest::default(),
+            &[],
+            &BTreeMap::new(),
+            &sessions,
+            &[],
+        );
         assert_eq!(
             targets,
             vec![
@@ -1355,6 +1415,30 @@ mod tests {
                 Target::Session("a".to_string()), // /home/u/proj
                 Target::Session("c".to_string()), // unknown, last
             ]
+        );
+    }
+
+    #[test]
+    fn remote_agent_rows_replace_gateway_screen_rows_and_keep_focus_identity() {
+        let mut current = sess("api", "");
+        current.is_current_session = true;
+        let remote = vec![RemoteAgentEntry {
+            pane_id: "terminal_7".into(),
+            label: "codex".into(),
+            state: AgentState::Working,
+            seen: true,
+            is_active: true,
+        }];
+        let targets = navigable_targets(
+            &PaneManifest::default(),
+            &[],
+            &BTreeMap::new(),
+            &[current],
+            &remote,
+        );
+        assert_eq!(
+            targets,
+            vec![Target::Session("api".into()), Target::RemotePane("terminal_7".into())]
         );
     }
 
@@ -1447,6 +1531,20 @@ mod tests {
     }
 
     #[test]
+    fn cached_coder_snapshot_gets_a_distinct_offline_activity() {
+        let states = BTreeMap::from_iter([(
+            PaneId::Plugin(u32::MAX),
+            PaneAgentStatus {
+                state: AgentRunState::Unknown,
+                label: "codex · offline".into(),
+                seen: true,
+            },
+        )]);
+        assert_eq!(session_activity_from_states(&states), SessionActivity::Offline);
+        assert_eq!(activity_dot(SessionActivity::Offline, &Theme::default()).0, "◌");
+    }
+
+    #[test]
     fn current_session_activity_falls_back_to_published_state() {
         let agents: BTreeMap<PaneId, PaneAgentState> = BTreeMap::new();
         let mut current_session = sess("workspace-a", "/home/u/proj");
@@ -1491,11 +1589,11 @@ mod tests {
             },
         );
 
-        let rows = build_rows(&panes, &tabs, &agents, &[current_session]);
+        let rows = build_rows(&panes, &tabs, &agents, &[current_session], &[]);
         assert!(rows.iter().any(|row| matches!(
             row,
             Row::Agent(entry)
-                if entry.pane_id == PaneId::Terminal(7)
+                if entry.target == Target::Pane(PaneId::Terminal(7))
                     && entry.label == "codex"
                     && entry.state == AgentState::Working
         )));
@@ -1536,11 +1634,11 @@ mod tests {
             },
         );
 
-        let rows = build_rows(&panes, &tabs, &agents, &[current_session]);
+        let rows = build_rows(&panes, &tabs, &agents, &[current_session], &[]);
         assert!(rows.iter().any(|row| matches!(
             row,
             Row::Agent(entry)
-                if entry.pane_id == PaneId::Terminal(7)
+                if entry.target == Target::Pane(PaneId::Terminal(7))
                     && entry.label == "codex"
                     && entry.state == AgentState::Idle
                     && entry.seen

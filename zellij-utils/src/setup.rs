@@ -132,6 +132,12 @@ pub const FLOCK_SELECTOR_LAYOUT: &[u8] = include_bytes!(concat!(
     "assets/layouts/flock-selector.kdl"
 ));
 
+pub const FLOCK_CODER_REMOTE_LAYOUT: &[u8] = include_bytes!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/",
+    "assets/layouts/flock-coder-remote.kdl"
+));
+
 pub const FISH_EXTRA_COMPLETION: &[u8] = include_bytes!(concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/",
@@ -192,6 +198,7 @@ pub fn dump_specified_layout(layout: &str) -> std::io::Result<()> {
         "classic" => dump_asset(CLASSIC_LAYOUT),
         "flock" => dump_asset(FLOCK_LAYOUT),
         "flock-selector" => dump_asset(FLOCK_SELECTOR_LAYOUT),
+        "flock-coder-remote" => dump_asset(FLOCK_CODER_REMOTE_LAYOUT),
         custom => {
             info!("Dump {custom} layout");
             let custom = add_layout_ext(custom);

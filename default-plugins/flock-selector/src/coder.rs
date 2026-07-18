@@ -6,13 +6,22 @@ use std::collections::{BTreeMap, HashSet};
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::codespaces::layout_doc_with_binding;
 use crate::fuzzy::fuzzy_match;
 
 pub const LIST_CONTEXT_KEY: &str = "flock_coder_list";
 pub const STOP_CONTEXT_KEY: &str = "flock_coder_stop";
 pub const TEMPLATE_LIST_CONTEXT_KEY: &str = "flock_coder_template_list";
 pub const CREATE_CONTEXT_KEY: &str = "flock_coder_create";
+pub const BOOTSTRAP_CONTEXT_KEY: &str = "flock_coder_bootstrap";
+
+pub const GATEWAY_WRAPPER_ARG0: &str = "flock-coder-gateway";
+pub const RELEASE_TAG: &str = "main";
+pub const RELEASE_BASE_URL: &str = "https://github.com/abeljim8am/zellij/releases/download";
+
+/// The host-side gateway is deliberately an exact argv shape. Both Flock
+/// plugins recognize this as the durable Coder binding, while the shell body
+/// remains an implementation detail that can evolve without changing identity.
+pub const GATEWAY_SCRIPT: &str = r#"trap 'exit 130' INT; trap 'exit 143' TERM; identifier="$1"; remote="$HOME/.local/share/flock/current/zellij"; while :; do coder ssh -t "$identifier" -- "$remote" attach --create flock options --default-layout flock-coder-remote; status=$?; [ "$status" -eq 0 ] && exit 0; printf '\nflock: Coder connection lost; retrying in 2s (Ctrl-c to stop)\n' >&2; sleep 2 || exit "$status"; done"#;
 
 const CACHE_PATH: &str = "/data/coder-workspaces.json";
 const FALLBACK_NAME: &str = "coder";
@@ -76,8 +85,80 @@ pub fn list_argv() -> Vec<String> {
     ]
 }
 
+#[cfg(test)]
 pub fn ssh_argv(identifier: &str) -> Vec<String> {
     vec!["coder".into(), "ssh".into(), identifier.into()]
+}
+
+pub fn gateway_argv(identifier: &str) -> Vec<String> {
+    vec![
+        "sh".into(),
+        "-c".into(),
+        GATEWAY_SCRIPT.into(),
+        GATEWAY_WRAPPER_ARG0.into(),
+        identifier.into(),
+    ]
+}
+
+pub fn parse_gateway(argv: &[String]) -> Option<&str> {
+    match argv {
+        [sh, dash_c, script, arg0, identifier]
+            if sh == "sh"
+                && dash_c == "-c"
+                && script == GATEWAY_SCRIPT
+                && arg0 == GATEWAY_WRAPPER_ARG0
+                && valid_identifier(identifier) =>
+        {
+            Some(identifier)
+        },
+        _ => None,
+    }
+}
+
+/// Bootstrap the fork into a versioned user directory in the workspace. The
+/// static musl build is intentionally Linux/x86_64-only for v1. Installation is
+/// atomic and checksum verified; repeated calls are cheap.
+pub fn bootstrap_argv(identifier: &str) -> Vec<String> {
+    let script = format!(
+        r#"set -eu
+[ "$(uname -s)" = Linux ] && [ "$(uname -m)" = x86_64 ] || {{ echo 'flock: persistent Coder sessions currently require Linux x86_64' >&2; exit 65; }}
+root="$HOME/.local/share/flock"
+dest="$root/{tag}"
+[ -x "$dest/zellij" ] && {{ mkdir -p "$root" "$HOME/.local/bin"; ln -sfn "$dest" "$root/current"; ln -sfn "$dest/zellij" "$HOME/.local/bin/zellij"; exit 0; }}
+tmp="$root/.bootstrap.$$"
+mkdir -p "$tmp" "$dest"
+trap 'rm -rf "$tmp"' EXIT HUP INT TERM
+base="{base}/{tag}"
+archive="$tmp/zellij.tar.gz"
+checksum="$tmp/zellij.sha256sum"
+fetch() {{ if command -v curl >/dev/null 2>&1; then curl -fsSL "$1" -o "$2"; elif command -v wget >/dev/null 2>&1; then wget -qO "$2" "$1"; elif command -v python3 >/dev/null 2>&1; then python3 -c 'import sys,urllib.request; urllib.request.urlretrieve(sys.argv[1],sys.argv[2])' "$1" "$2"; else echo 'flock: curl, wget, or python3 is required to install remote Zellij' >&2; exit 69; fi; }}
+fetch "$base/zellij-x86_64-unknown-linux-musl.tar.gz" "$archive"
+fetch "$base/zellij-x86_64-unknown-linux-musl.sha256sum" "$checksum"
+tar -xzf "$archive" -C "$tmp"
+expected="$(awk '{{print $1; exit}}' "$checksum")"
+actual="$(sha256sum "$tmp/zellij" | awk '{{print $1}}')"
+[ -n "$expected" ] && [ "$expected" = "$actual" ] || {{ echo 'flock: remote Zellij checksum verification failed' >&2; exit 74; }}
+install -m 0755 "$tmp/zellij" "$dest/zellij.new"
+mv -f "$dest/zellij.new" "$dest/zellij"
+mkdir -p "$HOME/.local/bin"
+ln -sfn "$dest" "$root/current"
+ln -sfn "$dest/zellij" "$HOME/.local/bin/zellij""#,
+        tag = RELEASE_TAG,
+        base = RELEASE_BASE_URL,
+    );
+    vec![
+        "coder".into(),
+        "ssh".into(),
+        identifier.into(),
+        "--".into(),
+        "sh".into(),
+        "-lc".into(),
+        script,
+    ]
+}
+
+pub fn bootstrap_context(identifier: &str) -> BTreeMap<String, String> {
+    BTreeMap::from_iter([(BOOTSTRAP_CONTEXT_KEY.into(), identifier.into())])
 }
 
 pub fn stop_argv(identifier: &str) -> Vec<String> {
@@ -149,7 +230,7 @@ pub fn parse_coder_ssh(argv: &[String]) -> Option<&str> {
         {
             Some(identifier)
         },
-        _ => None,
+        _ => parse_gateway(argv),
     }
 }
 
@@ -163,9 +244,34 @@ fn valid_identifier(identifier: &str) -> bool {
 pub fn layout_doc_for(
     identifier: &str,
     sidebar_args: &[(String, String)],
-    base_layout: Option<&str>,
+    _base_layout: Option<&str>,
 ) -> String {
-    layout_doc_with_binding(&ssh_argv(identifier), sidebar_args, base_layout)
+    let args = sidebar_args
+        .iter()
+        .map(|(key, value)| format!("            {} {}", key, kdl_quote(value)))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let plugin = if args.is_empty() {
+        "        plugin location=\"zellij:flock-sidebar\"".to_owned()
+    } else {
+        format!(
+            "        plugin location=\"zellij:flock-sidebar\" {{\n{}\n        }}",
+            args
+        )
+    };
+    let command = gateway_argv(identifier)
+        .iter()
+        .map(|arg| kdl_quote(arg))
+        .collect::<Vec<_>>()
+        .join(" ");
+    format!(
+        "layout {{\n    pane split_direction=\"Vertical\" {{\n        pane size=\"25%\" borderless=true {{\n{}\n        }}\n        pane\n    }}\n}}\ndefault_command {}\nsession_serialization false\n",
+        plugin, command
+    )
+}
+
+fn kdl_quote(value: &str) -> String {
+    format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\""))
 }
 
 pub fn list_context() -> BTreeMap<String, String> {
@@ -973,18 +1079,18 @@ mod tests {
         .expect("coder layout must parse");
         assert_eq!(
             config.options.default_command.as_deref(),
-            Some(ssh_argv("alice/api").as_slice())
+            Some(gateway_argv("alice/api").as_slice())
         );
         assert_eq!(config.options.session_serialization, Some(false));
         assert!(doc.contains("coder_enabled \"true\""));
     }
 
     #[test]
-    fn generated_layout_inherits_custom_base() {
+    fn generated_gateway_layout_intentionally_ignores_remote_content_base() {
         let base = "layout {\n    pane borderless=true\n}";
         let doc = layout_doc_for("alice/api", &[], Some(base));
-        assert!(doc.starts_with(base));
-        assert!(doc.contains("default_command \"coder\" \"ssh\" \"alice/api\""));
+        assert!(!doc.starts_with(base));
+        assert!(doc.contains(GATEWAY_WRAPPER_ARG0));
         let (_, config) = zellij_utils::input::layout::Layout::from_stringified_layout(
             &doc,
             zellij_utils::input::config::Config::default(),
@@ -992,8 +1098,20 @@ mod tests {
         .expect("custom Coder layout must parse");
         assert_eq!(
             config.options.default_command.as_deref(),
-            Some(ssh_argv("alice/api").as_slice())
+            Some(gateway_argv("alice/api").as_slice())
         );
         assert_eq!(config.options.session_serialization, Some(false));
+    }
+
+    #[test]
+    fn gateway_binding_and_bootstrap_are_exact_and_safe() {
+        let gateway = gateway_argv("alice/api");
+        assert_eq!(parse_gateway(&gateway), Some("alice/api"));
+        assert_eq!(parse_coder_ssh(&gateway), Some("alice/api"));
+        let bootstrap = bootstrap_argv("alice/api");
+        assert_eq!(&bootstrap[..3], &["coder", "ssh", "alice/api"]);
+        assert!(bootstrap.last().unwrap().contains("x86_64-unknown-linux-musl"));
+        assert!(bootstrap.last().unwrap().contains("sha256sum"));
+        assert!(!bootstrap.last().unwrap().contains("alice/api"));
     }
 }

@@ -109,11 +109,35 @@ the matching sidebar arguments as shown above.
 
 Coder uses the deployment currently authenticated by the Coder CLI. Its tab
 lists `coder list --output json`; opening a workspace creates a session whose
-default command is `coder ssh owner/name`, and Ctrl-x stops it with
-`coder stop -y owner/name`. Run `coder login <url>` before enabling the
-integration. In the Coder tab, Ctrl-o opens workspace creation: choose a Coder
-template, enter a name, and press Enter to start provisioning in the background.
-The selector returns to the workspace list instead of opening the new workspace.
+host-side content pane is a reconnecting gateway to a Zellij server inside the
+workspace, and Ctrl-x stops it with `coder stop -y owner/name`. The remote
+server owns shells, jobs, tabs, panes, and scrollback, so closing the laptop or
+losing the network no longer destroys the working session: selecting the same
+workspace later attaches to its deterministic `flock` session. A clean remote
+detach exits the gateway; an abnormal SSH exit retries with a short backoff.
+
+On first connection Flock installs the matching static fork build under
+`~/.local/share/flock` in the workspace, verifies its published checksum, and
+links it at `~/.local/bin/zellij`. Persistent Coder sessions currently require a
+Linux x86_64 workspace plus `tar`, `sha256sum`, and one of `curl`, `wget`, or
+Python 3. The workspace also needs outbound HTTPS access to this fork's GitHub
+release assets during that first bootstrap.
+
+The visible host sidebar remains the unified control plane for local and cloud
+sessions. A hidden sidebar in the remote session runs the normal Flock agent
+detection and hook pipeline; the gateway reads its versioned snapshots and
+publishes them into the host session list. Remote agents therefore retain their
+per-pane state and focus behavior, while other local sidebars receive the
+Coder session's aggregate attention badge. If snapshot polling fails, the last
+known rows remain visible as offline instead of being presented as live.
+
+Run `coder login <url>` before enabling the integration. In the Coder tab,
+Ctrl-o opens workspace creation: choose a Coder template, enter a name, and
+press Enter to start provisioning in the background. The selector returns to
+the workspace list instead of opening the new workspace. Stopping, rebuilding,
+or deleting the Coder workspace can still terminate its processes; persistence
+here covers client, host, and network disconnects while the workspace remains
+running.
 
 `coder_dotfiles_uri` is an optional, selector-only Git repository URL supplied
 at create time through Coder's conventional `dotfiles_uri` template parameter.

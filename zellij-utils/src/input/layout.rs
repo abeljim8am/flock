@@ -1312,6 +1312,7 @@ impl Layout {
         available_layouts.push(LayoutInfo::BuiltIn("classic".to_owned()));
         available_layouts.push(LayoutInfo::BuiltIn("flock".to_owned()));
         available_layouts.push(LayoutInfo::BuiltIn("flock-selector".to_owned()));
+        available_layouts.push(LayoutInfo::BuiltIn("flock-coder-remote".to_owned()));
         available_layouts.sort_by(|a, b| {
             let a_name = a.name();
             let b_name = b.name();
@@ -1664,6 +1665,11 @@ impl Layout {
                 Self::stringified_flock_selector_from_assets()?,
                 None,
             )),
+            Some("flock-coder-remote") => Ok((
+                "Flock Coder remote layout".into(),
+                Self::stringified_flock_coder_remote_from_assets()?,
+                None,
+            )),
             None | Some(_) => Err(ConfigError::IoPath(
                 std::io::Error::new(std::io::ErrorKind::Other, "The layout was not found"),
                 path.into(),
@@ -1717,6 +1723,10 @@ impl Layout {
 
     pub fn stringified_flock_selector_from_assets() -> Result<String, ConfigError> {
         Ok(String::from_utf8(setup::FLOCK_SELECTOR_LAYOUT.to_vec())?)
+    }
+
+    pub fn stringified_flock_coder_remote_from_assets() -> Result<String, ConfigError> {
+        Ok(String::from_utf8(setup::FLOCK_CODER_REMOTE_LAYOUT.to_vec())?)
     }
 
     pub fn new_tab(&self) -> (TiledPaneLayout, Vec<FloatingPaneLayout>) {

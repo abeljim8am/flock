@@ -2545,6 +2545,18 @@ fn flock_bundled_layout_parses() {
 }
 
 #[test]
+fn flock_coder_remote_bundled_layout_parses() {
+    let kdl_layout = include_str!("../../../assets/layouts/flock-coder-remote.kdl");
+    Layout::from_kdl(
+        kdl_layout,
+        Some("flock-coder-remote.kdl".into()),
+        None,
+        None,
+    )
+    .unwrap();
+}
+
+#[test]
 fn flock_bundled_layout_parses_with_swap_layout() {
     let kdl_layout = include_str!("../../../assets/layouts/flock.kdl");
     let kdl_swap_layout = include_str!("../../../assets/layouts/flock.swap.kdl");
