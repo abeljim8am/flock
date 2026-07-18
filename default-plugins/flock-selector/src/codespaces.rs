@@ -26,8 +26,8 @@ pub const LIST_CONTEXT_KEY: &str = "flock_codespace_list";
 /// Context key tagging a `gh codespace stop` RunCommandResult; its value is the
 /// codespace name being stopped.
 pub const STOP_CONTEXT_KEY: &str = "flock_codespace_stop";
-/// Context key tagging the `cat <codespace_session_layout>` RunCommandResult
-/// that loads the user's codespace layout base.
+/// Context key tagging the `cat <remote_session_layout>` RunCommandResult that
+/// loads the user's shared remote layout base.
 pub const LAYOUT_CONTEXT_KEY: &str = "flock_codespace_layout";
 
 /// Where the last successful list is cached inside the plugin's `/data` mount,
@@ -258,7 +258,7 @@ const FLOCK_LAYOUT_TEMPLATE: &str = r#"layout {
 "#;
 
 /// The generated stringified layout a bound session is created from: the
-/// user's `codespace_session_layout` file when one was configured and read
+/// user's `remote_session_layout` file (or deprecated legacy fallback) when read
 /// (`base_layout`), else the built-in flock chrome mirror (see
 /// [`FLOCK_LAYOUT_TEMPLATE`]) — in both cases with the binding +
 /// no-resurrection options appended (layout-doc options merge over the base
@@ -331,7 +331,7 @@ pub fn stop_context(codespace_name: &str) -> BTreeMap<String, String> {
     BTreeMap::from_iter([(STOP_CONTEXT_KEY.to_owned(), codespace_name.to_owned())])
 }
 
-/// Argv for reading the user's codespace layout base off the host.
+/// Argv for reading the user's shared remote layout base off the host.
 pub fn layout_read_argv(path: &Path) -> Vec<String> {
     vec!["cat".to_owned(), path.to_string_lossy().to_string()]
 }

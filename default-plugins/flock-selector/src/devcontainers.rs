@@ -116,7 +116,7 @@ pub fn up_context(workspace_folder: &Path) -> BTreeMap<String, String> {
 }
 
 /// The generated stringified layout a bound session is created from — the same
-/// chrome (user `codespace_session_layout` base or the built-in flock mirror)
+/// chrome (user `remote_session_layout` base or the built-in flock mirror)
 /// as a codespace session, with this binding's wrapper argv appended. See
 /// [`crate::codespaces::layout_doc_with_binding`] for the shared mechanics.
 pub fn layout_doc_for(

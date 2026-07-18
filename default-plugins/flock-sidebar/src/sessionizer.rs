@@ -13,6 +13,9 @@ use std::path::{Path, PathBuf};
 pub struct SessionizerConfig {
     individual_dirs: Vec<PathBuf>,
     root_dirs: Vec<PathBuf>,
+    codespaces_enabled: bool,
+    devcontainers_enabled: bool,
+    coder_enabled: bool,
 }
 
 impl SessionizerConfig {
@@ -25,7 +28,22 @@ impl SessionizerConfig {
         Self {
             individual_dirs: split_paths(config.get("individual_dirs"), &cwd),
             root_dirs: split_paths(config.get("root_dirs"), &cwd),
+            codespaces_enabled: enabled(config.get("codespaces_enabled")),
+            devcontainers_enabled: enabled(config.get("devcontainers_enabled")),
+            coder_enabled: enabled(config.get("coder_enabled")),
         }
+    }
+
+    pub fn codespaces_enabled(&self) -> bool {
+        self.codespaces_enabled
+    }
+
+    pub fn devcontainers_enabled(&self) -> bool {
+        self.devcontainers_enabled
+    }
+
+    pub fn coder_enabled(&self) -> bool {
+        self.coder_enabled
     }
 
     pub fn is_configured(&self) -> bool {
@@ -46,6 +64,10 @@ impl SessionizerConfig {
                 .iter()
                 .any(|root| is_immediate_root_child(root, &workspace_root))
     }
+}
+
+fn enabled(value: Option<&String>) -> bool {
+    value.is_some_and(|value| value.trim().eq_ignore_ascii_case("true"))
 }
 
 fn split_paths(raw: Option<&String>, cwd: &Path) -> Vec<PathBuf> {
@@ -126,6 +148,21 @@ mod tests {
     fn unconfigured_filter_is_detectable() {
         let config = SessionizerConfig::from_args(&BTreeMap::new());
         assert!(!config.is_configured());
+        assert!(!config.codespaces_enabled());
+        assert!(!config.devcontainers_enabled());
+        assert!(!config.coder_enabled());
+    }
+
+    #[test]
+    fn provider_flags_are_opt_in_true_only() {
+        let config = SessionizerConfig::from_args(&args(&[
+            ("codespaces_enabled", "TRUE"),
+            ("devcontainers_enabled", "yes"),
+            ("coder_enabled", " true "),
+        ]));
+        assert!(config.codespaces_enabled());
+        assert!(!config.devcontainers_enabled());
+        assert!(config.coder_enabled());
     }
 
     #[test]

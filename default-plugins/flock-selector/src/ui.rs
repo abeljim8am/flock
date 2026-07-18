@@ -17,6 +17,7 @@ use unicode_width::UnicodeWidthStr;
 use zellij_tile::prelude::PaletteColor;
 
 use crate::codespaces::{GhError, RankedCodespace, StateKind};
+use crate::coder::{CoderError, RankedCoderWorkspace, StateKind as CoderStateKind};
 use crate::devcontainers::{DevcontainerError, DevcontainerPhase, PendingDevcontainer};
 use crate::live_sessions::{RankedSession, SessionActivity};
 use crate::palette::{bg, fg, goto, Theme, BOLD, DIM, NORMAL_INTENSITY, RESET};
@@ -33,6 +34,7 @@ pub enum PickerMode {
     Sessions,
     Projects,
     Codespaces,
+    Coder,
 }
 
 /// A styled run of text on one row.
@@ -70,6 +72,9 @@ pub struct RenderInput<'a> {
     /// Which list is showing; selects between `session_results`, `results`,
     /// and `codespace_results`.
     pub mode: PickerMode,
+    /// Tabs available for this invocation. Sessions and Projects are always
+    /// present; opt-in providers are appended in stable order.
+    pub enabled_modes: &'a [PickerMode],
     /// Ranked live sessions (Sessions mode).
     pub session_results: &'a [RankedSession<'a>],
     pub results: &'a [Ranked<'a>],
@@ -85,6 +90,12 @@ pub struct RenderInput<'a> {
     pub codespaces_refreshing: bool,
     /// The codespace name a stop is pending for, if any.
     pub pending_stop: Option<&'a str>,
+    /// Ranked Coder workspaces (Coder mode).
+    pub coder_results: &'a [RankedCoderWorkspace<'a>],
+    pub bound_coder_workspaces: &'a std::collections::HashSet<String>,
+    pub coder_error: Option<&'a CoderError>,
+    pub coder_refreshing: bool,
+    pub pending_coder_stop: Option<&'a str>,
     /// The devcontainer prompt/up owning the picker, if any — rendered as a
     /// full-width notice row just above the input.
     pub pending_devcontainer: Option<&'a PendingDevcontainer>,
@@ -115,6 +126,7 @@ pub fn render(input: RenderInput) -> RenderOutput {
         configured,
         query,
         mode,
+        enabled_modes,
         session_results,
         results,
         open_paths,
@@ -123,6 +135,11 @@ pub fn render(input: RenderInput) -> RenderOutput {
         codespaces_error,
         codespaces_refreshing,
         pending_stop,
+        coder_results,
+        bound_coder_workspaces,
+        coder_error,
+        coder_refreshing,
+        pending_coder_stop,
         pending_devcontainer,
         palette: p,
         rows,
@@ -149,7 +166,7 @@ pub fn render(input: RenderInput) -> RenderOutput {
     // room for it alongside the input row and at least one result row.
     let has_header = rows >= 3;
     if has_header {
-        render_header_row(&mut out, cols, mode, p);
+        render_header_row(&mut out, cols, mode, enabled_modes, p);
     }
 
     // Clamp the selection + scroll to the current result set, keeping the
@@ -162,6 +179,7 @@ pub fn render(input: RenderInput) -> RenderOutput {
         PickerMode::Sessions => session_results.len(),
         PickerMode::Projects => results.len(),
         PickerMode::Codespaces => codespace_results.len(),
+        PickerMode::Coder => coder_results.len(),
     };
     let capacity = rows.saturating_sub(if has_header { 2 } else { 1 });
     let selected = if total == 0 {
@@ -220,6 +238,19 @@ pub fn render(input: RenderInput) -> RenderOutput {
                     vec![Span::new(msg, p.muted).dim()]
                 },
             },
+            PickerMode::Coder => match coder_error {
+                Some(err) => coder_error_spans(err, p),
+                None => {
+                    let msg = if coder_refreshing {
+                        " loading Coder workspaces…"
+                    } else if query.trim().is_empty() {
+                        " no Coder workspaces"
+                    } else {
+                        " no matches"
+                    };
+                    vec![Span::new(msg, p.muted).dim()]
+                },
+            },
         };
         render_row(&mut out, 0, input_y.saturating_sub(1), cols, None, &spans);
     }
@@ -270,6 +301,17 @@ pub fn render(input: RenderInput) -> RenderOutput {
                 row_map.push((y, idx));
             }
         },
+        PickerMode::Coder => {
+            for (k, idx) in (scroll..visible_end).enumerate() {
+                let y = input_y - 1 - k;
+                let r = &coder_results[idx];
+                let identifier = r.workspace.identifier();
+                let is_bound = bound_coder_workspaces.contains(&identifier);
+                let is_stopping = pending_coder_stop == Some(identifier.as_str());
+                render_coder_row(&mut out, y, cols, r, idx == selected, is_bound, is_stopping, p);
+                row_map.push((y, idx));
+            }
+        },
     }
 
     // A pending devcontainer prompt/up owns the keyboard, so its notice row
@@ -294,7 +336,13 @@ pub fn render(input: RenderInput) -> RenderOutput {
 
 /// The top header row: every mode name with the active one highlighted, plus a
 /// right-aligned key hint.
-fn render_header_row(out: &mut String, cols: usize, mode: PickerMode, p: &Theme) {
+fn render_header_row(
+    out: &mut String,
+    cols: usize,
+    mode: PickerMode,
+    enabled_modes: &[PickerMode],
+    p: &Theme,
+) {
     let active = Style {
         fg: p.accent,
         bold: true,
@@ -306,19 +354,25 @@ fn render_header_row(out: &mut String, cols: usize, mode: PickerMode, p: &Theme)
         dim: true,
     };
     let style_for = |m: PickerMode| if m == mode { active } else { inactive };
-    let mut spans = vec![
-        Span::new(" ", p.text),
-        styled("Sessions", style_for(PickerMode::Sessions)),
-        Span::new(" · ", p.text).dim(),
-        styled("Projects", style_for(PickerMode::Projects)),
-        Span::new(" · ", p.text).dim(),
-        styled("Codespaces", style_for(PickerMode::Codespaces)),
-    ];
+    let mut spans = vec![Span::new(" ", p.text)];
+    for (index, enabled) in enabled_modes.iter().enumerate() {
+        if index > 0 {
+            spans.push(Span::new(" · ", p.text).dim());
+        }
+        let label = match enabled {
+            PickerMode::Sessions => "Sessions",
+            PickerMode::Projects => "Projects",
+            PickerMode::Codespaces => "Codespaces",
+            PickerMode::Coder => "Coder",
+        };
+        spans.push(styled(label, style_for(*enabled)));
+    }
 
     let hint = match mode {
         PickerMode::Sessions => "Tab switch · Ctrl-x close ",
         PickerMode::Projects => "Tab ",
         PickerMode::Codespaces => "Tab switch · Ctrl-x stop ",
+        PickerMode::Coder => "Tab switch · Ctrl-x stop ",
     };
     let left_w: usize = spans.iter().map(|s| s.text.width()).sum();
     let hint_w = hint.width();
@@ -327,6 +381,17 @@ fn render_header_row(out: &mut String, cols: usize, mode: PickerMode, p: &Theme)
         spans.push(Span::new(hint, p.muted).dim());
     }
     render_row(out, 0, 0, cols, None, &spans);
+}
+
+fn coder_error_spans(err: &CoderError, p: &Theme) -> Vec<Span> {
+    let msg = match err {
+        CoderError::CliMissing => " coder not found — install the Coder CLI".to_owned(),
+        CoderError::NotConfigured => " Coder deployment not configured — run: coder login <url>".to_owned(),
+        CoderError::NotAuthenticated => " Coder authentication required — run: coder login".to_owned(),
+        CoderError::MalformedJson(detail) => format!(" invalid JSON from coder: {}", detail),
+        CoderError::Other(detail) => format!(" coder error: {}", detail),
+    };
+    vec![Span::new(" ✗", p.red), Span::new(msg, p.muted).dim()]
 }
 
 /// The hint line for a gh failure: a red marker plus an actionable message.
@@ -573,6 +638,86 @@ fn render_codespace_row(
         }
     }
 
+    render_row(out, 0, y, cols, row_bg, &spans);
+}
+
+/// Render one Coder row: `<badge> <owner/name>  <template>  <status>`.
+fn render_coder_row(
+    out: &mut String,
+    y: usize,
+    cols: usize,
+    r: &RankedCoderWorkspace,
+    selected: bool,
+    is_bound: bool,
+    is_stopping: bool,
+    p: &Theme,
+) {
+    let row_bg = selected.then_some(p.selection_bg);
+    let mut spans = Vec::new();
+    if is_bound {
+        spans.push(Span::new(" ", p.text));
+        spans.push(Span::new(OPEN_BADGE, p.green));
+    } else {
+        spans.push(Span::new("  ", p.text));
+    }
+    spans.push(Span::new(" ", p.text));
+
+    let identifier = r.workspace.identifier();
+    let identifier_budget = cols.saturating_sub(4).min(cols / 2 + 8).max(4);
+    let identifier = truncate_text(&identifier, identifier_budget);
+    let identifier_style = Style { fg: p.text, bold: true, dim: false };
+    push_highlighted(
+        &mut spans,
+        &identifier,
+        &clip_ranges(&r.identifier_ranges, &identifier),
+        identifier_style,
+        identifier_style,
+    );
+
+    if r.workspace.favorite {
+        spans.push(Span::new(" *", p.yellow));
+    }
+
+    let (state_text, state_color, state_dim) = if is_stopping {
+        ("stopping…".to_owned(), p.yellow, false)
+    } else {
+        match r.workspace.state_kind() {
+            CoderStateKind::Running => (r.workspace.status.clone(), p.green, false),
+            CoderStateKind::Stopped => (r.workspace.status.clone(), p.text, true),
+            CoderStateKind::Busy => (r.workspace.status.clone(), p.yellow, false),
+            CoderStateKind::Unknown => (r.workspace.status.clone(), p.muted, true),
+        }
+    };
+    let state_width = state_text.width() + 2;
+
+    if !r.workspace.template.is_empty() {
+        let used: usize = spans.iter().map(|span| span.text.width()).sum();
+        let template_budget = cols.saturating_sub(used + state_width + 2);
+        if template_budget > 1 {
+            let template_style = Style { fg: p.text, bold: false, dim: true };
+            spans.push(styled("  ", template_style));
+            let template = truncate_text(&r.workspace.template, template_budget);
+            push_highlighted(
+                &mut spans,
+                &template,
+                &clip_ranges(&r.template_ranges, &template),
+                template_style,
+                template_style,
+            );
+        }
+    }
+
+    if !state_text.is_empty() {
+        let used: usize = spans.iter().map(|span| span.text.width()).sum();
+        if used + state_width <= cols {
+            spans.push(Span::new("  ", p.text));
+            let mut state = Span::new(state_text, state_color);
+            if state_dim {
+                state = state.dim();
+            }
+            spans.push(state);
+        }
+    }
     render_row(out, 0, y, cols, row_bg, &spans);
 }
 
@@ -870,6 +1015,7 @@ mod tests {
             configured: true,
             query: "p",
             mode: PickerMode::Projects,
+            enabled_modes: &[PickerMode::Sessions, PickerMode::Projects],
             session_results: &[],
             results: &results,
             open_paths: &std::collections::HashSet::new(),
@@ -878,6 +1024,11 @@ mod tests {
             codespaces_error: None,
             codespaces_refreshing: false,
             pending_stop: None,
+            coder_results: &[],
+            bound_coder_workspaces: &std::collections::HashSet::new(),
+            coder_error: None,
+            coder_refreshing: false,
+            pending_coder_stop: None,
             pending_devcontainer: None,
             palette: &theme,
             selected: 0,
@@ -887,6 +1038,63 @@ mod tests {
             cols: 40,
         });
         assert!(out.row_map.is_empty(), "no result rows fit in a 1-row pane");
+    }
+
+    #[test]
+    fn coder_mode_renders_workspace_status_and_dynamic_header() {
+        let c = PaletteColor::EightBit(1);
+        let theme = Theme {
+            text: c,
+            muted: c,
+            separator: c,
+            selection_bg: c,
+            accent: c,
+            red: c,
+            yellow: c,
+            green: c,
+            teal: c,
+            blue: c,
+        };
+        let workspaces = vec![crate::coder::CoderWorkspace {
+            owner: "alice".into(),
+            name: "api".into(),
+            template: "rust".into(),
+            status: "running".into(),
+            favorite: true,
+            last_used_at: String::new(),
+        }];
+        let ranked = crate::coder::rank(&workspaces, "");
+        let output = render(RenderInput {
+            permissions_granted: true,
+            configured: false,
+            query: "",
+            mode: PickerMode::Coder,
+            enabled_modes: &[PickerMode::Sessions, PickerMode::Projects, PickerMode::Coder],
+            session_results: &[],
+            results: &[],
+            open_paths: &std::collections::HashSet::new(),
+            codespace_results: &[],
+            bound_codespaces: &std::collections::HashSet::new(),
+            codespaces_error: None,
+            codespaces_refreshing: false,
+            pending_stop: None,
+            coder_results: &ranked,
+            bound_coder_workspaces: &std::collections::HashSet::new(),
+            coder_error: None,
+            coder_refreshing: false,
+            pending_coder_stop: None,
+            pending_devcontainer: None,
+            palette: &theme,
+            selected: 0,
+            scroll: 0,
+            total_candidates: 1,
+            rows: 5,
+            cols: 80,
+        });
+        assert!(output.ansi.contains("alice/api"));
+        assert!(output.ansi.contains("running"));
+        assert!(output.ansi.contains("Coder"));
+        assert!(!output.ansi.contains("Codespaces"));
     }
 
     #[test]

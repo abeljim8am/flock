@@ -70,6 +70,46 @@ cp default-plugins/flock-sidebar/assets/opencode/flock-agent-state.js ~/.config/
 The Claude Code and Codex hook scripts live beside it (`assets/claude/`,
 `assets/codex/`) and are wired into each agent's own hook configuration.
 
+### Flock remote development providers
+
+GitHub Codespaces, devcontainers, and Coder are opt-in. This is a breaking
+default change: all three integrations are disabled unless their argument is
+set to `true` (case-insensitive). When disabled, a provider is not shown or
+queried and its remote session bindings are treated as ordinary commands.
+
+Pass the same flags to `flock-selector` and `flock-sidebar` in custom layouts:
+
+```kdl
+plugin location="zellij:flock-selector" {
+    root_dirs "~/src"
+    codespaces_enabled "true"
+    devcontainers_enabled "true"
+    coder_enabled "true"
+    remote_session_layout "~/.config/zellij/layouts/flock-remote.kdl"
+}
+
+plugin location="zellij:flock-sidebar" {
+    root_dirs "~/src"
+    codespaces_enabled "true"
+    devcontainers_enabled "true"
+    coder_enabled "true"
+}
+```
+
+`remote_session_layout` supplies the shared base layout for Codespaces,
+devcontainer, and Coder sessions. The old `codespace_session_layout` key is
+still accepted as a deprecated fallback when `remote_session_layout` is not
+present. The selector's built-in generated remote layout forwards all three
+enable flags to its sidebar automatically; a custom remote layout must include
+the matching sidebar arguments as shown above.
+
+Coder uses the deployment currently authenticated by the Coder CLI. Its tab
+lists `coder list --output json`; opening a workspace creates a session whose
+default command is `coder ssh owner/name`, and Ctrl-x stops it with
+`coder stop -y owner/name`. Run `coder login <url>` before enabling the
+integration. GitHub Codespaces similarly requires an authenticated `gh` CLI,
+and devcontainers require the `devcontainer` CLI and Docker.
+
 ## How do I install it?
 
 The easiest way to install Zellij is through a [package for your OS](./docs/THIRD_PARTY_INSTALL.md).

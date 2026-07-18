@@ -37,6 +37,7 @@
 //! instead of guessing from pane cwds.
 
 mod codespace;
+mod coder;
 mod detect;
 mod devcontainer;
 mod hook;
@@ -304,7 +305,9 @@ impl ZellijPlugin for State {
                 }
             },
             Event::RunCommandResult(exit_code, stdout, stderr, context) => {
-                if context.contains_key(devcontainer::PS_CONTEXT_KEY) {
+                if self.sessionizer.devcontainers_enabled()
+                    && context.contains_key(devcontainer::PS_CONTEXT_KEY)
+                {
                     let id = String::from_utf8_lossy(&stdout)
                         .lines()
                         .next()
@@ -317,7 +320,9 @@ impl ZellijPlugin for State {
                         self.devcontainer_container_id = Some(id.clone());
                         self.fire_devcontainer_hooks_read(&id);
                     }
-                } else if context.contains_key(devcontainer::HOOKS_CONTEXT_KEY) {
+                } else if self.sessionizer.devcontainers_enabled()
+                    && context.contains_key(devcontainer::HOOKS_CONTEXT_KEY)
+                {
                     // Parse whatever printed regardless of exit code: a bound
                     // session with no reports yet exits 1 (the glob matched
                     // nothing) with empty output.
@@ -645,13 +650,23 @@ impl State {
             .filter(|session| {
                 !self.sessionizer.is_configured()
                     || self.sessionizer.contains_workspace(&session.workspace_root)
-                    || session
-                        .default_command
-                        .as_deref()
-                        .and_then(parse_remote_binding)
-                        .is_some()
+                    || session.default_command.as_deref().and_then(|command| {
+                        self.parse_enabled_remote_binding(command)
+                    }).is_some()
             })
             .cloned()
+            .map(|mut session| {
+                if session.default_command.as_deref().is_some_and(|command| {
+                    parse_remote_binding(command).is_some()
+                        && self.parse_enabled_remote_binding(command).is_none()
+                }) {
+                    // UI row construction deliberately knows only binding
+                    // shapes. Scrubbing disabled bindings here prevents badges
+                    // and remote behavior from leaking through that layer.
+                    session.default_command = None;
+                }
+                session
+            })
             .collect()
     }
 
@@ -1052,8 +1067,23 @@ impl State {
     /// devcontainer CLI's node process after the wrapper's `exec`) — any
     /// command that isn't a recognized agent.
     fn command_is_remote_transport(&self, command: &[String]) -> bool {
-        parse_remote_binding(command).is_some()
+        self.parse_enabled_remote_binding(command).is_some()
             || (self.current_session_is_bound() && identify_agent_from_command(command).is_none())
+    }
+
+    fn parse_enabled_remote_binding(&self, argv: &[String]) -> Option<RemoteBinding> {
+        match parse_remote_binding(argv) {
+            Some(RemoteBinding::Codespace) if self.sessionizer.codespaces_enabled() => {
+                Some(RemoteBinding::Codespace)
+            },
+            Some(RemoteBinding::Devcontainer) if self.sessionizer.devcontainers_enabled() => {
+                Some(RemoteBinding::Devcontainer)
+            },
+            Some(RemoteBinding::Coder) if self.sessionizer.coder_enabled() => {
+                Some(RemoteBinding::Coder)
+            },
+            _ => None,
+        }
     }
 
     /// Whether the session this sidebar runs in is remote-bound (its
@@ -1064,7 +1094,7 @@ impl State {
                 && session
                     .default_command
                     .as_deref()
-                    .and_then(parse_remote_binding)
+                    .and_then(|command| self.parse_enabled_remote_binding(command))
                     .is_some()
         })
     }
@@ -1072,6 +1102,9 @@ impl State {
     /// The workspace folder of this session's devcontainer binding, if the
     /// current session is devcontainer-bound.
     fn current_devcontainer_workspace(&self) -> Option<String> {
+        if !self.sessionizer.devcontainers_enabled() {
+            return None;
+        }
         self.sessions
             .iter()
             .find(|session| session.is_current_session)
@@ -1089,7 +1122,7 @@ impl State {
     /// container id by its devcontainer label once, then `docker exec … cat`
     /// on each poll. Results arrive as `RunCommandResult` events.
     fn maybe_poll_devcontainer_hooks(&mut self, now: Instant) {
-        if !self.permissions_granted {
+        if !self.permissions_granted || !self.sessionizer.devcontainers_enabled() {
             return;
         }
         let Some(workspace) = self.current_devcontainer_workspace() else {
@@ -1197,6 +1230,7 @@ impl State {
 pub(crate) enum RemoteBinding {
     Codespace,
     Devcontainer,
+    Coder,
 }
 
 /// Recognize any remote binding in an argv (a session's `default_command` or
@@ -1207,6 +1241,9 @@ pub(crate) fn parse_remote_binding(argv: &[String]) -> Option<RemoteBinding> {
     }
     if devcontainer::parse_devcontainer_command(argv).is_some() {
         return Some(RemoteBinding::Devcontainer);
+    }
+    if coder::parse_coder_ssh(argv).is_some() {
+        return Some(RemoteBinding::Coder);
     }
     None
 }
@@ -1303,9 +1340,56 @@ mod tests {
         args.iter().map(|s| s.to_string()).collect()
     }
 
+    fn state_with_provider(key: &str) -> State {
+        let configuration = BTreeMap::from_iter([(key.to_owned(), "true".to_owned())]);
+        State {
+            sessionizer: SessionizerConfig::from_args(&configuration),
+            ..State::default()
+        }
+    }
+
+    #[test]
+    fn disabled_remote_bindings_are_not_recognized_or_badged() {
+        let mut state = State::default();
+        let command = argv(&["coder", "ssh", "alice/api"]);
+        let pane_id = PaneId::Terminal(3);
+        state.apply_command_changed(pane_id, &command, true, Instant::now());
+        assert!(!state.agents.get(&pane_id).unwrap().remote);
+
+        let mut session = SessionInfo::new("api".into());
+        session.default_command = Some(command);
+        state.sessions = vec![session];
+        let visible = state.visible_sessions();
+        assert_eq!(visible.len(), 1);
+        assert_eq!(visible[0].default_command, None);
+    }
+
+    #[test]
+    fn enabled_coder_binding_uses_remote_screen_detection() {
+        let mut state = state_with_provider("coder_enabled");
+        let pane_id = PaneId::Terminal(3);
+        state.apply_command_changed(
+            pane_id,
+            &argv(&["coder", "ssh", "alice/api"]),
+            true,
+            Instant::now(),
+        );
+        assert!(state.agents.get(&pane_id).unwrap().remote);
+    }
+
+    #[test]
+    fn disabled_devcontainer_binding_cannot_start_polling() {
+        let mut state = State::default();
+        let mut session = SessionInfo::new("api".into());
+        session.is_current_session = true;
+        session.default_command = Some(devcontainer_binding("/work/api"));
+        state.sessions = vec![session];
+        assert_eq!(state.current_devcontainer_workspace(), None);
+    }
+
     #[test]
     fn transport_argv_marks_pane_remote_without_agent() {
-        let mut state = State::default();
+        let mut state = state_with_provider("codespaces_enabled");
         let now = Instant::now();
         let pane_id = PaneId::Terminal(3);
 
@@ -1323,7 +1407,7 @@ mod tests {
 
     #[test]
     fn remote_pane_identifies_agent_from_screen_and_releases_on_absence() {
-        let mut state = State::default();
+        let mut state = state_with_provider("codespaces_enabled");
         let now = Instant::now();
         let pane_id = PaneId::Terminal(3);
         state.apply_command_changed(
@@ -1353,7 +1437,7 @@ mod tests {
 
     #[test]
     fn remote_pane_constant_transport_argv_never_clears_identified_agent() {
-        let mut state = State::default();
+        let mut state = state_with_provider("codespaces_enabled");
         let now = Instant::now();
         let pane_id = PaneId::Terminal(3);
         let transport = argv(&["gh", "codespace", "ssh", "-c", "my-cs"]);
@@ -1381,7 +1465,7 @@ mod tests {
 
     #[test]
     fn local_agent_argv_wins_back_a_remote_pane() {
-        let mut state = State::default();
+        let mut state = state_with_provider("codespaces_enabled");
         let now = Instant::now();
         let pane_id = PaneId::Terminal(3);
         state.apply_command_changed(
@@ -1402,7 +1486,7 @@ mod tests {
 
     #[test]
     fn seed_marks_transport_snapshot_remote() {
-        let mut state = State::default();
+        let mut state = state_with_provider("codespaces_enabled");
         let now = Instant::now();
         let pane_id = PaneId::Terminal(9);
         assert!(!state.seed_agent_command(
@@ -1425,7 +1509,7 @@ mod tests {
 
     #[test]
     fn devcontainer_wrapper_argv_marks_pane_remote_without_agent() {
-        let mut state = State::default();
+        let mut state = state_with_provider("devcontainers_enabled");
         let now = Instant::now();
         let pane_id = PaneId::Terminal(3);
 
@@ -1443,7 +1527,7 @@ mod tests {
     /// `default_command` still carries the wrapper).
     #[test]
     fn session_bound_devcontainer_marks_rewritten_node_argv_remote() {
-        let mut state = State::default();
+        let mut state = state_with_provider("devcontainers_enabled");
         let now = Instant::now();
         let mut session = SessionInfo::new("app".to_string());
         session.is_current_session = true;
@@ -1466,7 +1550,7 @@ mod tests {
 
     #[test]
     fn seed_marks_devcontainer_transport_snapshot_remote() {
-        let mut state = State::default();
+        let mut state = state_with_provider("devcontainers_enabled");
         let now = Instant::now();
         let pane_id = PaneId::Terminal(9);
         assert!(!state.seed_agent_command(pane_id, &devcontainer_binding("/work/app"), now));

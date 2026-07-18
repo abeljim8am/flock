@@ -28,6 +28,7 @@
 
 mod codespaces;
 mod config;
+mod coder;
 mod devcontainers;
 mod discovery;
 mod frecency;
@@ -63,6 +64,7 @@ const REFRESH_SECS: f64 = 10.0;
 /// = ~30s) while the Codespaces mode is showing — `gh codespace list` is a
 /// network call, so it shouldn't ride the 10s project-scan cadence.
 const CODESPACE_REFRESH_TICKS: u8 = 3;
+const CODER_REFRESH_TICKS: u8 = 3;
 
 /// Session name used by the cold-shell entry layout (its `session_name` arg).
 /// Sessions with this name are selector throwaways, not project sessions: their
@@ -100,7 +102,7 @@ struct State {
     row_map: Vec<(usize, usize)>,
     /// Whether the refresh timer is currently armed.
     timer_running: bool,
-    /// Which list is showing (Tab cycles Sessions → Projects → Codespaces).
+    /// Which enabled list is showing (Sessions and Projects are always present).
     mode: PickerMode,
     /// The latest codespace list — the `/data` cache at load, then live `gh`
     /// results as they land.
@@ -114,17 +116,77 @@ struct State {
     /// Ticks left until the next codespace list refresh (see
     /// [`CODESPACE_REFRESH_TICKS`]).
     codespace_refresh_ticks: u8,
-    /// The user's codespace layout base (the `codespace_session_layout` file's
-    /// content), once read off the host. `None` (unset, unreadable, or not yet
+    /// The latest Coder workspace list and command state. These remain empty
+    /// and inert unless `coder_enabled` is true.
+    coder_workspaces: Vec<coder::CoderWorkspace>,
+    coder_error: Option<coder::CoderError>,
+    coder_refreshing: bool,
+    pending_coder_stop: Option<String>,
+    coder_refresh_ticks: u8,
+    /// The user's shared remote layout base (`remote_session_layout`, or the
+    /// deprecated `codespace_session_layout` fallback), once read off the host.
+    /// `None` (unset, unreadable, or not yet
     /// loaded) falls back to the built-in flock chrome mirror. Devcontainer
     /// sessions share this base — both bindings want the same chrome.
-    codespace_layout_base: Option<String>,
+    remote_layout_base: Option<String>,
     /// Projects whose folder carries a `.devcontainer` marker, per scan scope
     /// (see [`devcontainers::SCAN_CONTEXT_KEY`]), so the Enter-time prompt
     /// check is a set lookup.
     devcontainer_projects: BTreeMap<String, HashSet<PathBuf>>,
     /// The devcontainer prompt/up currently owning the picker's keyboard.
     pending_devcontainer: Option<PendingDevcontainer>,
+}
+
+fn enabled_modes_for(config: &SelectorConfig) -> Vec<PickerMode> {
+    let mut modes = vec![PickerMode::Sessions, PickerMode::Projects];
+    if config.codespaces_enabled {
+        modes.push(PickerMode::Codespaces);
+    }
+    if config.coder_enabled {
+        modes.push(PickerMode::Coder);
+    }
+    modes
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn provider_tabs_are_dynamic_and_stably_ordered() {
+        let mut config = SelectorConfig::default();
+        assert_eq!(enabled_modes_for(&config), vec![PickerMode::Sessions, PickerMode::Projects]);
+
+        config.codespaces_enabled = true;
+        assert_eq!(
+            enabled_modes_for(&config),
+            vec![PickerMode::Sessions, PickerMode::Projects, PickerMode::Codespaces]
+        );
+
+        config.codespaces_enabled = false;
+        config.coder_enabled = true;
+        assert_eq!(
+            enabled_modes_for(&config),
+            vec![PickerMode::Sessions, PickerMode::Projects, PickerMode::Coder]
+        );
+
+        config.codespaces_enabled = true;
+        assert_eq!(
+            enabled_modes_for(&config),
+            vec![
+                PickerMode::Sessions,
+                PickerMode::Projects,
+                PickerMode::Codespaces,
+                PickerMode::Coder,
+            ]
+        );
+    }
+
+    #[test]
+    fn devcontainers_do_not_add_a_picker_tab() {
+        let config = SelectorConfig { devcontainers_enabled: true, ..SelectorConfig::default() };
+        assert_eq!(enabled_modes_for(&config), vec![PickerMode::Sessions, PickerMode::Projects]);
+    }
 }
 
 register_plugin!(State);
@@ -142,7 +204,12 @@ impl ZellijPlugin for State {
         self.frecency = FrecencyDb::load();
         // The cached list renders the Codespaces mode instantly; a live
         // refresh replaces it once permissions land.
-        self.codespaces = codespaces::load_cache();
+        if self.config.codespaces_enabled {
+            self.codespaces = codespaces::load_cache();
+        }
+        if self.config.coder_enabled {
+            self.coder_workspaces = coder::load_cache();
+        }
         // Individual dirs are projects directly, so show them immediately; a
         // root scan fills in the subdirectories once permissions land.
         self.rebuild_projects();
@@ -176,11 +243,18 @@ impl ZellijPlugin for State {
                 self.permissions_granted = matches!(result, PermissionStatus::Granted);
                 if self.permissions_granted {
                     self.fire_scans();
-                    self.fire_devcontainer_scans();
+                    if self.config.devcontainers_enabled {
+                        self.fire_devcontainer_scans();
+                    }
                     // Pre-warm the codespace list so Tab-ing over doesn't wait
                     // on a cold `gh` network call.
-                    self.fire_codespace_list();
-                    self.fire_codespace_layout_read();
+                    if self.config.codespaces_enabled {
+                        self.fire_codespace_list();
+                    }
+                    if self.config.coder_enabled {
+                        self.fire_coder_list();
+                    }
+                    self.fire_remote_layout_read();
                     self.arm_refresh_timer();
                 }
                 should_render = true;
@@ -197,14 +271,22 @@ impl ZellijPlugin for State {
                 self.timer_running = false;
                 if self.permissions_granted {
                     self.fire_scans();
-                    self.fire_devcontainer_scans();
+                    if self.config.devcontainers_enabled {
+                        self.fire_devcontainer_scans();
+                    }
                     // The codespace list refreshes on a slower cadence, and
                     // only while its mode is showing.
-                    if self.mode == PickerMode::Codespaces {
+                    if self.config.codespaces_enabled && self.mode == PickerMode::Codespaces {
                         self.codespace_refresh_ticks =
                             self.codespace_refresh_ticks.saturating_sub(1);
                         if self.codespace_refresh_ticks == 0 {
                             self.fire_codespace_list();
+                        }
+                    }
+                    if self.config.coder_enabled && self.mode == PickerMode::Coder {
+                        self.coder_refresh_ticks = self.coder_refresh_ticks.saturating_sub(1);
+                        if self.coder_refresh_ticks == 0 {
+                            self.fire_coder_list();
                         }
                     }
                     self.arm_refresh_timer();
@@ -221,7 +303,9 @@ impl ZellijPlugin for State {
                     }
                     self.rebuild_projects();
                     should_render = true;
-                } else if context.contains_key(codespaces::LIST_CONTEXT_KEY) {
+                } else if self.config.codespaces_enabled
+                    && context.contains_key(codespaces::LIST_CONTEXT_KEY)
+                {
                     self.codespaces_refreshing = false;
                     if exit_code == Some(0) {
                         match codespaces::parse_list_json(&String::from_utf8_lossy(&stdout)) {
@@ -241,16 +325,22 @@ impl ZellijPlugin for State {
                         ));
                     }
                     should_render = true;
-                } else if context.contains_key(codespaces::LAYOUT_CONTEXT_KEY) {
-                    // The user's codespace layout base. A failed read (missing
+                } else if (self.config.codespaces_enabled
+                    || self.config.devcontainers_enabled
+                    || self.config.coder_enabled)
+                    && context.contains_key(codespaces::LAYOUT_CONTEXT_KEY)
+                {
+                    // The user's shared remote layout base. A failed read (missing
                     // file, bad path) just leaves the built-in mirror in place.
                     if exit_code == Some(0) {
                         let content = String::from_utf8_lossy(&stdout).to_string();
                         if !content.trim().is_empty() {
-                            self.codespace_layout_base = Some(content);
+                            self.remote_layout_base = Some(content);
                         }
                     }
-                } else if context.contains_key(codespaces::STOP_CONTEXT_KEY) {
+                } else if self.config.codespaces_enabled
+                    && context.contains_key(codespaces::STOP_CONTEXT_KEY)
+                {
                     self.pending_stop = None;
                     if exit_code != Some(0) {
                         self.codespaces_error = Some(codespaces::classify_error(
@@ -262,7 +352,44 @@ impl ZellijPlugin for State {
                     // with reality.
                     self.fire_codespace_list();
                     should_render = true;
-                } else if let Some(scope) = context.get(devcontainers::SCAN_CONTEXT_KEY) {
+                } else if self.config.coder_enabled
+                    && context.contains_key(coder::LIST_CONTEXT_KEY)
+                {
+                    self.coder_refreshing = false;
+                    if exit_code == Some(0) {
+                        match coder::parse_list_json(&String::from_utf8_lossy(&stdout)) {
+                            Ok(list) => {
+                                self.coder_workspaces = list;
+                                self.coder_error = None;
+                                coder::save_cache(&self.coder_workspaces);
+                            },
+                            Err(error) => self.coder_error = Some(error),
+                        }
+                    } else {
+                        self.coder_error = Some(coder::classify_error(
+                            exit_code,
+                            &String::from_utf8_lossy(&stderr),
+                        ));
+                    }
+                    should_render = true;
+                } else if self.config.coder_enabled
+                    && context.contains_key(coder::STOP_CONTEXT_KEY)
+                {
+                    self.pending_coder_stop = None;
+                    if exit_code != Some(0) {
+                        self.coder_error = Some(coder::classify_error(
+                            exit_code,
+                            &String::from_utf8_lossy(&stderr),
+                        ));
+                    }
+                    self.fire_coder_list();
+                    should_render = true;
+                } else if self.config.devcontainers_enabled
+                    && context.contains_key(devcontainers::SCAN_CONTEXT_KEY)
+                {
+                    let scope = context
+                        .get(devcontainers::SCAN_CONTEXT_KEY)
+                        .expect("context key checked above");
                     // Parsed regardless of exit code: `find` over several start
                     // paths exits nonzero when any one is missing but still
                     // prints valid hits for the rest.
@@ -270,7 +397,12 @@ impl ZellijPlugin for State {
                         scope.clone(),
                         devcontainers::parse_scan_output(&String::from_utf8_lossy(&stdout)),
                     );
-                } else if let Some(path_str) = context.get(devcontainers::UP_CONTEXT_KEY) {
+                } else if self.config.devcontainers_enabled
+                    && context.contains_key(devcontainers::UP_CONTEXT_KEY)
+                {
+                    let path_str = context
+                        .get(devcontainers::UP_CONTEXT_KEY)
+                        .expect("context key checked above");
                     should_render = self.handle_devcontainer_up_result(
                         path_str,
                         exit_code,
@@ -294,6 +426,9 @@ impl ZellijPlugin for State {
         let session_results = live_sessions::rank(&session_entries, &self.query);
         let codespace_results = codespaces::rank(&self.codespaces, &self.query);
         let bound_codespaces = self.bound_codespace_names();
+        let coder_results = coder::rank(&self.coder_workspaces, &self.query);
+        let bound_coder_workspaces = self.bound_coder_workspace_names();
+        let enabled_modes = self.enabled_modes();
 
         let output = ui::render(ui::RenderInput {
             permissions_granted: self.permissions_granted,
@@ -301,6 +436,7 @@ impl ZellijPlugin for State {
                 || !self.config.root_dirs.is_empty(),
             query: &self.query,
             mode: self.mode,
+            enabled_modes: &enabled_modes,
             session_results: &session_results,
             results: &results,
             open_paths: &open_paths,
@@ -309,6 +445,11 @@ impl ZellijPlugin for State {
             codespaces_error: self.codespaces_error.as_ref(),
             codespaces_refreshing: self.codespaces_refreshing,
             pending_stop: self.pending_stop.as_deref(),
+            coder_results: &coder_results,
+            bound_coder_workspaces: &bound_coder_workspaces,
+            coder_error: self.coder_error.as_ref(),
+            coder_refreshing: self.coder_refreshing,
+            pending_coder_stop: self.pending_coder_stop.as_deref(),
             pending_devcontainer: self.pending_devcontainer.as_ref(),
             palette: &self.palette,
             selected: self.selected,
@@ -317,6 +458,7 @@ impl ZellijPlugin for State {
                 PickerMode::Sessions => session_entries.len(),
                 PickerMode::Projects => self.projects.len(),
                 PickerMode::Codespaces => self.codespaces.len(),
+                PickerMode::Coder => self.coder_workspaces.len(),
             },
             rows,
             cols,
@@ -458,6 +600,9 @@ impl State {
                 BareKey::Char('x') if self.mode == PickerMode::Codespaces => {
                     return self.stop_selected_codespace();
                 },
+                BareKey::Char('x') if self.mode == PickerMode::Coder => {
+                    return self.stop_selected_coder_workspace();
+                },
                 BareKey::Char('x') if self.mode == PickerMode::Sessions => {
                     return self.kill_selected_session();
                 },
@@ -474,6 +619,7 @@ impl State {
             PickerMode::Sessions => self.session_entries().len(),
             PickerMode::Projects => self.projects.len(),
             PickerMode::Codespaces => self.codespaces.len(),
+            PickerMode::Coder => self.coder_workspaces.len(),
         }
     }
 
@@ -507,25 +653,37 @@ impl State {
         }
     }
 
-    /// Cycle through the Sessions, Projects, and Codespaces lists, resetting
+    /// The tabs enabled for this plugin invocation, in stable cycle order.
+    fn enabled_modes(&self) -> Vec<PickerMode> {
+        enabled_modes_for(&self.config)
+    }
+
+    /// Cycle through only the enabled lists, resetting
     /// the query and cursor (a filter typed against one list is meaningless on
     /// another).
     fn toggle_mode(&mut self) {
-        self.mode = match self.mode {
-            PickerMode::Sessions => PickerMode::Projects,
-            PickerMode::Projects => PickerMode::Codespaces,
-            PickerMode::Codespaces => PickerMode::Sessions,
-        };
+        let modes = self.enabled_modes();
+        let current = modes.iter().position(|mode| *mode == self.mode).unwrap_or(0);
+        self.mode = modes[(current + 1) % modes.len()];
         self.query.clear();
         self.reset_selection();
-        if self.mode == PickerMode::Codespaces && self.permissions_granted {
+        if self.mode == PickerMode::Codespaces
+            && self.config.codespaces_enabled
+            && self.permissions_granted
+        {
             self.fire_codespace_list();
+        }
+        if self.mode == PickerMode::Coder && self.config.coder_enabled && self.permissions_granted {
+            self.fire_coder_list();
         }
     }
 
     /// Kick off a `gh codespace list` refresh. The result arrives as a
     /// `RunCommandResult` tagged with [`codespaces::LIST_CONTEXT_KEY`].
     fn fire_codespace_list(&mut self) {
+        if !self.config.codespaces_enabled {
+            return;
+        }
         let argv = codespaces::list_argv();
         let argv_refs: Vec<&str> = argv.iter().map(|s| s.as_str()).collect();
         run_command(&argv_refs, codespaces::list_context());
@@ -533,10 +691,16 @@ impl State {
         self.codespace_refresh_ticks = CODESPACE_REFRESH_TICKS;
     }
 
-    /// Read the configured `codespace_session_layout` file off the host, if
+    /// Read the configured shared remote layout file off the host, if
     /// any. Local file read — lands well before a user can pick a codespace.
-    fn fire_codespace_layout_read(&self) {
-        let Some(path) = &self.config.codespace_session_layout else {
+    fn fire_remote_layout_read(&self) {
+        if !(self.config.codespaces_enabled
+            || self.config.devcontainers_enabled
+            || self.config.coder_enabled)
+        {
+            return;
+        }
+        let Some(path) = &self.config.remote_session_layout else {
             return;
         };
         let argv = codespaces::layout_read_argv(path);
@@ -547,6 +711,9 @@ impl State {
     /// Codespace names that currently have a live bound session (recognized by
     /// each session's `default_command`), for the open badge.
     fn bound_codespace_names(&self) -> HashSet<String> {
+        if !self.config.codespaces_enabled {
+            return HashSet::new();
+        }
         self.sessions
             .iter()
             .filter_map(|s| {
@@ -569,6 +736,47 @@ impl State {
                     .default_command
                     .as_deref()
                     .and_then(codespaces::parse_codespace_ssh)
+                    .map(str::to_owned),
+            })
+            .collect()
+    }
+
+    fn fire_coder_list(&mut self) {
+        if !self.config.coder_enabled {
+            return;
+        }
+        let argv = coder::list_argv();
+        let argv_refs: Vec<&str> = argv.iter().map(String::as_str).collect();
+        run_command(&argv_refs, coder::list_context());
+        self.coder_refreshing = true;
+        self.coder_refresh_ticks = CODER_REFRESH_TICKS;
+    }
+
+    fn bound_coder_workspace_names(&self) -> HashSet<String> {
+        if !self.config.coder_enabled {
+            return HashSet::new();
+        }
+        self.sessions
+            .iter()
+            .filter_map(|session| {
+                session
+                    .default_command
+                    .as_deref()
+                    .and_then(coder::parse_coder_ssh)
+                    .map(str::to_owned)
+            })
+            .collect()
+    }
+
+    fn existing_coder_sessions(&self) -> Vec<coder::ExistingSession> {
+        self.sessions
+            .iter()
+            .map(|session| coder::ExistingSession {
+                name: session.name.clone(),
+                bound_workspace: session
+                    .default_command
+                    .as_deref()
+                    .and_then(coder::parse_coder_ssh)
                     .map(str::to_owned),
             })
             .collect()
@@ -651,6 +859,9 @@ impl State {
     /// pane/tab to `gh codespace ssh` (and disables serialization, so a dead
     /// bound session is never resurrectable). Then closes the picker.
     fn confirm_codespace_selection(&mut self) {
+        if !self.config.codespaces_enabled {
+            return;
+        }
         let ranked = codespaces::rank(&self.codespaces, &self.query);
         let Some(codespace) = ranked.get(self.selected).map(|r| r.codespace.clone()) else {
             return;
@@ -677,7 +888,7 @@ impl State {
                 let layout = LayoutInfo::Stringified(codespaces::layout_doc_for(
                     &codespace.name,
                     &self.config.sidebar_args,
-                    self.codespace_layout_base.as_deref(),
+                    self.remote_layout_base.as_deref(),
                 ));
                 switch_session_with_layout(Some(&name), layout, None);
                 self.discard_throwaway_session(current_session_name.as_deref());
@@ -691,6 +902,9 @@ impl State {
     /// The picker stays open; the row shows "stopping…" until the re-list
     /// reconciles.
     fn stop_selected_codespace(&mut self) -> bool {
+        if !self.config.codespaces_enabled {
+            return false;
+        }
         if self.pending_stop.is_some() {
             return false; // one stop at a time — the re-list will catch up
         }
@@ -719,6 +933,67 @@ impl State {
         true
     }
 
+    fn confirm_coder_selection(&mut self) {
+        if !self.config.coder_enabled {
+            return;
+        }
+        let ranked = coder::rank(&self.coder_workspaces, &self.query);
+        let Some(workspace) = ranked.get(self.selected).map(|ranked| ranked.workspace.clone()) else {
+            return;
+        };
+        let identifier = workspace.identifier();
+        let action = coder::resolve_open(&workspace, &self.existing_coder_sessions());
+        let current_session_name = self
+            .sessions
+            .iter()
+            .find(|session| session.is_current_session)
+            .map(|session| session.name.clone());
+        match action {
+            coder::OpenAction::Switch { name } if Some(&name) == current_session_name.as_ref() => {},
+            coder::OpenAction::Switch { name } => {
+                switch_session(Some(&name));
+                self.discard_throwaway_session(current_session_name.as_deref());
+            },
+            coder::OpenAction::Create { name } => {
+                let layout = LayoutInfo::Stringified(coder::layout_doc_for(
+                    &identifier,
+                    &self.config.sidebar_args,
+                    self.remote_layout_base.as_deref(),
+                ));
+                switch_session_with_layout(Some(&name), layout, None);
+                self.discard_throwaway_session(current_session_name.as_deref());
+            },
+        }
+        close_self();
+    }
+
+    fn stop_selected_coder_workspace(&mut self) -> bool {
+        if !self.config.coder_enabled || self.pending_coder_stop.is_some() {
+            return false;
+        }
+        let ranked = coder::rank(&self.coder_workspaces, &self.query);
+        let Some(workspace) = ranked.get(self.selected).map(|ranked| ranked.workspace.clone()) else {
+            return false;
+        };
+        let identifier = workspace.identifier();
+        if let Some(bound) = self.sessions.iter().find(|session| {
+            session
+                .default_command
+                .as_deref()
+                .and_then(coder::parse_coder_ssh)
+                == Some(identifier.as_str())
+        }) {
+            if !bound.is_current_session {
+                let _ = kill_sessions(&[bound.name.as_str()]);
+            }
+        }
+        let argv = coder::stop_argv(&identifier);
+        let argv_refs: Vec<&str> = argv.iter().map(String::as_str).collect();
+        run_command(&argv_refs, coder::stop_context(&identifier));
+        self.pending_coder_stop = Some(identifier);
+        true
+    }
+
     /// Open the selected project: switch to its session if one already roots at
     /// that folder, otherwise create a new session there with the configured
     /// `session_layout`. Bumps the frecency db on the open, then closes the
@@ -731,6 +1006,10 @@ impl State {
             },
             PickerMode::Codespaces => {
                 self.confirm_codespace_selection();
+                return;
+            },
+            PickerMode::Coder => {
+                self.confirm_coder_selection();
                 return;
             },
             PickerMode::Projects => {},
@@ -755,7 +1034,10 @@ impl State {
         // carries a `.devcontainer` marker. The prompt takes over the
         // keyboard; the picker closes when the flow resolves.
         let action = session::resolve_open(&path, &self.existing_sessions());
-        if matches!(action, OpenAction::Create { .. }) && self.project_has_devcontainer(&path) {
+        if self.config.devcontainers_enabled
+            && matches!(action, OpenAction::Create { .. })
+            && self.project_has_devcontainer(&path)
+        {
             let display_name = path
                 .file_name()
                 .map(|n| n.to_string_lossy().to_string())
@@ -827,7 +1109,7 @@ impl State {
                 let layout = LayoutInfo::Stringified(devcontainers::layout_doc_for(
                     &path,
                     &self.config.sidebar_args,
-                    self.codespace_layout_base.as_deref(),
+                    self.remote_layout_base.as_deref(),
                 ));
                 switch_session_with_layout(Some(&name), layout, Some(path));
                 self.discard_throwaway_session(current_session_name.as_deref());
@@ -926,6 +1208,9 @@ impl State {
     /// dirs (markers one level under each project) and one over the
     /// individual dirs, so the Enter-time prompt check is a set lookup.
     fn fire_devcontainer_scans(&self) {
+        if !self.config.devcontainers_enabled {
+            return;
+        }
         if !self.config.root_dirs.is_empty() {
             let argv = devcontainers::scan_roots_argv(&self.config.root_dirs);
             let argv_refs: Vec<&str> = argv.iter().map(|s| s.as_str()).collect();

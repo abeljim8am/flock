@@ -276,7 +276,8 @@ pub(crate) enum Row {
         activity: SessionActivity,
         is_current: bool,
         /// The session's remote binding, if any (parsed from its
-        /// `default_command`) — badged in the row: ⚡ codespace, ⬢ devcontainer.
+        /// `default_command`) — badged in the row: ⚡ codespace, ⬢ devcontainer,
+        /// or ASCII C for Coder.
         binding: Option<crate::RemoteBinding>,
     },
     Agent(AgentEntry),
@@ -905,6 +906,10 @@ fn draw_row(
                     spans.push(Span::new("⬢", p.teal));
                     spans.push(Span::new(" ", p.text));
                 },
+                Some(crate::RemoteBinding::Coder) => {
+                    spans.push(Span::new("C", p.yellow));
+                    spans.push(Span::new(" ", p.text));
+                },
                 None => {},
             }
             spans.push(name_span);
@@ -1170,13 +1175,19 @@ mod tests {
             crate::devcontainer::WRAPPER_ARG0.to_string(),
             "/work/app".to_string(),
         ]);
+        let mut coder = sess("coder", "");
+        coder.default_command = Some(vec![
+            "coder".to_string(),
+            "ssh".to_string(),
+            "alice/api".to_string(),
+        ]);
         let plain = sess("plain", "/work/other");
 
         let rows = build_rows(
             &PaneManifest::default(),
             &[],
             &BTreeMap::new(),
-            &[codespace, devcontainer, plain],
+            &[codespace, devcontainer, coder, plain],
         );
         let binding_of = |wanted: &str| {
             rows.iter()
@@ -1188,7 +1199,21 @@ mod tests {
         };
         assert_eq!(binding_of("cs"), Some(crate::RemoteBinding::Codespace));
         assert_eq!(binding_of("dc"), Some(crate::RemoteBinding::Devcontainer));
+        assert_eq!(binding_of("coder"), Some(crate::RemoteBinding::Coder));
         assert_eq!(binding_of("plain"), None);
+    }
+
+    #[test]
+    fn coder_workspace_badge_is_ascii_c() {
+        let row = Row::Session {
+            name: "x".into(),
+            activity: SessionActivity::None,
+            is_current: false,
+            binding: Some(crate::RemoteBinding::Coder),
+        };
+        let mut output = String::new();
+        draw_row(&mut output, &row, 0, 20, false, 0, &Theme::default());
+        assert!(output.contains('C'));
     }
 
     #[test]

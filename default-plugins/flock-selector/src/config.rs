@@ -39,20 +39,25 @@ pub struct SelectorConfig {
     /// one. Left `None` for a keybind launch, where renaming the user's working
     /// session would be wrong.
     pub session_name: Option<String>,
-    /// The raw arg pairs the flock-sidebar shares with this plugin
-    /// (`individual_dirs` / `root_dirs` / `cwd`), exactly as received. The
-    /// generated codespace-session layout embeds them into its sidebar plugin
+    /// The raw arg pairs the flock-sidebar shares with this plugin, exactly as
+    /// received. Generated remote-session layouts embed them into sidebar plugin
     /// blocks so the spawned sidebar filters workspaces the same way the
     /// user's regular flock sessions do.
     pub sidebar_args: Vec<(String, String)>,
-    /// Path to a layout file used as the base for codespace-bound sessions
-    /// (`codespace_session_layout` arg; `~`-expanded). When set and readable,
+    /// Opt-in provider flags. Only a case-insensitive `true` enables one.
+    pub codespaces_enabled: bool,
+    pub devcontainers_enabled: bool,
+    pub coder_enabled: bool,
+    /// Path to a layout file used as the base for all remote-bound sessions
+    /// (`remote_session_layout` arg; `~`-expanded). The deprecated
+    /// `codespace_session_layout` is used only when the new key is absent.
+    /// When set and readable,
     /// bound sessions get this layout's chrome with the SSH binding options
     /// appended, instead of the built-in flock mirror. The file's content
     /// panes must NOT carry explicit `command`s — an explicit command
     /// overrides the session's `default_command`, so such a pane would open
     /// locally instead of SSHing into the codespace.
-    pub codespace_session_layout: Option<PathBuf>,
+    pub remote_session_layout: Option<PathBuf>,
 }
 
 impl Default for SelectorConfig {
@@ -64,7 +69,10 @@ impl Default for SelectorConfig {
             cwd: PathBuf::from("/"),
             session_name: None,
             sidebar_args: Vec::new(),
-            codespace_session_layout: None,
+            codespaces_enabled: false,
+            devcontainers_enabled: false,
+            coder_enabled: false,
+            remote_session_layout: None,
         }
     }
 }
@@ -86,7 +94,14 @@ impl SelectorConfig {
             .get("session_name")
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty());
-        let sidebar_args = ["individual_dirs", "root_dirs", "cwd"]
+        let sidebar_args = [
+            "individual_dirs",
+            "root_dirs",
+            "cwd",
+            "codespaces_enabled",
+            "devcontainers_enabled",
+            "coder_enabled",
+        ]
             .iter()
             .filter_map(|key| {
                 config
@@ -95,8 +110,9 @@ impl SelectorConfig {
                     .map(|value| (key.to_string(), value.clone()))
             })
             .collect();
-        let codespace_session_layout = config
-            .get("codespace_session_layout")
+        let remote_session_layout = config
+            .get("remote_session_layout")
+            .or_else(|| config.get("codespace_session_layout"))
             .and_then(|raw| resolve_path(raw, &cwd));
         SelectorConfig {
             individual_dirs: split_paths(config.get("individual_dirs"), &cwd),
@@ -105,9 +121,16 @@ impl SelectorConfig {
             cwd,
             session_name,
             sidebar_args,
-            codespace_session_layout,
+            codespaces_enabled: enabled(config.get("codespaces_enabled")),
+            devcontainers_enabled: enabled(config.get("devcontainers_enabled")),
+            coder_enabled: enabled(config.get("coder_enabled")),
+            remote_session_layout,
         }
     }
+}
+
+fn enabled(value: Option<&String>) -> bool {
+    value.is_some_and(|value| value.trim().eq_ignore_ascii_case("true"))
 }
 
 /// Split a `;`-separated path list into resolved absolute [`PathBuf`]s, dropping
@@ -189,6 +212,50 @@ mod tests {
         assert_eq!(c.session_layout, DEFAULT_SESSION_LAYOUT);
         assert_eq!(c.cwd, PathBuf::from("/"));
         assert_eq!(c.session_name, None);
+        assert!(!c.codespaces_enabled);
+        assert!(!c.devcontainers_enabled);
+        assert!(!c.coder_enabled);
+        assert_eq!(c.remote_session_layout, None);
+    }
+
+    #[test]
+    fn provider_flags_only_accept_true_case_insensitively() {
+        let c = SelectorConfig::from_args(&args(&[
+            ("codespaces_enabled", " TRUE "),
+            ("devcontainers_enabled", "1"),
+            ("coder_enabled", "TrUe"),
+        ]));
+        assert!(c.codespaces_enabled);
+        assert!(!c.devcontainers_enabled);
+        assert!(c.coder_enabled);
+    }
+
+    #[test]
+    fn remote_layout_precedes_deprecated_codespace_layout() {
+        let c = SelectorConfig::from_args(&args(&[
+            ("remote_session_layout", "remote.kdl"),
+            ("codespace_session_layout", "legacy.kdl"),
+            ("cwd", "/config"),
+        ]));
+        assert_eq!(c.remote_session_layout, Some(PathBuf::from("/config/remote.kdl")));
+
+        let legacy = SelectorConfig::from_args(&args(&[
+            ("codespace_session_layout", "legacy.kdl"),
+            ("cwd", "/config"),
+        ]));
+        assert_eq!(legacy.remote_session_layout, Some(PathBuf::from("/config/legacy.kdl")));
+    }
+
+    #[test]
+    fn forwards_provider_flags_to_generated_sidebars() {
+        let c = SelectorConfig::from_args(&args(&[
+            ("codespaces_enabled", "true"),
+            ("devcontainers_enabled", "false"),
+            ("coder_enabled", "TRUE"),
+        ]));
+        assert!(c.sidebar_args.contains(&("codespaces_enabled".into(), "true".into())));
+        assert!(c.sidebar_args.contains(&("devcontainers_enabled".into(), "false".into())));
+        assert!(c.sidebar_args.contains(&("coder_enabled".into(), "TRUE".into())));
     }
 
     #[test]
