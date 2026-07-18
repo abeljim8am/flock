@@ -899,16 +899,14 @@ fn draw_row(
             ];
             match binding {
                 Some(crate::RemoteBinding::Codespace) => {
-                    spans.push(Span::new("☁", p.blue));
-                    spans.push(Span::new(" ", p.text));
+                    spans.push(Span::new("☁︎ ", p.blue));
                 },
                 Some(crate::RemoteBinding::Devcontainer) => {
                     spans.push(Span::new("⬢", p.teal));
                     spans.push(Span::new(" ", p.text));
                 },
                 Some(crate::RemoteBinding::Coder) => {
-                    spans.push(Span::new("☁", p.yellow));
-                    spans.push(Span::new(" ", p.text));
+                    spans.push(Span::new("☁︎ ", p.blue));
                 },
                 None => {},
             }
@@ -1214,7 +1212,7 @@ mod tests {
             };
             let mut output = String::new();
             draw_row(&mut output, &row, 0, 20, false, 0, &Theme::default());
-            assert!(output.contains('☁'));
+            assert!(output.contains("☁︎ "));
         }
     }
 
