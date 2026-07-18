@@ -16,8 +16,11 @@
 use unicode_width::UnicodeWidthStr;
 use zellij_tile::prelude::PaletteColor;
 
+use crate::coder::{
+    CoderError, CreateError, CreatePhase, CreateWizard, RankedCoderWorkspace,
+    StateKind as CoderStateKind,
+};
 use crate::codespaces::{GhError, RankedCodespace, StateKind};
-use crate::coder::{CoderError, RankedCoderWorkspace, StateKind as CoderStateKind};
 use crate::devcontainers::{DevcontainerError, DevcontainerPhase, PendingDevcontainer};
 use crate::live_sessions::{RankedSession, SessionActivity};
 use crate::palette::{bg, fg, goto, Theme, BOLD, DIM, NORMAL_INTENSITY, RESET};
@@ -96,6 +99,10 @@ pub struct RenderInput<'a> {
     pub coder_error: Option<&'a CoderError>,
     pub coder_refreshing: bool,
     pub pending_coder_stop: Option<&'a str>,
+    /// Coder workspace creation owns the picker while present.
+    pub coder_create: Option<&'a CreateWizard>,
+    /// Transient success message after a no-wait create returns.
+    pub coder_create_notice: Option<&'a str>,
     /// The devcontainer prompt/up owning the picker, if any — rendered as a
     /// full-width notice row just above the input.
     pub pending_devcontainer: Option<&'a PendingDevcontainer>,
@@ -140,6 +147,8 @@ pub fn render(input: RenderInput) -> RenderOutput {
         coder_error,
         coder_refreshing,
         pending_coder_stop,
+        coder_create,
+        coder_create_notice,
         pending_devcontainer,
         palette: p,
         rows,
@@ -166,7 +175,20 @@ pub fn render(input: RenderInput) -> RenderOutput {
     // room for it alongside the input row and at least one result row.
     let has_header = rows >= 3;
     if has_header {
-        render_header_row(&mut out, cols, mode, enabled_modes, p);
+        render_header_row(
+            &mut out,
+            cols,
+            mode,
+            enabled_modes,
+            coder_create.is_some(),
+            p,
+        );
+    }
+
+    if mode == PickerMode::Coder {
+        if let Some(wizard) = coder_create {
+            return render_coder_create(out, rows, cols, has_header, wizard, p);
+        }
     }
 
     // Clamp the selection + scroll to the current result set, keeping the
@@ -319,6 +341,18 @@ pub fn render(input: RenderInput) -> RenderOutput {
     if let Some(pending) = pending_devcontainer {
         render_devcontainer_notice(&mut out, input_y.saturating_sub(1), cols, pending, p);
     }
+    if mode == PickerMode::Coder {
+        if let Some(notice) = coder_create_notice {
+            render_row(
+                &mut out,
+                0,
+                input_y.saturating_sub(1),
+                cols,
+                None,
+                &[Span::new(" ✓ ", p.green), Span::new(notice, p.text).bold()],
+            );
+        }
+    }
 
     // The input line on the bottom row: prompt + query + a block cursor, with a
     // right-aligned shown/total count.
@@ -341,6 +375,7 @@ fn render_header_row(
     cols: usize,
     mode: PickerMode,
     enabled_modes: &[PickerMode],
+    creating_coder: bool,
     p: &Theme,
 ) {
     let active = Style {
@@ -368,11 +403,15 @@ fn render_header_row(
         spans.push(styled(label, style_for(*enabled)));
     }
 
-    let hint = match mode {
-        PickerMode::Sessions => "Tab switch · Ctrl-x close ",
-        PickerMode::Projects => "Tab ",
-        PickerMode::Codespaces => "Tab switch · Ctrl-x stop ",
-        PickerMode::Coder => "Tab switch · Ctrl-x stop ",
+    let hint = if creating_coder {
+        "Esc back · Enter next "
+    } else {
+        match mode {
+            PickerMode::Sessions => "Tab switch · Ctrl-x close ",
+            PickerMode::Projects => "Tab ",
+            PickerMode::Codespaces => "Tab switch · Ctrl-x stop ",
+            PickerMode::Coder => "Tab switch · Ctrl-a create · Ctrl-x stop ",
+        }
     };
     let left_w: usize = spans.iter().map(|s| s.text.width()).sum();
     let hint_w = hint.width();
@@ -381,6 +420,218 @@ fn render_header_row(
         spans.push(Span::new(hint, p.muted).dim());
     }
     render_row(out, 0, 0, cols, None, &spans);
+}
+
+fn render_coder_create(
+    mut out: String,
+    rows: usize,
+    cols: usize,
+    has_header: bool,
+    wizard: &CreateWizard,
+    p: &Theme,
+) -> RenderOutput {
+    let input_y = rows.saturating_sub(1);
+    let capacity = rows.saturating_sub(if has_header { 2 } else { 1 });
+    let mut row_map = Vec::new();
+    match wizard.phase {
+        CreatePhase::Templates => {
+            let filtered = wizard.filtered_templates();
+            let total = filtered.len();
+            let selected = if total == 0 {
+                0
+            } else {
+                wizard.selected.min(total - 1)
+            };
+            if !wizard.templates_loading && wizard.template_error.is_none() && total > 0 {
+                let visible = capacity.min(total);
+                let start = selected.saturating_sub(visible.saturating_sub(1));
+                for (offset, template) in filtered.iter().skip(start).take(visible).enumerate() {
+                    let index = start + offset;
+                    let y = input_y.saturating_sub(1 + offset);
+                    let spans = vec![
+                        Span::new("  ", p.text),
+                        Span::new(
+                            truncate_text(template.label(), cols.saturating_sub(8).max(1)),
+                            p.text,
+                        )
+                        .bold(),
+                        Span::new(format!("  {}", template.organization), p.text).dim(),
+                    ];
+                    render_row(
+                        &mut out,
+                        0,
+                        y,
+                        cols,
+                        (index == selected).then_some(p.selection_bg),
+                        &spans,
+                    );
+                    row_map.push((y, index));
+                }
+            } else {
+                let spans = if wizard.templates_loading {
+                    vec![Span::new(" loading Coder templates…", p.muted).dim()]
+                } else if let Some(error) = wizard.template_error.as_ref() {
+                    let mut spans = coder_error_spans(error, p);
+                    // Put the action before the potentially long CLI detail so
+                    // it remains visible in narrow panes.
+                    spans.insert(1, Span::new(" Enter to retry —", p.accent).bold());
+                    spans
+                } else if wizard.filter.trim().is_empty() {
+                    vec![Span::new(" no Coder templates available", p.muted).dim()]
+                } else {
+                    vec![Span::new(" no matching templates", p.muted).dim()]
+                };
+                render_row(&mut out, 0, input_y.saturating_sub(1), cols, None, &spans);
+            }
+            render_wizard_input(
+                &mut out,
+                input_y,
+                cols,
+                "Template",
+                &wizard.filter,
+                total,
+                wizard.templates.len(),
+                p,
+            );
+            out.push_str(RESET);
+            RenderOutput {
+                ansi: out,
+                selected,
+                scroll: 0,
+                row_map,
+            }
+        },
+        CreatePhase::Name | CreatePhase::Submitting => {
+            let template = wizard.template.as_ref();
+            let mut y = input_y.saturating_sub(1);
+            if let Some(error) = wizard.create_error.as_ref() {
+                render_row(&mut out, 0, y, cols, None, &create_error_spans(error, p));
+                y = y.saturating_sub(1);
+            }
+            if wizard.phase == CreatePhase::Submitting {
+                render_row(
+                    &mut out,
+                    0,
+                    y,
+                    cols,
+                    None,
+                    &[
+                        Span::new(" ◌ ", p.yellow),
+                        Span::new("starting workspace creation…", p.text).bold(),
+                    ],
+                );
+                y = y.saturating_sub(1);
+            }
+            render_row(
+                &mut out,
+                0,
+                y,
+                cols,
+                None,
+                &[
+                    Span::new(" Template  ", p.muted).dim(),
+                    Span::new(
+                        template.map(|template| template.label()).unwrap_or(""),
+                        p.text,
+                    )
+                    .bold(),
+                    Span::new(
+                        format!(
+                            "  ({})",
+                            template
+                                .map(|template| template.organization.as_str())
+                                .unwrap_or("")
+                        ),
+                        p.text,
+                    )
+                    .dim(),
+                ],
+            );
+            y = y.saturating_sub(1);
+            if wizard.dotfiles_configured {
+                render_row(
+                    &mut out,
+                    0,
+                    y,
+                    cols,
+                    None,
+                    &[
+                        Span::new(" Dotfiles  ", p.muted).dim(),
+                        Span::new(
+                            "configured; applied when the template supports the parameters",
+                            p.text,
+                        ),
+                    ],
+                );
+                y = y.saturating_sub(1);
+            }
+            render_row(&mut out, 0, y, cols, None, &[
+                Span::new(" Provisioning continues in the background; the workspace will not open automatically.", p.muted).dim(),
+            ]);
+            render_wizard_input(
+                &mut out,
+                input_y,
+                cols,
+                "Workspace name",
+                &wizard.workspace_name,
+                0,
+                0,
+                p,
+            );
+            out.push_str(RESET);
+            RenderOutput {
+                ansi: out,
+                selected: 0,
+                scroll: 0,
+                row_map,
+            }
+        },
+    }
+}
+
+fn render_wizard_input(
+    out: &mut String,
+    y: usize,
+    cols: usize,
+    label: &str,
+    value: &str,
+    shown: usize,
+    total: usize,
+    p: &Theme,
+) {
+    let count = if total > 0 {
+        format!("{}/{} ", shown, total)
+    } else {
+        String::new()
+    };
+    let fixed = format!("{} › ", label);
+    let budget = cols
+        .saturating_sub(fixed.width() + count.width() + 2)
+        .max(1);
+    let mut spans = vec![
+        Span::new(format!("{} › ", label), p.accent).bold(),
+        Span::new(tail_text(value, budget), p.text),
+        Span::new("▏", p.accent),
+    ];
+    let used: usize = spans.iter().map(|span| span.text.width()).sum();
+    if !count.is_empty() && used + count.width() < cols {
+        spans.push(Span::new(" ".repeat(cols - used - count.width()), p.text));
+        spans.push(Span::new(count, p.muted).dim());
+    }
+    render_row(out, 0, y, cols, None, &spans);
+}
+
+fn create_error_spans(error: &CreateError, p: &Theme) -> Vec<Span> {
+    let message = match error {
+        CreateError::CliMissing => "coder not found — install the Coder CLI".to_owned(),
+        CreateError::NotAuthenticated => "authentication required — run: coder login".to_owned(),
+        CreateError::DuplicateName => {
+            "that workspace name already exists — edit the name and retry".to_owned()
+        },
+        CreateError::Validation(detail) => format!("invalid workspace name — {}", detail),
+        CreateError::Other(detail) => format!("workspace creation failed — {}", detail),
+    };
+    vec![Span::new(" ✗ ", p.red), Span::new(message, p.text)]
 }
 
 fn coder_error_spans(err: &CoderError, p: &Theme) -> Vec<Span> {
@@ -1029,6 +1280,8 @@ mod tests {
             coder_error: None,
             coder_refreshing: false,
             pending_coder_stop: None,
+            coder_create: None,
+            coder_create_notice: None,
             pending_devcontainer: None,
             palette: &theme,
             selected: 0,
@@ -1083,6 +1336,8 @@ mod tests {
             coder_error: None,
             coder_refreshing: false,
             pending_coder_stop: None,
+            coder_create: None,
+            coder_create_notice: None,
             pending_devcontainer: None,
             palette: &theme,
             selected: 0,
@@ -1095,6 +1350,83 @@ mod tests {
         assert!(output.ansi.contains("running"));
         assert!(output.ansi.contains("Coder"));
         assert!(!output.ansi.contains("Codespaces"));
+    }
+
+    #[test]
+    fn coder_create_renders_loading_summary_dotfiles_errors_and_narrow_panes() {
+        let c = PaletteColor::EightBit(1);
+        let theme = Theme {
+            text: c,
+            muted: c,
+            separator: c,
+            selection_bg: c,
+            accent: c,
+            red: c,
+            yellow: c,
+            green: c,
+            teal: c,
+            blue: c,
+        };
+        let mut wizard = crate::coder::CreateWizard::new(None, true);
+        let render_wizard = |wizard: &crate::coder::CreateWizard, rows, cols| {
+            render(RenderInput {
+                permissions_granted: true,
+                configured: false,
+                query: "",
+                mode: PickerMode::Coder,
+                enabled_modes: &[
+                    PickerMode::Sessions,
+                    PickerMode::Projects,
+                    PickerMode::Coder,
+                ],
+                session_results: &[],
+                results: &[],
+                open_paths: &std::collections::HashSet::new(),
+                codespace_results: &[],
+                bound_codespaces: &std::collections::HashSet::new(),
+                codespaces_error: None,
+                codespaces_refreshing: false,
+                pending_stop: None,
+                coder_results: &[],
+                bound_coder_workspaces: &std::collections::HashSet::new(),
+                coder_error: None,
+                coder_refreshing: false,
+                pending_coder_stop: None,
+                coder_create: Some(wizard),
+                coder_create_notice: None,
+                pending_devcontainer: None,
+                palette: &theme,
+                selected: 0,
+                scroll: 0,
+                total_candidates: 0,
+                rows,
+                cols,
+            })
+        };
+        assert!(render_wizard(&wizard, 4, 18)
+            .ansi
+            .contains("loading Coder templates"));
+
+        wizard.set_templates(vec![crate::coder::CoderTemplate {
+            name: "rust".into(),
+            display_name: "Rust Development".into(),
+            organization: "acme".into(),
+        }]);
+        assert!(wizard.select_current_template());
+        wizard.workspace_name = "demo".into();
+        wizard.fail_submit(crate::coder::CreateError::DuplicateName);
+        let summary = render_wizard(&wizard, 8, 42).ansi;
+        assert!(summary.contains("applied when the template supports"));
+        assert!(summary.contains("continues in the background"));
+        assert!(summary.contains("already exists"));
+        assert!(summary.contains("Workspace name"));
+
+        wizard.phase = crate::coder::CreatePhase::Templates;
+        wizard.templates.clear();
+        wizard.set_template_error(crate::coder::CoderError::NotAuthenticated);
+        let error = render_wizard(&wizard, 3, 20).ansi;
+        assert!(error.contains("authentication required"));
+        assert!(error.contains("Enter to retry"));
     }
 
     #[test]

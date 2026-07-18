@@ -20,6 +20,8 @@ use std::path::{Path, PathBuf};
 
 /// Layout new sessions open with when none is configured.
 pub const DEFAULT_SESSION_LAYOUT: &str = "default";
+pub const DEFAULT_CODER_DOTFILES_PARAMETER: &str = "dotfiles_uri";
+pub const DEFAULT_CODER_DOTFILES_BRANCH_PARAMETER: &str = "dotfiles_branch";
 
 /// The selector's resolved configuration, derived from the plugin's KDL args.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -48,6 +50,16 @@ pub struct SelectorConfig {
     pub codespaces_enabled: bool,
     pub devcontainers_enabled: bool,
     pub coder_enabled: bool,
+    /// Optional repository injected as a Coder template parameter default when
+    /// creating workspaces. This is selector-only: the sidebar never creates
+    /// workspaces.
+    pub coder_dotfiles_uri: Option<String>,
+    /// Template parameter receiving [`Self::coder_dotfiles_uri`].
+    pub coder_dotfiles_parameter: String,
+    /// Optional branch injected alongside the dotfiles repository.
+    pub coder_dotfiles_branch: Option<String>,
+    /// Template parameter receiving [`Self::coder_dotfiles_branch`].
+    pub coder_dotfiles_branch_parameter: String,
     /// Path to a layout file used as the base for all remote-bound sessions
     /// (`remote_session_layout` arg; `~`-expanded). The deprecated
     /// `codespace_session_layout` is used only when the new key is absent.
@@ -72,6 +84,10 @@ impl Default for SelectorConfig {
             codespaces_enabled: false,
             devcontainers_enabled: false,
             coder_enabled: false,
+            coder_dotfiles_uri: None,
+            coder_dotfiles_parameter: DEFAULT_CODER_DOTFILES_PARAMETER.to_owned(),
+            coder_dotfiles_branch: None,
+            coder_dotfiles_branch_parameter: DEFAULT_CODER_DOTFILES_BRANCH_PARAMETER.to_owned(),
             remote_session_layout: None,
         }
     }
@@ -124,6 +140,24 @@ impl SelectorConfig {
             codespaces_enabled: enabled(config.get("codespaces_enabled")),
             devcontainers_enabled: enabled(config.get("devcontainers_enabled")),
             coder_enabled: enabled(config.get("coder_enabled")),
+            coder_dotfiles_uri: config
+                .get("coder_dotfiles_uri")
+                .map(|value| value.trim().to_owned())
+                .filter(|value| !value.is_empty()),
+            coder_dotfiles_parameter: config
+                .get("coder_dotfiles_parameter")
+                .map(|value| value.trim().to_owned())
+                .filter(|value| !value.is_empty())
+                .unwrap_or_else(|| DEFAULT_CODER_DOTFILES_PARAMETER.to_owned()),
+            coder_dotfiles_branch: config
+                .get("coder_dotfiles_branch")
+                .map(|value| value.trim().to_owned())
+                .filter(|value| !value.is_empty()),
+            coder_dotfiles_branch_parameter: config
+                .get("coder_dotfiles_branch_parameter")
+                .map(|value| value.trim().to_owned())
+                .filter(|value| !value.is_empty())
+                .unwrap_or_else(|| DEFAULT_CODER_DOTFILES_BRANCH_PARAMETER.to_owned()),
             remote_session_layout,
         }
     }
@@ -215,6 +249,13 @@ mod tests {
         assert!(!c.codespaces_enabled);
         assert!(!c.devcontainers_enabled);
         assert!(!c.coder_enabled);
+        assert_eq!(c.coder_dotfiles_uri, None);
+        assert_eq!(c.coder_dotfiles_parameter, DEFAULT_CODER_DOTFILES_PARAMETER);
+        assert_eq!(c.coder_dotfiles_branch, None);
+        assert_eq!(
+            c.coder_dotfiles_branch_parameter,
+            DEFAULT_CODER_DOTFILES_BRANCH_PARAMETER
+        );
         assert_eq!(c.remote_session_layout, None);
     }
 
@@ -228,6 +269,29 @@ mod tests {
         assert!(c.codespaces_enabled);
         assert!(!c.devcontainers_enabled);
         assert!(c.coder_enabled);
+    }
+
+    #[test]
+    fn coder_dotfiles_settings_trim_and_default_parameter() {
+        let configured = SelectorConfig::from_args(&args(&[(
+            "coder_dotfiles_uri",
+            "  https://example.test/my dotfiles.git  ",
+        )]));
+        assert_eq!(
+            configured.coder_dotfiles_uri.as_deref(),
+            Some("https://example.test/my dotfiles.git")
+        );
+        assert_eq!(configured.coder_dotfiles_parameter, "dotfiles_uri");
+
+        let custom = SelectorConfig::from_args(&args(&[
+            ("coder_dotfiles_uri", "https://example.test/dotfiles"),
+            ("coder_dotfiles_parameter", "  personal_dotfiles  "),
+            ("coder_dotfiles_branch", "  main  "),
+            ("coder_dotfiles_branch_parameter", "  personal_branch  "),
+        ]));
+        assert_eq!(custom.coder_dotfiles_parameter, "personal_dotfiles");
+        assert_eq!(custom.coder_dotfiles_branch.as_deref(), Some("main"));
+        assert_eq!(custom.coder_dotfiles_branch_parameter, "personal_branch");
     }
 
     #[test]

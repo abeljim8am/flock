@@ -19,6 +19,13 @@ layout {
                 // individual_dirs "/path/to/project;/another/project"
                 // root_dirs "/path/to/projects;/path/to/work"
                 // session_layout "default"
+                // coder_enabled "true"
+                // Optional, applied only when the selected Coder template
+                // exposes this conventional parameter.
+                // coder_dotfiles_uri "https://github.com/example/dotfiles.git"
+                // coder_dotfiles_branch "main"
+                // coder_dotfiles_parameter "dotfiles_uri"
+                // coder_dotfiles_branch_parameter "dotfiles_branch"
             }
             width "70%"
             height "70%"

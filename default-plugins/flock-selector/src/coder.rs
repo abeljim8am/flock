@@ -11,8 +11,11 @@ use crate::fuzzy::fuzzy_match;
 
 pub const LIST_CONTEXT_KEY: &str = "flock_coder_list";
 pub const STOP_CONTEXT_KEY: &str = "flock_coder_stop";
+pub const TEMPLATE_LIST_CONTEXT_KEY: &str = "flock_coder_template_list";
+pub const CREATE_CONTEXT_KEY: &str = "flock_coder_create";
 
 const CACHE_PATH: &str = "/data/coder-workspaces.json";
+const TEMPLATE_CACHE_PATH: &str = "/data/coder-templates.json";
 const CACHE_TTL_SECS: u64 = 300;
 const FALLBACK_NAME: &str = "coder";
 
@@ -24,6 +27,23 @@ pub struct CoderWorkspace {
     pub status: String,
     pub favorite: bool,
     pub last_used_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct CoderTemplate {
+    pub name: String,
+    pub display_name: String,
+    pub organization: String,
+}
+
+impl CoderTemplate {
+    pub fn label(&self) -> &str {
+        if self.display_name.is_empty() {
+            &self.name
+        } else {
+            &self.display_name
+        }
+    }
 }
 
 impl CoderWorkspace {
@@ -69,6 +89,59 @@ pub fn stop_argv(identifier: &str) -> Vec<String> {
         "-y".into(),
         identifier.into(),
     ]
+}
+
+pub fn template_list_argv() -> Vec<String> {
+    vec![
+        "coder".into(),
+        "templates".into(),
+        "list".into(),
+        "--output".into(),
+        "json".into(),
+    ]
+}
+
+pub fn create_argv(
+    name: &str,
+    template: &CoderTemplate,
+    dotfiles: Option<(&str, &str)>,
+    dotfiles_branch: Option<(&str, &str)>,
+) -> Vec<String> {
+    let mut argv = vec![
+        "coder".into(),
+        "create".into(),
+        name.into(),
+        "--template".into(),
+        template.name.clone(),
+        "--org".into(),
+        template.organization.clone(),
+        "--preset".into(),
+        "none".into(),
+        "--use-parameter-defaults".into(),
+        "--yes".into(),
+        "--no-wait".into(),
+    ];
+    if let Some((parameter, uri)) = dotfiles {
+        argv.extend([
+            "--parameter-default".into(),
+            format!("{}={}", parameter, uri),
+        ]);
+    }
+    if let Some((parameter, branch)) = dotfiles_branch {
+        argv.extend([
+            "--parameter-default".into(),
+            format!("{}={}", parameter, branch),
+        ]);
+    }
+    argv
+}
+
+pub fn template_list_context() -> BTreeMap<String, String> {
+    BTreeMap::from_iter([(TEMPLATE_LIST_CONTEXT_KEY.into(), String::new())])
+}
+
+pub fn create_context(name: &str) -> BTreeMap<String, String> {
+    BTreeMap::from_iter([(CREATE_CONTEXT_KEY.into(), name.into())])
 }
 
 pub fn parse_coder_ssh(argv: &[String]) -> Option<&str> {
@@ -187,6 +260,47 @@ pub fn parse_list_json(raw: &str) -> Result<Vec<CoderWorkspace>, CoderError> {
     Ok(workspaces)
 }
 
+pub fn parse_template_list_json(raw: &str) -> Result<Vec<CoderTemplate>, CoderError> {
+    let value: serde_json::Value =
+        serde_json::from_str(raw).map_err(|error| CoderError::MalformedJson(error.to_string()))?;
+    let entries = value
+        .as_array()
+        .ok_or_else(|| CoderError::MalformedJson("expected a JSON array".into()))?;
+    let mut templates = Vec::with_capacity(entries.len());
+    for entry in entries {
+        let Some(name) = string_field(entry, &["name"]).filter(|name| !name.trim().is_empty())
+        else {
+            continue;
+        };
+        let organization = string_field(entry, &["organization_name", "organizationName"])
+            .or_else(|| {
+                entry.get("organization").and_then(|organization| {
+                    string_field(organization, &["name", "display_name", "displayName"])
+                })
+            })
+            .unwrap_or_default();
+        if organization.trim().is_empty() {
+            continue;
+        }
+        let display_name = string_field(entry, &["display_name", "displayName"])
+            .filter(|display_name| !display_name.trim().is_empty())
+            .unwrap_or_else(|| name.clone());
+        templates.push(CoderTemplate {
+            name,
+            display_name,
+            organization,
+        });
+    }
+    templates.sort_by(|a, b| {
+        a.label()
+            .to_ascii_lowercase()
+            .cmp(&b.label().to_ascii_lowercase())
+            .then_with(|| a.organization.cmp(&b.organization))
+            .then_with(|| a.name.cmp(&b.name))
+    });
+    Ok(templates)
+}
+
 fn workspace_status(entry: &serde_json::Value) -> String {
     let Some(build) = entry
         .get("latest_build")
@@ -227,6 +341,12 @@ struct CacheEnvelope {
     workspaces: Vec<CoderWorkspace>,
 }
 
+#[derive(serde::Serialize, serde::Deserialize)]
+struct TemplateCacheEnvelope {
+    saved_at: u64,
+    templates: Vec<CoderTemplate>,
+}
+
 pub fn load_cache() -> Vec<CoderWorkspace> {
     load_cache_from(Path::new(CACHE_PATH), now_secs())
 }
@@ -247,6 +367,206 @@ pub fn save_cache(workspaces: &[CoderWorkspace]) {
     };
     if let Ok(raw) = serde_json::to_string(&cache) {
         let _ = std::fs::write(CACHE_PATH, raw);
+    }
+}
+
+pub fn load_template_cache() -> Option<Vec<CoderTemplate>> {
+    load_template_cache_from(Path::new(TEMPLATE_CACHE_PATH), now_secs())
+}
+
+fn load_template_cache_from(path: &Path, now: u64) -> Option<Vec<CoderTemplate>> {
+    std::fs::read_to_string(path)
+        .ok()
+        .and_then(|raw| serde_json::from_str::<TemplateCacheEnvelope>(&raw).ok())
+        .filter(|cache| now.saturating_sub(cache.saved_at) <= CACHE_TTL_SECS)
+        .map(|cache| cache.templates)
+}
+
+pub fn save_template_cache(templates: &[CoderTemplate]) {
+    let cache = TemplateCacheEnvelope {
+        saved_at: now_secs(),
+        templates: templates.to_vec(),
+    };
+    if let Ok(raw) = serde_json::to_string(&cache) {
+        let _ = std::fs::write(TEMPLATE_CACHE_PATH, raw);
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CreateError {
+    CliMissing,
+    NotAuthenticated,
+    DuplicateName,
+    Validation(String),
+    Other(String),
+}
+
+pub fn classify_create_error(exit_code: Option<i32>, stderr: &str) -> CreateError {
+    let lower = stderr.to_ascii_lowercase();
+    if exit_code == Some(127)
+        || lower.contains("command not found")
+        || lower.contains("no such file or directory")
+    {
+        return CreateError::CliMissing;
+    }
+    if lower.contains("coder login")
+        || lower.contains("not logged in")
+        || lower.contains("not authenticated")
+        || lower.contains("unauthorized")
+        || lower.contains("status code 401")
+    {
+        return CreateError::NotAuthenticated;
+    }
+    if (lower.contains("workspace") && lower.contains("already exists"))
+        || lower.contains("name is already in use")
+    {
+        return CreateError::DuplicateName;
+    }
+    if lower.contains("invalid workspace name")
+        || lower.contains("validation failed")
+        || lower.contains("must match")
+        || lower.contains("is not a valid")
+    {
+        return CreateError::Validation(last_nonempty_line(stderr));
+    }
+    CreateError::Other(last_nonempty_line(stderr))
+}
+
+fn last_nonempty_line(stderr: &str) -> String {
+    stderr
+        .lines()
+        .rev()
+        .find(|line| !line.trim().is_empty())
+        .unwrap_or("")
+        .trim()
+        .to_owned()
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CreatePhase {
+    Templates,
+    Name,
+    Submitting,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CreateWizard {
+    pub phase: CreatePhase,
+    pub templates: Vec<CoderTemplate>,
+    pub templates_loading: bool,
+    pub template_error: Option<CoderError>,
+    pub filter: String,
+    pub selected: usize,
+    pub template: Option<CoderTemplate>,
+    pub workspace_name: String,
+    pub create_error: Option<CreateError>,
+    pub dotfiles_configured: bool,
+}
+
+impl CreateWizard {
+    pub fn new(cached: Option<Vec<CoderTemplate>>, dotfiles_configured: bool) -> Self {
+        Self {
+            phase: CreatePhase::Templates,
+            templates_loading: cached.is_none(),
+            templates: cached.unwrap_or_default(),
+            template_error: None,
+            filter: String::new(),
+            selected: 0,
+            template: None,
+            workspace_name: String::new(),
+            create_error: None,
+            dotfiles_configured,
+        }
+    }
+
+    pub fn set_templates(&mut self, templates: Vec<CoderTemplate>) {
+        self.templates = templates;
+        self.templates_loading = false;
+        self.template_error = None;
+        self.selected = 0;
+    }
+
+    pub fn set_template_error(&mut self, error: CoderError) {
+        self.templates_loading = false;
+        self.template_error = Some(error);
+    }
+
+    pub fn filtered_templates(&self) -> Vec<&CoderTemplate> {
+        let query = self.filter.trim();
+        let mut ranked: Vec<(i32, &CoderTemplate)> = self
+            .templates
+            .iter()
+            .filter_map(|template| {
+                let display = fuzzy_match(query, template.label());
+                let name = fuzzy_match(query, &template.name);
+                let organization = fuzzy_match(query, &template.organization);
+                if !query.is_empty()
+                    && display.is_none()
+                    && name.is_none()
+                    && organization.is_none()
+                {
+                    return None;
+                }
+                let score = display
+                    .map(|m| m.score + 8)
+                    .into_iter()
+                    .chain(name.map(|m| m.score + 4))
+                    .chain(organization.map(|m| m.score))
+                    .max()
+                    .unwrap_or(0);
+                Some((score, template))
+            })
+            .collect();
+        ranked.sort_by(|a, b| {
+            b.0.cmp(&a.0)
+                .then_with(|| a.1.label().cmp(b.1.label()))
+                .then_with(|| a.1.organization.cmp(&b.1.organization))
+        });
+        ranked.into_iter().map(|(_, template)| template).collect()
+    }
+
+    pub fn select_current_template(&mut self) -> bool {
+        let selected = self
+            .filtered_templates()
+            .get(self.selected)
+            .map(|template| (*template).clone());
+        if let Some(template) = selected {
+            self.template = Some(template);
+            self.phase = CreatePhase::Name;
+            self.create_error = None;
+            true
+        } else {
+            false
+        }
+    }
+
+    pub fn back(&mut self) -> bool {
+        match self.phase {
+            CreatePhase::Templates => false,
+            CreatePhase::Name => {
+                self.phase = CreatePhase::Templates;
+                self.create_error = None;
+                true
+            },
+            CreatePhase::Submitting => true,
+        }
+    }
+
+    pub fn begin_submit(&mut self) -> Option<(String, CoderTemplate)> {
+        if self.phase != CreatePhase::Name || self.workspace_name.trim().is_empty() {
+            return None;
+        }
+        let template = self.template.clone()?;
+        let name = self.workspace_name.trim().to_owned();
+        self.workspace_name = name.clone();
+        self.phase = CreatePhase::Submitting;
+        self.create_error = None;
+        Some((name, template))
+    }
+
+    pub fn fail_submit(&mut self, error: CreateError) {
+        self.phase = CreatePhase::Name;
+        self.create_error = Some(error);
     }
 }
 
@@ -402,6 +722,14 @@ mod tests {
         }
     }
 
+    fn template(org: &str, name: &str, display_name: &str) -> CoderTemplate {
+        CoderTemplate {
+            organization: org.into(),
+            name: name.into(),
+            display_name: display_name.into(),
+        }
+    }
+
     #[test]
     fn parses_workspace_fixture_and_states() {
         let parsed = parse_list_json(LIST_JSON).unwrap();
@@ -411,6 +739,152 @@ mod tests {
         assert!(parsed[0].favorite);
         assert_eq!(parsed[0].state_kind(), StateKind::Running);
         assert_eq!(parsed[1].state_kind(), StateKind::Stopped);
+    }
+
+    #[test]
+    fn parses_templates_with_field_variants_and_duplicate_names() {
+        let parsed = parse_template_list_json(
+            r#"[
+          {"name":"rust","display_name":"Rust Dev","organization_name":"acme"},
+          {"name":"rust","displayName":"Rust Platform","organizationName":"platform"},
+          {"name":"web","organization":{"name":"labs"}},
+          {"name":"missing-org"}
+        ]"#,
+        )
+        .unwrap();
+        assert_eq!(parsed.len(), 3);
+        assert!(parsed.contains(&template("acme", "rust", "Rust Dev")));
+        assert!(parsed.contains(&template("platform", "rust", "Rust Platform")));
+        assert!(parsed.contains(&template("labs", "web", "web")));
+        assert!(parse_template_list_json("[]").unwrap().is_empty());
+        assert!(matches!(
+            parse_template_list_json("{"),
+            Err(CoderError::MalformedJson(_))
+        ));
+    }
+
+    #[test]
+    fn create_argv_is_exact_and_values_remain_single_arguments() {
+        let selected = template("my org; echo nope", "rust template", "Rust");
+        assert_eq!(
+            create_argv("my workspace $(false)", &selected, None, None),
+            vec![
+                "coder",
+                "create",
+                "my workspace $(false)",
+                "--template",
+                "rust template",
+                "--org",
+                "my org; echo nope",
+                "--preset",
+                "none",
+                "--use-parameter-defaults",
+                "--yes",
+                "--no-wait"
+            ]
+        );
+        let uri = "https://example.test/dot files.git?x=$(nope)&y=1";
+        let default_parameter = create_argv(
+            "demo",
+            &selected,
+            Some(("dotfiles_uri", uri)),
+            Some(("dotfiles_branch", "main")),
+        );
+        assert_eq!(
+            &default_parameter[12..],
+            &[
+                "--parameter-default",
+                &format!("dotfiles_uri={uri}"),
+                "--parameter-default",
+                "dotfiles_branch=main",
+            ]
+        );
+        let custom = create_argv(
+            "demo",
+            &selected,
+            Some(("personal_dotfiles", uri)),
+            Some(("personal_branch", "release; $(nope)")),
+        );
+        assert_eq!(
+            &custom[12..],
+            &[
+                "--parameter-default",
+                &format!("personal_dotfiles={uri}"),
+                "--parameter-default",
+                "personal_branch=release; $(nope)",
+            ]
+        );
+    }
+
+    #[test]
+    fn template_cache_preserves_empty_results_and_expires() {
+        let path = std::env::temp_dir().join(format!(
+            "flock-coder-template-cache-{}.json",
+            std::process::id()
+        ));
+        let cache = TemplateCacheEnvelope {
+            saved_at: 100,
+            templates: vec![],
+        };
+        std::fs::write(&path, serde_json::to_string(&cache).unwrap()).unwrap();
+        assert_eq!(
+            load_template_cache_from(&path, 100 + CACHE_TTL_SECS),
+            Some(vec![])
+        );
+        assert_eq!(load_template_cache_from(&path, 101 + CACHE_TTL_SECS), None);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn creation_wizard_filters_navigates_submits_once_and_retries() {
+        let mut wizard = CreateWizard::new(None, true);
+        assert!(wizard.templates_loading);
+        wizard.set_templates(vec![
+            template("acme", "rust", "Rust Dev"),
+            template("labs", "web", "Web"),
+        ]);
+        wizard.filter = "web".into();
+        assert_eq!(wizard.filtered_templates()[0].organization, "labs");
+        assert!(wizard.select_current_template());
+        wizard.workspace_name = "demo".into();
+        assert_eq!(
+            wizard.begin_submit(),
+            Some(("demo".into(), template("labs", "web", "Web")))
+        );
+        assert_eq!(
+            wizard.begin_submit(),
+            None,
+            "duplicate Enter is ignored while submitting"
+        );
+        wizard.fail_submit(CreateError::DuplicateName);
+        assert_eq!(wizard.phase, CreatePhase::Name);
+        assert_eq!(wizard.workspace_name, "demo");
+        assert_eq!(wizard.begin_submit().unwrap().0, "demo");
+        wizard.fail_submit(CreateError::Validation("bad name".into()));
+        assert!(wizard.back());
+        assert_eq!(wizard.phase, CreatePhase::Templates);
+        assert_eq!(wizard.template.as_ref().unwrap().organization, "labs");
+        assert!(!wizard.back(), "Esc from templates cancels the wizard");
+    }
+
+    #[test]
+    fn create_errors_are_actionable() {
+        assert_eq!(
+            classify_create_error(Some(1), "workspace already exists"),
+            CreateError::DuplicateName
+        );
+        assert_eq!(
+            classify_create_error(Some(1), "please run coder login"),
+            CreateError::NotAuthenticated
+        );
+        assert!(matches!(
+            classify_create_error(Some(1), "invalid workspace name: nope"),
+            CreateError::Validation(_)
+        ));
+        assert_eq!(
+            classify_create_error(Some(1), "first\nCLI exploded"),
+            CreateError::Other("CLI exploded".into())
+        );
     }
 
     #[test]

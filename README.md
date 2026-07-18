@@ -85,6 +85,10 @@ plugin location="zellij:flock-selector" {
     codespaces_enabled "true"
     devcontainers_enabled "true"
     coder_enabled "true"
+    coder_dotfiles_uri "https://github.com/example/dotfiles.git"
+    coder_dotfiles_branch "main"
+    // coder_dotfiles_parameter "dotfiles_uri"
+    // coder_dotfiles_branch_parameter "dotfiles_branch"
     remote_session_layout "~/.config/zellij/layouts/flock-remote.kdl"
 }
 
@@ -107,7 +111,20 @@ Coder uses the deployment currently authenticated by the Coder CLI. Its tab
 lists `coder list --output json`; opening a workspace creates a session whose
 default command is `coder ssh owner/name`, and Ctrl-x stops it with
 `coder stop -y owner/name`. Run `coder login <url>` before enabling the
-integration. GitHub Codespaces similarly requires an authenticated `gh` CLI,
+integration. In the Coder tab, Ctrl-a opens workspace creation: choose a Coder
+template, enter a name, and press Enter to start provisioning in the background.
+The selector returns to the workspace list instead of opening the new workspace.
+
+`coder_dotfiles_uri` is an optional, selector-only Git repository URL supplied
+at create time through Coder's conventional `dotfiles_uri` template parameter.
+Set `coder_dotfiles_branch` to supply the conventional `dotfiles_branch`
+parameter too. Override either parameter name with `coder_dotfiles_parameter`
+or `coder_dotfiles_branch_parameter`. Dotfiles are only applied when the
+selected template exposes these parameters; Flock does not install them after
+creation. See Coder's [create parameter defaults](https://coder.com/docs/reference/cli/create)
+and [workspace dotfiles guide](https://coder.com/docs/user-guides/workspace-dotfiles).
+
+GitHub Codespaces similarly requires an authenticated `gh` CLI,
 and devcontainers require the `devcontainer` CLI and Docker.
 
 ## How do I install it?

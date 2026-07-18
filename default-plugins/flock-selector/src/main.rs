@@ -123,6 +123,10 @@ struct State {
     coder_refreshing: bool,
     pending_coder_stop: Option<String>,
     coder_refresh_ticks: u8,
+    /// Coder-only workspace creation flow, opened lazily with Ctrl-a.
+    coder_create: Option<coder::CreateWizard>,
+    /// Cleared on the next refresh tick after a successful no-wait create.
+    coder_create_notice: Option<String>,
     /// The user's shared remote layout base (`remote_session_layout`, or the
     /// deprecated `codespace_session_layout` fallback), once read off the host.
     /// `None` (unset, unreadable, or not yet
@@ -186,6 +190,50 @@ mod tests {
     fn devcontainers_do_not_add_a_picker_tab() {
         let config = SelectorConfig { devcontainers_enabled: true, ..SelectorConfig::default() };
         assert_eq!(enabled_modes_for(&config), vec![PickerMode::Sessions, PickerMode::Projects]);
+    }
+
+    #[test]
+    fn coder_creation_keys_edit_filter_name_and_navigate_back() {
+        let mut state = State {
+            permissions_granted: true,
+            mode: PickerMode::Coder,
+            config: SelectorConfig {
+                coder_enabled: true,
+                ..SelectorConfig::default()
+            },
+            coder_create: Some(coder::CreateWizard::new(
+                Some(vec![coder::CoderTemplate {
+                    name: "rust".into(),
+                    display_name: "Rust Dev".into(),
+                    organization: "acme".into(),
+                }]),
+                false,
+            )),
+            ..State::default()
+        };
+        state.handle_coder_create_key(KeyWithModifier::new(BareKey::Char('r')));
+        assert_eq!(state.coder_create.as_ref().unwrap().filter, "r");
+        state.handle_coder_create_key(KeyWithModifier::new(BareKey::Backspace));
+        assert_eq!(state.coder_create.as_ref().unwrap().filter, "");
+        state.handle_coder_create_key(KeyWithModifier::new(BareKey::Enter));
+        assert_eq!(
+            state.coder_create.as_ref().unwrap().phase,
+            coder::CreatePhase::Name
+        );
+        for character in "my-space".chars() {
+            state.handle_coder_create_key(KeyWithModifier::new(BareKey::Char(character)));
+        }
+        assert_eq!(
+            state.coder_create.as_ref().unwrap().workspace_name,
+            "my-space"
+        );
+        state.handle_coder_create_key(KeyWithModifier::new(BareKey::Esc));
+        assert_eq!(
+            state.coder_create.as_ref().unwrap().phase,
+            coder::CreatePhase::Templates
+        );
+        state.handle_coder_create_key(KeyWithModifier::new(BareKey::Esc));
+        assert!(state.coder_create.is_none());
     }
 }
 
@@ -269,6 +317,7 @@ impl ZellijPlugin for State {
             },
             Event::Timer(_) => {
                 self.timer_running = false;
+                self.coder_create_notice = None;
                 if self.permissions_granted {
                     self.fire_scans();
                     if self.config.devcontainers_enabled {
@@ -351,6 +400,50 @@ impl ZellijPlugin for State {
                     // Whatever happened, re-list so the shown state reconciles
                     // with reality.
                     self.fire_codespace_list();
+                    should_render = true;
+                } else if self.config.coder_enabled
+                    && context.contains_key(coder::TEMPLATE_LIST_CONTEXT_KEY)
+                {
+                    if let Some(wizard) = self.coder_create.as_mut() {
+                        if exit_code == Some(0) {
+                            match coder::parse_template_list_json(&String::from_utf8_lossy(&stdout))
+                            {
+                                Ok(templates) => {
+                                    coder::save_template_cache(&templates);
+                                    wizard.set_templates(templates);
+                                },
+                                Err(error) => wizard.set_template_error(error),
+                            }
+                        } else {
+                            wizard.set_template_error(coder::classify_error(
+                                exit_code,
+                                &String::from_utf8_lossy(&stderr),
+                            ));
+                        }
+                    }
+                    should_render = true;
+                } else if self.config.coder_enabled
+                    && context.contains_key(coder::CREATE_CONTEXT_KEY)
+                {
+                    let name = context
+                        .get(coder::CREATE_CONTEXT_KEY)
+                        .cloned()
+                        .unwrap_or_default();
+                    if exit_code == Some(0) {
+                        self.coder_create = None;
+                        self.query.clear();
+                        self.reset_selection();
+                        self.coder_create_notice = Some(format!(
+                            "Workspace \"{}\" is provisioning in the background",
+                            name
+                        ));
+                        self.fire_coder_list();
+                    } else if let Some(wizard) = self.coder_create.as_mut() {
+                        wizard.fail_submit(coder::classify_create_error(
+                            exit_code,
+                            &String::from_utf8_lossy(&stderr),
+                        ));
+                    }
                     should_render = true;
                 } else if self.config.coder_enabled
                     && context.contains_key(coder::LIST_CONTEXT_KEY)
@@ -450,6 +543,8 @@ impl ZellijPlugin for State {
             coder_error: self.coder_error.as_ref(),
             coder_refreshing: self.coder_refreshing,
             pending_coder_stop: self.pending_coder_stop.as_deref(),
+            coder_create: self.coder_create.as_ref(),
+            coder_create_notice: self.coder_create_notice.as_deref(),
             pending_devcontainer: self.pending_devcontainer.as_ref(),
             palette: &self.palette,
             selected: self.selected,
@@ -463,8 +558,12 @@ impl ZellijPlugin for State {
             rows,
             cols,
         });
-        self.selected = output.selected;
-        self.scroll = output.scroll;
+        if let Some(wizard) = self.coder_create.as_mut() {
+            wizard.selected = output.selected;
+        } else {
+            self.selected = output.selected;
+            self.scroll = output.scroll;
+        }
         self.row_map = output.row_map;
         print!("{}", output.ansi);
     }
@@ -531,6 +630,9 @@ impl State {
         // into the query or list navigation until it resolves.
         if self.pending_devcontainer.is_some() {
             return self.handle_devcontainer_key(key);
+        }
+        if self.coder_create.is_some() {
+            return self.handle_coder_create_key(key);
         }
         // Navigation: in the reverse layout the best result sits at the bottom
         // (selected = 0), so Up moves toward worse results (higher on screen) and
@@ -605,6 +707,9 @@ impl State {
                 },
                 BareKey::Char('x') if self.mode == PickerMode::Sessions => {
                     return self.kill_selected_session();
+                },
+                BareKey::Char('a') if self.mode == PickerMode::Coder => {
+                    return self.open_coder_create();
                 },
                 _ => return false,
             }
@@ -750,6 +855,185 @@ impl State {
         run_command(&argv_refs, coder::list_context());
         self.coder_refreshing = true;
         self.coder_refresh_ticks = CODER_REFRESH_TICKS;
+    }
+
+    fn open_coder_create(&mut self) -> bool {
+        if !self.config.coder_enabled || !self.permissions_granted {
+            return false;
+        }
+        let cached = coder::load_template_cache();
+        let needs_load = cached.is_none();
+        self.coder_create = Some(coder::CreateWizard::new(
+            cached,
+            self.config.coder_dotfiles_uri.is_some(),
+        ));
+        self.coder_create_notice = None;
+        if needs_load {
+            self.fire_coder_template_list();
+        }
+        true
+    }
+
+    fn fire_coder_template_list(&mut self) {
+        let argv = coder::template_list_argv();
+        let argv_refs: Vec<&str> = argv.iter().map(String::as_str).collect();
+        run_command(&argv_refs, coder::template_list_context());
+        if let Some(wizard) = self.coder_create.as_mut() {
+            wizard.templates_loading = true;
+            wizard.template_error = None;
+        }
+    }
+
+    fn handle_coder_create_key(&mut self, key: KeyWithModifier) -> bool {
+        use coder::CreatePhase;
+
+        if key.has_no_modifiers() {
+            match key.bare_key {
+                BareKey::Esc => {
+                    let cancel = self
+                        .coder_create
+                        .as_mut()
+                        .is_some_and(|wizard| !wizard.back());
+                    if cancel {
+                        self.coder_create = None;
+                    }
+                    return true;
+                },
+                BareKey::Up => {
+                    if let Some(wizard) = self.coder_create.as_mut() {
+                        if wizard.phase == CreatePhase::Templates {
+                            let max = wizard.filtered_templates().len().saturating_sub(1);
+                            wizard.selected = (wizard.selected + 1).min(max);
+                        }
+                    }
+                    return true;
+                },
+                BareKey::Down => {
+                    if let Some(wizard) = self.coder_create.as_mut() {
+                        if wizard.phase == CreatePhase::Templates {
+                            wizard.selected = wizard.selected.saturating_sub(1);
+                        }
+                    }
+                    return true;
+                },
+                BareKey::Enter => {
+                    let retry_templates = self.coder_create.as_ref().is_some_and(|wizard| {
+                        wizard.phase == CreatePhase::Templates && wizard.template_error.is_some()
+                    });
+                    if retry_templates {
+                        self.fire_coder_template_list();
+                        return true;
+                    }
+                    let phase = self.coder_create.as_ref().map(|wizard| wizard.phase);
+                    match phase {
+                        Some(CreatePhase::Templates) => {
+                            if let Some(wizard) = self.coder_create.as_mut() {
+                                wizard.select_current_template();
+                            }
+                        },
+                        Some(CreatePhase::Name) => self.submit_coder_create(),
+                        Some(CreatePhase::Submitting) | None => {},
+                    }
+                    return true;
+                },
+                BareKey::Backspace => {
+                    if let Some(wizard) = self.coder_create.as_mut() {
+                        match wizard.phase {
+                            CreatePhase::Templates => {
+                                wizard.filter.pop();
+                                wizard.selected = 0;
+                            },
+                            CreatePhase::Name => {
+                                wizard.workspace_name.pop();
+                                wizard.create_error = None;
+                            },
+                            CreatePhase::Submitting => {},
+                        }
+                    }
+                    return true;
+                },
+                BareKey::Char(character) => {
+                    if let Some(wizard) = self.coder_create.as_mut() {
+                        match wizard.phase {
+                            CreatePhase::Templates => {
+                                wizard.filter.push(character);
+                                wizard.selected = 0;
+                            },
+                            CreatePhase::Name => {
+                                wizard.workspace_name.push(character);
+                                wizard.create_error = None;
+                            },
+                            CreatePhase::Submitting => {},
+                        }
+                    }
+                    return true;
+                },
+                _ => return false,
+            }
+        }
+        if key.has_modifiers(&[KeyModifier::Ctrl]) {
+            match key.bare_key {
+                BareKey::Char('u') => {
+                    if let Some(wizard) = self.coder_create.as_mut() {
+                        match wizard.phase {
+                            CreatePhase::Templates => wizard.filter.clear(),
+                            CreatePhase::Name => wizard.workspace_name.clear(),
+                            CreatePhase::Submitting => {},
+                        }
+                        wizard.selected = 0;
+                        wizard.create_error = None;
+                    }
+                    return true;
+                },
+                BareKey::Char('w') => {
+                    if let Some(wizard) = self.coder_create.as_mut() {
+                        let value = match wizard.phase {
+                            CreatePhase::Templates => &mut wizard.filter,
+                            CreatePhase::Name => &mut wizard.workspace_name,
+                            CreatePhase::Submitting => return true,
+                        };
+                        let trimmed = value.trim_end();
+                        match trimmed.rfind(char::is_whitespace) {
+                            Some(index) => value.truncate(index + 1),
+                            None => value.clear(),
+                        }
+                        wizard.selected = 0;
+                        wizard.create_error = None;
+                    }
+                    return true;
+                },
+                BareKey::Char('c') => {
+                    self.coder_create = None;
+                    return true;
+                },
+                _ => return false,
+            }
+        }
+        false
+    }
+
+    fn submit_coder_create(&mut self) {
+        let Some((name, template)) = self
+            .coder_create
+            .as_mut()
+            .and_then(|wizard| wizard.begin_submit())
+        else {
+            return;
+        };
+        let dotfiles = self
+            .config
+            .coder_dotfiles_uri
+            .as_deref()
+            .map(|uri| (self.config.coder_dotfiles_parameter.as_str(), uri));
+        let dotfiles_branch = self.config.coder_dotfiles_branch.as_deref().map(|branch| {
+            (
+                self.config.coder_dotfiles_branch_parameter.as_str(),
+                branch,
+            )
+        });
+        let argv = coder::create_argv(&name, &template, dotfiles, dotfiles_branch);
+        let argv_refs: Vec<&str> = argv.iter().map(String::as_str).collect();
+        run_command(&argv_refs, coder::create_context(&name));
     }
 
     fn bound_coder_workspace_names(&self) -> HashSet<String> {
