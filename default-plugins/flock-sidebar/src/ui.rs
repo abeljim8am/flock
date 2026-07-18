@@ -276,8 +276,8 @@ pub(crate) enum Row {
         activity: SessionActivity,
         is_current: bool,
         /// The session's remote binding, if any (parsed from its
-        /// `default_command`) — badged in the row: ⚡ codespace, ⬢ devcontainer,
-        /// or ASCII C for Coder.
+        /// `default_command`) — badged in the row: ☁ codespace/Coder or ⬢
+        /// devcontainer.
         binding: Option<crate::RemoteBinding>,
     },
     Agent(AgentEntry),
@@ -899,7 +899,7 @@ fn draw_row(
             ];
             match binding {
                 Some(crate::RemoteBinding::Codespace) => {
-                    spans.push(Span::new("⚡", p.blue));
+                    spans.push(Span::new("☁", p.blue));
                     spans.push(Span::new(" ", p.text));
                 },
                 Some(crate::RemoteBinding::Devcontainer) => {
@@ -907,7 +907,7 @@ fn draw_row(
                     spans.push(Span::new(" ", p.text));
                 },
                 Some(crate::RemoteBinding::Coder) => {
-                    spans.push(Span::new("C", p.yellow));
+                    spans.push(Span::new("☁", p.yellow));
                     spans.push(Span::new(" ", p.text));
                 },
                 None => {},
@@ -1204,16 +1204,18 @@ mod tests {
     }
 
     #[test]
-    fn coder_workspace_badge_is_ascii_c() {
-        let row = Row::Session {
-            name: "x".into(),
-            activity: SessionActivity::None,
-            is_current: false,
-            binding: Some(crate::RemoteBinding::Coder),
-        };
-        let mut output = String::new();
-        draw_row(&mut output, &row, 0, 20, false, 0, &Theme::default());
-        assert!(output.contains('C'));
+    fn cloud_workspace_badge_is_used_for_coder_and_codespaces() {
+        for binding in [crate::RemoteBinding::Coder, crate::RemoteBinding::Codespace] {
+            let row = Row::Session {
+                name: "x".into(),
+                activity: SessionActivity::None,
+                is_current: false,
+                binding: Some(binding),
+            };
+            let mut output = String::new();
+            draw_row(&mut output, &row, 0, 20, false, 0, &Theme::default());
+            assert!(output.contains('☁'));
+        }
     }
 
     #[test]
