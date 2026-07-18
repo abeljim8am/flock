@@ -111,7 +111,7 @@ Coder uses the deployment currently authenticated by the Coder CLI. Its tab
 lists `coder list --output json`; opening a workspace creates a session whose
 default command is `coder ssh owner/name`, and Ctrl-x stops it with
 `coder stop -y owner/name`. Run `coder login <url>` before enabling the
-integration. In the Coder tab, Ctrl-a opens workspace creation: choose a Coder
+integration. In the Coder tab, Ctrl-o opens workspace creation: choose a Coder
 template, enter a name, and press Enter to start provisioning in the background.
 The selector returns to the workspace list instead of opening the new workspace.
 

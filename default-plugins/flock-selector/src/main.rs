@@ -123,7 +123,7 @@ struct State {
     coder_refreshing: bool,
     pending_coder_stop: Option<String>,
     coder_refresh_ticks: u8,
-    /// Coder-only workspace creation flow, opened lazily with Ctrl-a.
+    /// Coder-only workspace creation flow, opened lazily with Ctrl-o.
     coder_create: Option<coder::CreateWizard>,
     /// Cleared on the next refresh tick after a successful no-wait create.
     coder_create_notice: Option<String>,
@@ -708,7 +708,7 @@ impl State {
                 BareKey::Char('x') if self.mode == PickerMode::Sessions => {
                     return self.kill_selected_session();
                 },
-                BareKey::Char('a') if self.mode == PickerMode::Coder => {
+                BareKey::Char('o') if self.mode == PickerMode::Coder => {
                     return self.open_coder_create();
                 },
                 _ => return false,

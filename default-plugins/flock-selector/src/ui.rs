@@ -410,7 +410,7 @@ fn render_header_row(
             PickerMode::Sessions => "Tab switch · Ctrl-x close ",
             PickerMode::Projects => "Tab ",
             PickerMode::Codespaces => "Tab switch · Ctrl-x stop ",
-            PickerMode::Coder => "Tab switch · Ctrl-a create · Ctrl-x stop ",
+            PickerMode::Coder => "Tab switch · Ctrl-o create · Ctrl-x stop ",
         }
     };
     let left_w: usize = spans.iter().map(|s| s.text.width()).sum();
