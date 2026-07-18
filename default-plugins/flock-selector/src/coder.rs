@@ -15,8 +15,6 @@ pub const TEMPLATE_LIST_CONTEXT_KEY: &str = "flock_coder_template_list";
 pub const CREATE_CONTEXT_KEY: &str = "flock_coder_create";
 
 const CACHE_PATH: &str = "/data/coder-workspaces.json";
-const TEMPLATE_CACHE_PATH: &str = "/data/coder-templates.json";
-const CACHE_TTL_SECS: u64 = 300;
 const FALLBACK_NAME: &str = "coder";
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -268,6 +266,10 @@ pub fn parse_template_list_json(raw: &str) -> Result<Vec<CoderTemplate>, CoderEr
         .ok_or_else(|| CoderError::MalformedJson("expected a JSON array".into()))?;
     let mut templates = Vec::with_capacity(entries.len());
     for entry in entries {
+        // Newer Coder CLI versions serialize the API response wrapper, placing
+        // the template fields under a `Template` key. Older versions returned
+        // the template object directly, so accept both response shapes.
+        let entry = entry.get("Template").unwrap_or(entry);
         let Some(name) = string_field(entry, &["name"]).filter(|name| !name.trim().is_empty())
         else {
             continue;
@@ -341,21 +343,14 @@ struct CacheEnvelope {
     workspaces: Vec<CoderWorkspace>,
 }
 
-#[derive(serde::Serialize, serde::Deserialize)]
-struct TemplateCacheEnvelope {
-    saved_at: u64,
-    templates: Vec<CoderTemplate>,
-}
-
 pub fn load_cache() -> Vec<CoderWorkspace> {
-    load_cache_from(Path::new(CACHE_PATH), now_secs())
+    load_cache_from(Path::new(CACHE_PATH))
 }
 
-fn load_cache_from(path: &Path, now: u64) -> Vec<CoderWorkspace> {
+fn load_cache_from(path: &Path) -> Vec<CoderWorkspace> {
     std::fs::read_to_string(path)
         .ok()
         .and_then(|raw| serde_json::from_str::<CacheEnvelope>(&raw).ok())
-        .filter(|cache| now.saturating_sub(cache.saved_at) <= CACHE_TTL_SECS)
         .map(|cache| cache.workspaces)
         .unwrap_or_default()
 }
@@ -367,28 +362,6 @@ pub fn save_cache(workspaces: &[CoderWorkspace]) {
     };
     if let Ok(raw) = serde_json::to_string(&cache) {
         let _ = std::fs::write(CACHE_PATH, raw);
-    }
-}
-
-pub fn load_template_cache() -> Option<Vec<CoderTemplate>> {
-    load_template_cache_from(Path::new(TEMPLATE_CACHE_PATH), now_secs())
-}
-
-fn load_template_cache_from(path: &Path, now: u64) -> Option<Vec<CoderTemplate>> {
-    std::fs::read_to_string(path)
-        .ok()
-        .and_then(|raw| serde_json::from_str::<TemplateCacheEnvelope>(&raw).ok())
-        .filter(|cache| now.saturating_sub(cache.saved_at) <= CACHE_TTL_SECS)
-        .map(|cache| cache.templates)
-}
-
-pub fn save_template_cache(templates: &[CoderTemplate]) {
-    let cache = TemplateCacheEnvelope {
-        saved_at: now_secs(),
-        templates: templates.to_vec(),
-    };
-    if let Ok(raw) = serde_json::to_string(&cache) {
-        let _ = std::fs::write(TEMPLATE_CACHE_PATH, raw);
     }
 }
 
@@ -464,11 +437,11 @@ pub struct CreateWizard {
 }
 
 impl CreateWizard {
-    pub fn new(cached: Option<Vec<CoderTemplate>>, dotfiles_configured: bool) -> Self {
+    pub fn new(templates: Option<Vec<CoderTemplate>>, dotfiles_configured: bool) -> Self {
         Self {
             phase: CreatePhase::Templates,
-            templates_loading: cached.is_none(),
-            templates: cached.unwrap_or_default(),
+            templates_loading: templates.is_none(),
+            templates: templates.unwrap_or_default(),
             template_error: None,
             filter: String::new(),
             selected: 0,
@@ -764,6 +737,26 @@ mod tests {
     }
 
     #[test]
+    fn parses_templates_wrapped_by_current_coder_cli() {
+        let parsed = parse_template_list_json(
+            r#"[
+              {
+                "Template": {
+                  "id": "31715e2d-421e-4477-97c7-3468c34197ae",
+                  "organization_name": "coder",
+                  "organization_display_name": "Coder",
+                  "name": "wooli",
+                  "display_name": ""
+                }
+              }
+            ]"#,
+        )
+        .unwrap();
+
+        assert_eq!(parsed, vec![template("coder", "wooli", "wooli")]);
+    }
+
+    #[test]
     fn create_argv_is_exact_and_values_remain_single_arguments() {
         let selected = template("my org; echo nope", "rust template", "Rust");
         assert_eq!(
@@ -814,25 +807,6 @@ mod tests {
                 "personal_branch=release; $(nope)",
             ]
         );
-    }
-
-    #[test]
-    fn template_cache_preserves_empty_results_and_expires() {
-        let path = std::env::temp_dir().join(format!(
-            "flock-coder-template-cache-{}.json",
-            std::process::id()
-        ));
-        let cache = TemplateCacheEnvelope {
-            saved_at: 100,
-            templates: vec![],
-        };
-        std::fs::write(&path, serde_json::to_string(&cache).unwrap()).unwrap();
-        assert_eq!(
-            load_template_cache_from(&path, 100 + CACHE_TTL_SECS),
-            Some(vec![])
-        );
-        assert_eq!(load_template_cache_from(&path, 101 + CACHE_TTL_SECS), None);
-        let _ = std::fs::remove_file(path);
     }
 
     #[test]
@@ -950,7 +924,7 @@ mod tests {
     }
 
     #[test]
-    fn cache_expires() {
+    fn cache_loads_stale_results_for_background_refresh() {
         let path =
             std::env::temp_dir().join(format!("flock-coder-cache-{}.json", std::process::id()));
         let cache = CacheEnvelope {
@@ -958,8 +932,7 @@ mod tests {
             workspaces: vec![workspace("alice", "api")],
         };
         std::fs::write(&path, serde_json::to_string(&cache).unwrap()).unwrap();
-        assert_eq!(load_cache_from(&path, 100 + CACHE_TTL_SECS).len(), 1);
-        assert!(load_cache_from(&path, 101 + CACHE_TTL_SECS).is_empty());
+        assert_eq!(load_cache_from(&path).len(), 1);
         let _ = std::fs::remove_file(path);
     }
 

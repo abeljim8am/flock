@@ -409,7 +409,6 @@ impl ZellijPlugin for State {
                             match coder::parse_template_list_json(&String::from_utf8_lossy(&stdout))
                             {
                                 Ok(templates) => {
-                                    coder::save_template_cache(&templates);
                                     wizard.set_templates(templates);
                                 },
                                 Err(error) => wizard.set_template_error(error),
@@ -861,16 +860,12 @@ impl State {
         if !self.config.coder_enabled || !self.permissions_granted {
             return false;
         }
-        let cached = coder::load_template_cache();
-        let needs_load = cached.is_none();
         self.coder_create = Some(coder::CreateWizard::new(
-            cached,
+            None,
             self.config.coder_dotfiles_uri.is_some(),
         ));
         self.coder_create_notice = None;
-        if needs_load {
-            self.fire_coder_template_list();
-        }
+        self.fire_coder_template_list();
         true
     }
 
