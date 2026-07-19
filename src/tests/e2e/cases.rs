@@ -732,7 +732,7 @@ pub fn close_pane() {
 
 #[test]
 #[ignore]
-pub fn exit_zellij() {
+pub fn exit_flock() {
     let fake_win_size = Size {
         cols: 120,
         rows: 24,
@@ -771,7 +771,7 @@ pub fn exit_zellij() {
 
 #[test]
 #[ignore]
-pub fn closing_last_pane_exits_zellij() {
+pub fn closing_last_pane_exits_flock() {
     let fake_win_size = Size {
         cols: 120,
         rows: 24,
@@ -1141,8 +1141,8 @@ pub fn detach_and_attach_session() {
                     if !remote_terminal.status_bar_appears()
                         && remote_terminal.snapshot_contains("Bye from Flock!")
                     {
-                        // we don't see the toolbar and Zellij's exit message is visible,
-                        // so Zellij has fully exited and the server is ready to accept connections
+                        // we don't see the toolbar and Flock's exit message is visible,
+                        // so Flock has fully exited and the server is ready to accept connections
                         remote_terminal.attach_to_original_session();
                         step_is_complete = true;
                     }
@@ -2890,7 +2890,7 @@ pub fn override_layout_from_default_to_compact() {
             .add_step(Step {
                 name: "Override to compact layout",
                 instruction: |mut remote_terminal: RemoteTerminal| -> bool {
-                    remote_terminal.run_zellij_action("override-layout compact");
+                    remote_terminal.run_flock_action("override-layout compact");
                     std::thread::sleep(std::time::Duration::from_millis(500));
                     remote_terminal.send_key(&ENTER);
                     true

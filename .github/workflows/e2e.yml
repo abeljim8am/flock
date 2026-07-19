@@ -21,6 +21,7 @@ jobs:
   test-e2e:
     name: Build generic binary and run tests on it
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     services:
       ssh:
         image: lscr.io/linuxserver/openssh-server:latest
@@ -33,7 +34,7 @@ jobs:
           USER_NAME: test
         ports:
           - 2222:2222
-        options: -v ${{ github.workspace }}/target:/usr/src/zellij --name ssh
+        options: -v ${{ github.workspace }}/target:/usr/src/flock --name ssh
     steps:
     - uses: actions/checkout@v7
 

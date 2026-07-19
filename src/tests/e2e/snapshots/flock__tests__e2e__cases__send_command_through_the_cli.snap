@@ -3,9 +3,9 @@ source: src/tests/e2e/cases.rs
 expression: last_snapshot
 ---
  Zellij (e2e-test)  Tab #1                                                                                                    Alt <[]>  VERTICAL 
-┌ Pane #1 ────────────────────────────────────────────────────────────────┐┌ /usr/src/zellij/fixtures/append-echo-script.sh ─────────────────────────┐
-│$ /usr/src/zellij/zellij run -s -- "/usr/src/zellij/fixtures/append-echo-││foo                                                                      │
-│script.sh"                                                               ││foo                                                                      │
+┌ Pane #1 ────────────────────────────────────────────────────────────────┐┌ /usr/src/flock/fixtures/append-echo-script.sh ──────────────────────────┐
+│$ /usr/src/flock/flock run -s -- "/usr/src/flock/fixtures/append-echo-scr││foo                                                                      │
+│ipt.sh"                                                                  ││foo                                                                      │
 │terminal_1                                                               ││█                                                                        │
 │$                                                                        ││                                                                         │
 │$                                                                        ││                                                                         │

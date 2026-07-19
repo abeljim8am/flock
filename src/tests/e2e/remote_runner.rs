@@ -17,18 +17,18 @@ use std::path::Path;
 use std::cell::RefCell;
 use std::rc::Rc;
 
-const ZELLIJ_EXECUTABLE_LOCATION: &str = "/usr/src/zellij/zellij";
+const FLOCK_EXECUTABLE_LOCATION: &str = "/usr/src/flock/flock";
 const SET_ENV_VARIABLES: &str = "EDITOR=/usr/bin/vi";
-const ZELLIJ_CONFIG_PATH: &str = "/usr/src/zellij/fixtures/configs";
-const ZELLIJ_CONFIG_DIRS_PATH: &str = "/usr/src/zellij/fixtures/config-dirs";
-const ZELLIJ_DATA_DIR: &str = "/usr/src/zellij/e2e-data";
-const ZELLIJ_FIXTURE_PATH: &str = "/usr/src/zellij/fixtures";
+const FLOCK_CONFIG_PATH: &str = "/usr/src/flock/fixtures/configs";
+const FLOCK_CONFIG_DIRS_PATH: &str = "/usr/src/flock/fixtures/config-dirs";
+const FLOCK_DATA_DIR: &str = "/usr/src/flock/e2e-data";
+const FLOCK_FIXTURE_PATH: &str = "/usr/src/flock/fixtures";
 const CONNECTION_STRING: &str = "127.0.0.1:2222";
 const CONNECTION_USERNAME: &str = "test";
 const CONNECTION_PASSWORD: &str = "test";
 const SESSION_NAME: &str = "e2e-test";
 const RETRIES: usize = 10;
-const CLEANUP_DONE_MARKER: &str = "__ZELLIJ_CLEANUP_DONE__";
+const CLEANUP_DONE_MARKER: &str = "__FLOCK_CLEANUP_DONE__";
 
 fn ssh_connect() -> ssh2::Session {
     let tcp = TcpStream::connect(CONNECTION_STRING).unwrap();
@@ -60,12 +60,12 @@ fn setup_remote_environment(channel: &mut ssh2::Channel, win_size: Size) {
     channel.flush().unwrap();
 }
 
-fn stop_zellij(channel: &mut ssh2::Channel) {
+fn stop_flock(channel: &mut ssh2::Channel) {
     // here we remove the status-bar-tips cache to make sure only the quicknav tip is loaded
     channel
         .write_all(b"find /tmp | grep status-bar-tips | xargs rm\n")
         .unwrap();
-    channel.write_all(b"killall -KILL zellij\n").unwrap();
+    channel.write_all(b"killall -KILL flock\n").unwrap();
     channel.write_all(b"rm -rf /tmp/*\n").unwrap(); // remove temporary artifacts from previous
                                                     // tests
     channel.write_all(b"rm -rf /tmp/*\n").unwrap(); // remove temporary artifacts from previous
@@ -80,18 +80,18 @@ fn stop_zellij(channel: &mut ssh2::Channel) {
     // x86_64 (CI) and aarch64 (Apple Silicon local dev)
     channel
         .write_all(
-            b"ln -sf /usr/src/zellij/$(uname -m)-unknown-linux-musl/release/zellij /usr/src/zellij/zellij\n",
+            b"ln -sf /usr/src/flock/$(uname -m)-unknown-linux-musl/release/flock /usr/src/flock/flock\n",
         )
         .unwrap();
 }
 
-fn start_zellij(channel: &mut ssh2::Channel) {
-    stop_zellij(channel);
+fn start_flock(channel: &mut ssh2::Channel) {
+    stop_flock(channel);
     channel
         .write_all(
             format!(
                 "{} {} --session {} --data-dir {} options --show-release-notes false --show-startup-tips false\n",
-                SET_ENV_VARIABLES, ZELLIJ_EXECUTABLE_LOCATION, SESSION_NAME, ZELLIJ_DATA_DIR
+                SET_ENV_VARIABLES, FLOCK_EXECUTABLE_LOCATION, SESSION_NAME, FLOCK_DATA_DIR
             )
             .as_bytes(),
         )
@@ -99,13 +99,13 @@ fn start_zellij(channel: &mut ssh2::Channel) {
     channel.flush().unwrap();
 }
 
-fn start_zellij_with_config_dir(channel: &mut ssh2::Channel, config_dir: &str) {
-    stop_zellij(channel);
+fn start_flock_with_config_dir(channel: &mut ssh2::Channel, config_dir: &str) {
+    stop_flock(channel);
     channel
         .write_all(
             format!(
                 "{} {} --session {} --data-dir {} --config-dir {} options --show-release-notes false --show-startup-tips false\n",
-                SET_ENV_VARIABLES, ZELLIJ_EXECUTABLE_LOCATION, SESSION_NAME, ZELLIJ_DATA_DIR, format!("{}/{}", ZELLIJ_CONFIG_DIRS_PATH, config_dir)
+                SET_ENV_VARIABLES, FLOCK_EXECUTABLE_LOCATION, SESSION_NAME, FLOCK_DATA_DIR, format!("{}/{}", FLOCK_CONFIG_DIRS_PATH, config_dir)
             )
             .as_bytes(),
         )
@@ -113,13 +113,13 @@ fn start_zellij_with_config_dir(channel: &mut ssh2::Channel, config_dir: &str) {
     channel.flush().unwrap();
 }
 
-fn start_zellij_mirrored_session(channel: &mut ssh2::Channel) {
-    stop_zellij(channel);
+fn start_flock_mirrored_session(channel: &mut ssh2::Channel) {
+    stop_flock(channel);
     channel
         .write_all(
             format!(
                 "{} {} --session {} --data-dir {} options --show-release-notes false --show-startup-tips false --mirror-session true --serialization-interval 1\n",
-                SET_ENV_VARIABLES, ZELLIJ_EXECUTABLE_LOCATION, SESSION_NAME, ZELLIJ_DATA_DIR
+                SET_ENV_VARIABLES, FLOCK_EXECUTABLE_LOCATION, SESSION_NAME, FLOCK_DATA_DIR
             )
             .as_bytes(),
         )
@@ -127,17 +127,17 @@ fn start_zellij_mirrored_session(channel: &mut ssh2::Channel) {
     channel.flush().unwrap();
 }
 
-fn start_zellij_mirrored_session_with_layout(channel: &mut ssh2::Channel, layout_file_name: &str) {
-    stop_zellij(channel);
+fn start_flock_mirrored_session_with_layout(channel: &mut ssh2::Channel, layout_file_name: &str) {
+    stop_flock(channel);
     channel
         .write_all(
             format!(
                 "{} {} --session {} --data-dir {} --new-session-with-layout {} options --show-release-notes false --show-startup-tips false --mirror-session true --serialization-interval 1\n",
                 SET_ENV_VARIABLES,
-                ZELLIJ_EXECUTABLE_LOCATION,
+                FLOCK_EXECUTABLE_LOCATION,
                 SESSION_NAME,
-                ZELLIJ_DATA_DIR,
-                format!("{}/{}", ZELLIJ_FIXTURE_PATH, layout_file_name)
+                FLOCK_DATA_DIR,
+                format!("{}/{}", FLOCK_FIXTURE_PATH, layout_file_name)
             )
             .as_bytes(),
         )
@@ -145,20 +145,20 @@ fn start_zellij_mirrored_session_with_layout(channel: &mut ssh2::Channel, layout
     channel.flush().unwrap();
 }
 
-fn start_zellij_mirrored_session_with_layout_and_viewport_serialization(
+fn start_flock_mirrored_session_with_layout_and_viewport_serialization(
     channel: &mut ssh2::Channel,
     layout_file_name: &str,
 ) {
-    stop_zellij(channel);
+    stop_flock(channel);
     channel
         .write_all(
             format!(
                 "{} {} --session {} --data-dir {} --new-session-with-layout {} options --show-release-notes false --show-startup-tips false --mirror-session true --serialize-pane-viewport true --serialization-interval 1\n",
                 SET_ENV_VARIABLES,
-                ZELLIJ_EXECUTABLE_LOCATION,
+                FLOCK_EXECUTABLE_LOCATION,
                 SESSION_NAME,
-                ZELLIJ_DATA_DIR,
-                format!("{}/{}", ZELLIJ_FIXTURE_PATH, layout_file_name)
+                FLOCK_DATA_DIR,
+                format!("{}/{}", FLOCK_FIXTURE_PATH, layout_file_name)
             )
             .as_bytes(),
         )
@@ -166,16 +166,16 @@ fn start_zellij_mirrored_session_with_layout_and_viewport_serialization(
     channel.flush().unwrap();
 }
 
-fn start_zellij_in_session(channel: &mut ssh2::Channel, session_name: &str, mirrored: bool) {
-    stop_zellij(channel);
+fn start_flock_in_session(channel: &mut ssh2::Channel, session_name: &str, mirrored: bool) {
+    stop_flock(channel);
     channel
         .write_all(
             format!(
                 "{} {} --session {} --data-dir {} options --show-release-notes false --show-startup-tips false --mirror-session {}\n",
                 SET_ENV_VARIABLES,
-                ZELLIJ_EXECUTABLE_LOCATION,
+                FLOCK_EXECUTABLE_LOCATION,
                 session_name,
-                ZELLIJ_DATA_DIR,
+                FLOCK_DATA_DIR,
                 mirrored
             )
             .as_bytes(),
@@ -189,7 +189,7 @@ fn attach_to_existing_session(channel: &mut ssh2::Channel, session_name: &str) {
         .write_all(
             format!(
                 "{} {} attach {}\n",
-                SET_ENV_VARIABLES, ZELLIJ_EXECUTABLE_LOCATION, session_name
+                SET_ENV_VARIABLES, FLOCK_EXECUTABLE_LOCATION, session_name
             )
             .as_bytes(),
         )
@@ -202,7 +202,7 @@ fn watch_existing_session(channel: &mut ssh2::Channel, session_name: &str) {
         .write_all(
             format!(
                 "{} {} watch {}\n",
-                SET_ENV_VARIABLES, ZELLIJ_EXECUTABLE_LOCATION, session_name
+                SET_ENV_VARIABLES, FLOCK_EXECUTABLE_LOCATION, session_name
             )
             .as_bytes(),
         )
@@ -210,13 +210,13 @@ fn watch_existing_session(channel: &mut ssh2::Channel, session_name: &str) {
     channel.flush().unwrap();
 }
 
-fn start_zellij_without_frames(channel: &mut ssh2::Channel) {
-    stop_zellij(channel);
+fn start_flock_without_frames(channel: &mut ssh2::Channel) {
+    stop_flock(channel);
     channel
         .write_all(
             format!(
                 "{} {} --session {} --data-dir {} options --show-release-notes false --show-startup-tips false --pane-frames false\n",
-                SET_ENV_VARIABLES, ZELLIJ_EXECUTABLE_LOCATION, SESSION_NAME, ZELLIJ_DATA_DIR
+                SET_ENV_VARIABLES, FLOCK_EXECUTABLE_LOCATION, SESSION_NAME, FLOCK_DATA_DIR
             )
             .as_bytes(),
         )
@@ -224,17 +224,17 @@ fn start_zellij_without_frames(channel: &mut ssh2::Channel) {
     channel.flush().unwrap();
 }
 
-fn start_zellij_with_config(channel: &mut ssh2::Channel, config_path: &str) {
-    stop_zellij(channel);
+fn start_flock_with_config(channel: &mut ssh2::Channel, config_path: &str) {
+    stop_flock(channel);
     channel
         .write_all(
             format!(
                 "{} {} --config {} --session {} --data-dir {} options --show-release-notes false --show-startup-tips false\n",
                 SET_ENV_VARIABLES,
-                ZELLIJ_EXECUTABLE_LOCATION,
+                FLOCK_EXECUTABLE_LOCATION,
                 config_path,
                 SESSION_NAME,
-                ZELLIJ_DATA_DIR
+                FLOCK_DATA_DIR
             )
             .as_bytes(),
         )
@@ -476,20 +476,20 @@ impl RemoteTerminal {
             let mut channel = self.channel.lock().unwrap();
             channel
                 .write_all(
-                    format!("{} attach {}\n", ZELLIJ_EXECUTABLE_LOCATION, SESSION_NAME).as_bytes(),
+                    format!("{} attach {}\n", FLOCK_EXECUTABLE_LOCATION, SESSION_NAME).as_bytes(),
                 )
                 .unwrap();
             channel.flush().unwrap();
-        } // release mutex before sleeping so the reader thread can process Zellij's startup output
-        std::thread::sleep(std::time::Duration::from_secs(1)); // wait until Zellij stops parsing startup ANSI codes from the terminal STDIN
+        } // release mutex before sleeping so the reader thread can process Flock's startup output
+        std::thread::sleep(std::time::Duration::from_secs(1)); // wait until Flock stops parsing startup ANSI codes from the terminal STDIN
     }
-    pub fn run_zellij_action(&mut self, action_and_arguments: &str) {
+    pub fn run_flock_action(&mut self, action_and_arguments: &str) {
         let mut channel = self.channel.lock().unwrap();
         channel
             .write_all(
                 format!(
                     "{} action {}",
-                    ZELLIJ_EXECUTABLE_LOCATION, action_and_arguments
+                    FLOCK_EXECUTABLE_LOCATION, action_and_arguments
                 )
                 .as_bytes(),
             )
@@ -501,7 +501,7 @@ impl RemoteTerminal {
         channel
             .write_all(
                 // note that this is run with the -s flag that suspends the command on startup
-                format!("{} run -s -- \"{}\"", ZELLIJ_EXECUTABLE_LOCATION, command).as_bytes(),
+                format!("{} run -s -- \"{}\"", FLOCK_EXECUTABLE_LOCATION, command).as_bytes(),
             )
             .unwrap();
         channel.flush().unwrap();
@@ -512,7 +512,7 @@ impl RemoteTerminal {
             .write_all(
                 format!(
                     "{} run --blocking --floating --close-on-exit -- {}",
-                    ZELLIJ_EXECUTABLE_LOCATION, command
+                    FLOCK_EXECUTABLE_LOCATION, command
                 )
                 .as_bytes(),
             )
@@ -520,12 +520,12 @@ impl RemoteTerminal {
         channel.flush().unwrap();
     }
     pub fn path_to_fixture_folder(&self) -> String {
-        ZELLIJ_FIXTURE_PATH.to_string()
+        FLOCK_FIXTURE_PATH.to_string()
     }
     pub fn load_fixture(&mut self, name: &str) {
         let mut channel = self.channel.lock().unwrap();
         channel
-            .write_all(format!("cat {ZELLIJ_FIXTURE_PATH}/{name}\n").as_bytes())
+            .write_all(format!("cat {FLOCK_FIXTURE_PATH}/{name}\n").as_bytes())
             .unwrap();
         channel.flush().unwrap();
     }
@@ -569,7 +569,7 @@ impl RemoteRunner {
             logical_position: None,
         };
         setup_remote_environment(&mut channel, win_size);
-        start_zellij(&mut channel);
+        start_flock(&mut channel);
         let channel = Arc::new(Mutex::new(channel));
         let last_snapshot = Arc::new(Mutex::new(String::new()));
         let cursor_coordinates = Arc::new(Mutex::new((0, 0)));
@@ -608,7 +608,7 @@ impl RemoteRunner {
             logical_position: None,
         };
         setup_remote_environment(&mut channel, win_size);
-        start_zellij_with_config_dir(&mut channel, config_dir_name);
+        start_flock_with_config_dir(&mut channel, config_dir_name);
         let channel = Arc::new(Mutex::new(channel));
         let last_snapshot = Arc::new(Mutex::new(String::new()));
         let cursor_coordinates = Arc::new(Mutex::new((0, 0)));
@@ -647,7 +647,7 @@ impl RemoteRunner {
             logical_position: None,
         };
         setup_remote_environment(&mut channel, win_size);
-        start_zellij_mirrored_session(&mut channel);
+        start_flock_mirrored_session(&mut channel);
         let channel = Arc::new(Mutex::new(channel));
         let last_snapshot = Arc::new(Mutex::new(String::new()));
         let cursor_coordinates = Arc::new(Mutex::new((0, 0)));
@@ -686,7 +686,7 @@ impl RemoteRunner {
             logical_position: None,
         };
         setup_remote_environment(&mut channel, win_size);
-        start_zellij_mirrored_session_with_layout(&mut channel, layout_file_name);
+        start_flock_mirrored_session_with_layout(&mut channel, layout_file_name);
         let channel = Arc::new(Mutex::new(channel));
         let last_snapshot = Arc::new(Mutex::new(String::new()));
         let cursor_coordinates = Arc::new(Mutex::new((0, 0)));
@@ -728,7 +728,7 @@ impl RemoteRunner {
             logical_position: None,
         };
         setup_remote_environment(&mut channel, win_size);
-        start_zellij_mirrored_session_with_layout_and_viewport_serialization(
+        start_flock_mirrored_session_with_layout_and_viewport_serialization(
             &mut channel,
             layout_file_name,
         );
@@ -757,7 +757,7 @@ impl RemoteRunner {
         let sess = ssh_connect();
         let mut channel = sess.channel_session().unwrap();
         setup_remote_environment(&mut channel, win_size);
-        stop_zellij(&mut channel);
+        stop_flock(&mut channel);
         channel
             .write_all(format!("printf '{}\\n'\n", CLEANUP_DONE_MARKER).as_bytes())
             .unwrap();
@@ -783,7 +783,7 @@ impl RemoteRunner {
             logical_position: None,
         };
         setup_remote_environment(&mut channel, win_size);
-        start_zellij_in_session(&mut channel, session_name, mirrored);
+        start_flock_in_session(&mut channel, session_name, mirrored);
         let channel = Arc::new(Mutex::new(channel));
         let last_snapshot = Arc::new(Mutex::new(String::new()));
         let cursor_coordinates = Arc::new(Mutex::new((0, 0)));
@@ -900,7 +900,7 @@ impl RemoteRunner {
             logical_position: None,
         };
         setup_remote_environment(&mut channel, win_size);
-        start_zellij_without_frames(&mut channel);
+        start_flock_without_frames(&mut channel);
         let channel = Arc::new(Mutex::new(channel));
         let last_snapshot = Arc::new(Mutex::new(String::new()));
         let cursor_coordinates = Arc::new(Mutex::new((0, 0)));
@@ -923,7 +923,7 @@ impl RemoteRunner {
         }
     }
     pub fn new_with_config(win_size: Size, config_file_name: &'static str) -> Self {
-        let remote_path = Path::new(ZELLIJ_CONFIG_PATH).join(config_file_name);
+        let remote_path = Path::new(FLOCK_CONFIG_PATH).join(config_file_name);
         let sess = ssh_connect();
         let mut channel = sess.channel_session().unwrap();
         let mut rows = Dimension::fixed(win_size.rows);
@@ -940,7 +940,7 @@ impl RemoteRunner {
             logical_position: None,
         };
         setup_remote_environment(&mut channel, win_size);
-        start_zellij_with_config(&mut channel, &remote_path.to_string_lossy());
+        start_flock_with_config(&mut channel, &remote_path.to_string_lossy());
         let channel = Arc::new(Mutex::new(channel));
         let last_snapshot = Arc::new(Mutex::new(String::new()));
         let cursor_coordinates = Arc::new(Mutex::new((0, 0)));
