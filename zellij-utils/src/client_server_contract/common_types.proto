@@ -1174,6 +1174,9 @@ message Options {
   optional bool mouse_click_through = 45;
   optional string theme_dark = 46;
   optional string theme_light = 47;
+  // Command + args every new pane/tab runs instead of the default shell
+  // (layout-injected per-session binding). Empty means unset.
+  repeated string default_command = 48;
 }
 
 enum OnForceClose {

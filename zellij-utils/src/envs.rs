@@ -1,4 +1,4 @@
-/// Uniformly operates ZELLIJ* environment variables
+/// Uniformly operates Flock's process environment variables.
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::{
@@ -8,7 +8,7 @@ use std::{
 
 use std::fmt;
 
-pub const ZELLIJ_ENV_KEY: &str = "ZELLIJ";
+pub const ZELLIJ_ENV_KEY: &str = "FLOCK";
 pub fn get_zellij() -> Result<String> {
     Ok(var(ZELLIJ_ENV_KEY)?)
 }
@@ -16,7 +16,7 @@ pub fn set_zellij(v: String) {
     set_var(ZELLIJ_ENV_KEY, v);
 }
 
-pub const SESSION_NAME_ENV_KEY: &str = "ZELLIJ_SESSION_NAME";
+pub const SESSION_NAME_ENV_KEY: &str = "FLOCK_SESSION_NAME";
 
 pub fn get_session_name() -> Result<String> {
     Ok(var(SESSION_NAME_ENV_KEY)?)
@@ -26,9 +26,16 @@ pub fn set_session_name(v: String) {
     set_var(SESSION_NAME_ENV_KEY, v);
 }
 
-pub const SOCKET_DIR_ENV_KEY: &str = "ZELLIJ_SOCKET_DIR";
+pub const SOCKET_DIR_ENV_KEY: &str = "FLOCK_SOCKET_DIR";
 pub fn get_socket_dir() -> Result<String> {
     Ok(var(SOCKET_DIR_ENV_KEY)?)
+}
+
+pub const PANE_ID_ENV_KEY: &str = "FLOCK_PANE_ID";
+pub const EXECUTABLE_ENV_KEY: &str = "FLOCK_EXECUTABLE";
+
+pub fn set_executable(v: String) {
+    set_var(EXECUTABLE_ENV_KEY, v);
 }
 
 /// Manage ENVIRONMENT VARIABLES from the configuration and the layout files
@@ -66,5 +73,19 @@ impl EnvironmentVariables {
     }
     pub fn inner(&self) -> &HashMap<String, String> {
         &self.env
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn flock_runtime_environment_is_not_shared_with_zellij() {
+        assert_eq!(ZELLIJ_ENV_KEY, "FLOCK");
+        assert_eq!(SESSION_NAME_ENV_KEY, "FLOCK_SESSION_NAME");
+        assert_eq!(SOCKET_DIR_ENV_KEY, "FLOCK_SOCKET_DIR");
+        assert_eq!(PANE_ID_ENV_KEY, "FLOCK_PANE_ID");
+        assert_eq!(EXECUTABLE_ENV_KEY, "FLOCK_EXECUTABLE");
     }
 }

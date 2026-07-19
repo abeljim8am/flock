@@ -201,3 +201,165 @@ fn spawn_and_read_output() {
         output_str
     );
 }
+
+// --- Foreground command resolution through the process tree ---
+
+fn entry(pid: u32, ppid: u32, pgid: u32, foreground: bool, cmd: &[&str]) -> ProcessEntry {
+    ProcessEntry {
+        pid,
+        ppid,
+        pgid,
+        foreground,
+        cmd: cmd.iter().map(|p| p.to_string()).collect(),
+    }
+}
+
+#[test]
+fn foreground_cmd_resolves_direct_child() {
+    // fish(10) → claude(20): claude leads the tty's foreground group.
+    let table = vec![entry(20, 10, 20, true, &["claude"])];
+    assert_eq!(
+        foreground_descendant_cmd(&table, 10),
+        Some(vec!["claude".to_string()])
+    );
+}
+
+#[test]
+fn foreground_cmd_sees_through_devenv_wrapper() {
+    // Observed live devenv topology: the wrapper chain stays in the *outer*
+    // shell's process group (foreground on the outer tty but never a group
+    // leader), the inner shell is a session leader on a nested pty without
+    // the foreground flag, and the agent leads the nested pty's foreground
+    // group. Only the agent satisfies `foreground && pid == pgid`.
+    let table = vec![
+        entry(
+            20,
+            10,
+            10,
+            true,
+            &["fish", "--no-config", "-c", "devenv shell"],
+        ),
+        entry(30, 20, 10, true, &["devenv", "shell"]),
+        entry(40, 30, 40, false, &["zsh", "-i"]),
+        entry(50, 40, 50, true, &["claude", "--continue"]),
+    ];
+    assert_eq!(
+        foreground_descendant_cmd(&table, 10),
+        Some(vec!["claude".to_string(), "--continue".to_string()])
+    );
+}
+
+#[test]
+fn foreground_cmd_resolves_inner_shell_when_agent_exits_in_devenv() {
+    // Same topology after the agent exits: the inner shell takes the nested
+    // pty's foreground group back, so it is the deepest leader and the pane
+    // reads as a plain shell again (not as the devenv wrapper).
+    let table = vec![
+        entry(
+            20,
+            10,
+            10,
+            true,
+            &["fish", "--no-config", "-c", "devenv shell"],
+        ),
+        entry(30, 20, 10, true, &["devenv", "shell"]),
+        entry(40, 30, 40, true, &["zsh", "-i"]),
+    ];
+    assert_eq!(
+        foreground_descendant_cmd(&table, 10),
+        Some(vec!["zsh".to_string(), "-i".to_string()])
+    );
+}
+
+#[test]
+fn foreground_cmd_prefers_deepest_leader_across_nested_ptys() {
+    // A wrapper that proxies a nested pty (devenv painting its watch bar)
+    // leads the *outer* tty's foreground group itself, while the agent leads
+    // the inner pty's. The deepest leader is the interactive program.
+    let table = vec![
+        entry(20, 10, 20, true, &["devenv", "shell"]),
+        entry(30, 20, 30, false, &["bash"]),
+        entry(40, 30, 40, true, &["claude"]),
+    ];
+    assert_eq!(
+        foreground_descendant_cmd(&table, 10),
+        Some(vec!["claude".to_string()])
+    );
+}
+
+#[test]
+fn foreground_cmd_ignores_non_leader_group_members() {
+    // claude(20) spawned git(21) inside its own process group: git carries
+    // the foreground flag as a group member but is not the leader.
+    let table = vec![
+        entry(20, 10, 20, true, &["claude"]),
+        entry(21, 20, 20, true, &["git", "status"]),
+    ];
+    assert_eq!(
+        foreground_descendant_cmd(&table, 10),
+        Some(vec!["claude".to_string()])
+    );
+}
+
+#[test]
+fn foreground_cmd_falls_back_to_newest_direct_child() {
+    // Only a background job below the shell (or the scan missed the live
+    // foreground line): fall back to the newest direct child, matching the
+    // previous direct-child behavior.
+    let table = vec![
+        entry(20, 10, 20, false, &["cargo", "watch"]),
+        entry(25, 10, 25, false, &["tail", "-f", "log"]),
+    ];
+    assert_eq!(
+        foreground_descendant_cmd(&table, 10),
+        Some(vec![
+            "tail".to_string(),
+            "-f".to_string(),
+            "log".to_string()
+        ])
+    );
+}
+
+#[test]
+fn foreground_cmd_none_when_shell_has_no_children() {
+    let table = vec![entry(99, 1, 99, true, &["unrelated"])];
+    assert_eq!(foreground_descendant_cmd(&table, 10), None);
+}
+
+#[test]
+fn foreground_cmd_survives_ppid_cycles() {
+    // A stale scan can pair reused pids into a parent cycle; the walk must
+    // terminate and still resolve the leader.
+    let table = vec![
+        entry(20, 10, 20, false, &["wrapper"]),
+        entry(30, 20, 30, true, &["claude"]),
+        entry(10, 30, 10, false, &["ghost"]),
+    ];
+    assert_eq!(
+        foreground_descendant_cmd(&table, 10),
+        Some(vec!["claude".to_string()])
+    );
+}
+
+#[test]
+fn process_table_parses_ps_output() {
+    let output = "\
+  501   340   501  Ss   -fish
+  502   501   502  S    devenv shell
+  503   502   503  S+   claude --continue
+  504   502   504  Z    \n";
+    let table = parse_process_table(output);
+    // The zombie line has no command and is dropped.
+    assert_eq!(table.len(), 3);
+    assert_eq!(
+        table[2],
+        ProcessEntry {
+            pid: 503,
+            ppid: 502,
+            pgid: 503,
+            foreground: true,
+            cmd: vec!["claude".to_string(), "--continue".to_string()],
+        }
+    );
+    assert!(!table[1].foreground);
+}

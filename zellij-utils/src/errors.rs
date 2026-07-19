@@ -367,6 +367,8 @@ pub enum ScreenContext {
     BreakPaneRight,
     BreakPaneLeft,
     UpdateSessionInfos,
+    PublishAgentState,
+    PublishFlockSidebarState,
     UpdateAvailableLayouts,
     ReplacePane,
     NewInPlacePluginPane,
@@ -383,6 +385,7 @@ pub enum ScreenContext {
     Reconfigure,
     RerunCommandPane,
     ResizePaneWithId,
+    ResizePaneIdToFixedWidth,
     EditScrollbackForPaneWithId,
     WriteToPaneId,
     Paste,
@@ -656,14 +659,14 @@ pub enum ZellijError {
     FailedToStartPty,
 
     #[error(
-        "This version of zellij was built to load the core plugins from
+        "This version of Flock was built to load the core plugins from
 the globally configured plugin directory. However, a plugin wasn't found:
 
     Plugin name: '{plugin_path}'
     Plugin directory: '{plugin_dir}'
 
 If you're a user:
-    Please report this error to the distributor of your current zellij version
+    Please report this error to the distributor of your current Flock version
 
 If you're a developer:
     Either make sure to include the plugins with the application (See feature
@@ -671,8 +674,8 @@ If you're a developer:
     plugin directory.
 
 Possible fix for your problem:
-    Run `zellij setup --dump-plugins`, and optionally point it to your
-    'DATA DIR', visible in e.g. the output of `zellij setup --check`. Without
+    Run `flock setup --dump-plugins`, and optionally point it to your
+    'DATA DIR', visible in e.g. the output of `flock setup --check`. Without
     further arguments, it will use the default 'DATA DIR'.
 "
     )]
@@ -688,7 +691,7 @@ Possible fix for your problem:
 
     Plugin name: '{plugin_path}'
 
-This is not a builtin plugin known to this version of zellij. If you were using
+This is not a builtin plugin known to this version of Flock. If you were using
 a custom layout, please refer to the layout documentation at:
 
     https://zellij.dev/documentation/creating-a-layout.html#plugin
@@ -696,7 +699,7 @@ a custom layout, please refer to the layout documentation at:
 If you think this is a bug and the plugin is indeed an internal plugin, please
 open an issue on GitHub:
 
-    https://github.com/zellij-org/zellij/issues
+    https://github.com/abeljim8am/flock/issues
 "
     )]
     BuiltinPluginNonexistent {
@@ -769,8 +772,8 @@ mod not_wasm {
                 "If you are seeing this message, it means that something went wrong.
 
 -> To get additional information, check the log at: {}
--> To see a backtrace next time, reproduce the error with: RUST_BACKTRACE=1 zellij [...]
--> To help us fix this, please open an issue: https://github.com/zellij-org/zellij/issues
+-> To see a backtrace next time, reproduce the error with: RUST_BACKTRACE=1 flock [...]
+-> To help us fix this, please open an issue: https://github.com/abeljim8am/flock/issues
 
 ",
                 crate::consts::ZELLIJ_TMP_LOG_FILE.display().to_string()

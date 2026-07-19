@@ -2033,8 +2033,8 @@ impl Action {
             } => {
                 let pane_id_str = match pane_id {
                     Some(id) => id,
-                    None => std::env::var("ZELLIJ_PANE_ID").map_err(|_| {
-                        "No --pane-id provided and ZELLIJ_PANE_ID is not set".to_string()
+                    None => std::env::var(crate::envs::PANE_ID_ENV_KEY).map_err(|_| {
+                        "No --pane-id provided and FLOCK_PANE_ID is not set".to_string()
                     })?,
                 };
                 let parsed_pane_id = PaneId::from_str(&pane_id_str);

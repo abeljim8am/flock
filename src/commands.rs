@@ -53,7 +53,7 @@ pub(crate) use zellij_utils::sessions::list_sessions;
 pub(crate) fn kill_all_sessions(yes: bool) {
     match get_sessions() {
         Ok(sessions) if sessions.is_empty() => {
-            eprintln!("No active zellij sessions found.");
+            eprintln!("No active Flock sessions found.");
             process::exit(1);
         },
         Ok(sessions) => {
@@ -224,10 +224,10 @@ pub(crate) fn start_web_server(
     _startup_timeout: Option<u64>,
 ) {
     log::error!(
-        "This version of Zellij was compiled without web server support, cannot run web server!"
+        "This version of Flock was compiled without web server support, cannot run web server!"
     );
     eprintln!(
-        "This version of Zellij was compiled without web server support, cannot run web server!"
+        "This version of Flock was compiled without web server support, cannot run web server!"
     );
     std::process::exit(2);
 }
@@ -245,10 +245,10 @@ pub(crate) fn stop_web_server() -> Result<(), String> {
 #[cfg(not(feature = "web_server_capability"))]
 pub(crate) fn stop_web_server() -> Result<(), String> {
     log::error!(
-        "This version of Zellij was compiled without web server support, cannot stop web server!"
+        "This version of Flock was compiled without web server support, cannot stop web server!"
     );
     eprintln!(
-        "This version of Zellij was compiled without web server support, cannot stop web server!"
+        "This version of Flock was compiled without web server support, cannot stop web server!"
     );
     std::process::exit(2);
 }
@@ -267,10 +267,10 @@ pub(crate) fn create_auth_token(name: Option<String>, read_only: bool) -> Result
 #[cfg(not(feature = "web_server_capability"))]
 pub(crate) fn create_auth_token(_name: Option<String>, _read_only: bool) -> Result<String, String> {
     log::error!(
-        "This version of Zellij was compiled without web server support, cannot create auth token!"
+        "This version of Flock was compiled without web server support, cannot create auth token!"
     );
     eprintln!(
-        "This version of Zellij was compiled without web server support, cannot create auth token!"
+        "This version of Flock was compiled without web server support, cannot create auth token!"
     );
     std::process::exit(2);
 }
@@ -283,10 +283,10 @@ pub(crate) fn revoke_auth_token(token_name: &str) -> Result<bool, String> {
 #[cfg(not(feature = "web_server_capability"))]
 pub(crate) fn revoke_auth_token(_token_name: &str) -> Result<bool, String> {
     log::error!(
-        "This version of Zellij was compiled without web server support, cannot revoke auth token!"
+        "This version of Flock was compiled without web server support, cannot revoke auth token!"
     );
     eprintln!(
-        "This version of Zellij was compiled without web server support, cannot revoke auth token!"
+        "This version of Flock was compiled without web server support, cannot revoke auth token!"
     );
     std::process::exit(2);
 }
@@ -300,10 +300,10 @@ pub(crate) fn revoke_all_auth_tokens() -> Result<usize, String> {
 #[cfg(not(feature = "web_server_capability"))]
 pub(crate) fn revoke_all_auth_tokens() -> Result<usize, String> {
     log::error!(
-        "This version of Zellij was compiled without web server support, cannot revoke all tokens!"
+        "This version of Flock was compiled without web server support, cannot revoke all tokens!"
     );
     eprintln!(
-        "This version of Zellij was compiled without web server support, cannot revoke all tokens!"
+        "This version of Flock was compiled without web server support, cannot revoke all tokens!"
     );
     std::process::exit(2);
 }
@@ -329,11 +329,9 @@ pub(crate) fn list_auth_tokens() -> Result<Vec<String>, String> {
 #[cfg(not(feature = "web_server_capability"))]
 pub(crate) fn list_auth_tokens() -> Result<Vec<String>, String> {
     log::error!(
-        "This version of Zellij was compiled without web server support, cannot list tokens!"
+        "This version of Flock was compiled without web server support, cannot list tokens!"
     );
-    eprintln!(
-        "This version of Zellij was compiled without web server support, cannot list tokens!"
-    );
+    eprintln!("This version of Flock was compiled without web server support, cannot list tokens!");
     std::process::exit(2);
 }
 
@@ -373,10 +371,10 @@ pub(crate) fn web_server_status(
     _timeout_secs: Option<u64>,
 ) -> Result<String, String> {
     log::error!(
-        "This version of Zellij was compiled without web server support, cannot get web server status!"
+        "This version of Flock was compiled without web server support, cannot get web server status!"
     );
     eprintln!(
-        "This version of Zellij was compiled without web server support, cannot get web server status!"
+        "This version of Flock was compiled without web server support, cannot get web server status!"
     );
     std::process::exit(2);
 }
@@ -607,7 +605,7 @@ fn attach_with_session_index(config_options: Options, index: usize, create: bool
             if create {
                 create_new_client()
             } else {
-                eprintln!("No active zellij sessions found.");
+                eprintln!("No active Flock sessions found.");
                 process::exit(1);
             }
         },
@@ -660,7 +658,7 @@ fn attach_with_session_name(
         None => match get_active_session() {
             ActiveSession::None if create => create_new_client(),
             ActiveSession::None => {
-                eprintln!("No active zellij sessions found.");
+                eprintln!("No active Flock sessions found.");
                 process::exit(1);
             },
             ActiveSession::One(session_name) => ClientInfo::Attach(session_name, config_options),
@@ -774,7 +772,7 @@ pub(crate) fn start_client(opts: CliArgs) {
                 }
             }) {
                 if !cfg!(feature = "web_server_capability") {
-                    eprintln!("This version of Zellij was compiled without web/remote-attach capabilities.");
+                    eprintln!("This version of Flock was compiled without web/remote-attach capabilities.");
                     std::process::exit(2);
                 }
 
@@ -1048,7 +1046,7 @@ pub(crate) fn watch_session(session_name: Option<String>, opts: CliArgs) {
         },
         None => match get_active_session() {
             ActiveSession::None => {
-                eprintln!("No active zellij sessions found.");
+                eprintln!("No active Flock sessions found.");
                 process::exit(1);
             },
             ActiveSession::One(name) => ClientInfo::Watch(name, config_options.clone()),

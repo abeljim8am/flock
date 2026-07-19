@@ -64,6 +64,14 @@ pub struct Options {
     /// Set the default shell
     #[clap(long, value_parser)]
     pub default_shell: Option<PathBuf>,
+    /// Command (with arguments) every new pane and tab runs instead of the
+    /// default shell. Config/layout-only (no CLI flag): its purpose is
+    /// per-session injection through a layout's embedded options — e.g. the
+    /// flock-selector codespace binding (`default_command "gh" "codespace"
+    /// "ssh" "-c" "<name>"`). Takes precedence over `default_shell`.
+    #[clap(skip)]
+    #[serde(default)]
+    pub default_command: Option<Vec<String>>,
     /// Set the default cwd
     #[clap(long, value_parser)]
     pub default_cwd: Option<PathBuf>,
@@ -324,6 +332,9 @@ impl Options {
         let simplified_ui = other.simplified_ui.or(self.simplified_ui);
         let default_mode = other.default_mode.or(self.default_mode);
         let default_shell = other.default_shell.or_else(|| self.default_shell.clone());
+        let default_command = other
+            .default_command
+            .or_else(|| self.default_command.clone());
         let default_cwd = other.default_cwd.or_else(|| self.default_cwd.clone());
         let default_layout = other.default_layout.or_else(|| self.default_layout.clone());
         let layout_dir = other.layout_dir.or_else(|| self.layout_dir.clone());
@@ -392,6 +403,7 @@ impl Options {
             theme_light,
             default_mode,
             default_shell,
+            default_command,
             default_cwd,
             default_layout,
             layout_dir,
@@ -463,6 +475,9 @@ impl Options {
 
         let default_mode = other.default_mode.or(self.default_mode);
         let default_shell = other.default_shell.or_else(|| self.default_shell.clone());
+        let default_command = other
+            .default_command
+            .or_else(|| self.default_command.clone());
         let default_cwd = other.default_cwd.or_else(|| self.default_cwd.clone());
         let default_layout = other.default_layout.or_else(|| self.default_layout.clone());
         let layout_dir = other.layout_dir.or_else(|| self.layout_dir.clone());
@@ -527,6 +542,7 @@ impl Options {
             theme_light,
             default_mode,
             default_shell,
+            default_command,
             default_cwd,
             default_layout,
             layout_dir,

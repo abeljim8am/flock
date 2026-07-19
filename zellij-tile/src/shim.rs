@@ -168,8 +168,8 @@ pub fn dump_layout(layout_name: &str) -> Result<String, String> {
 /// This is the directory where Zellij looks for layout files. It can be:
 /// - The directory specified via CLI `--layout-dir` flag
 /// - The directory specified in the config file
-/// - The directory specified via ZELLIJ_LAYOUT_DIR env var
-/// - The default: `~/.config/zellij/layouts`
+/// - The directory specified via FLOCK_LAYOUT_DIR env var
+/// - The default: `~/.config/flock/layouts`
 ///
 /// # Returns
 /// A String containing the absolute path to the layout directory.
@@ -321,7 +321,7 @@ pub fn get_tab_info(tab_id: usize) -> Option<TabInfo> {
 /// Save the current session state to disk immediately.
 ///
 /// This triggers an immediate write of the current session metadata and layout
-/// to the session cache directory (~/.cache/zellij/contract_version_1/session_info/<session_name>/).
+/// to the session cache directory (~/.cache/flock/contract_version_1/session_info/<session_name>/).
 ///
 /// # Returns
 ///
@@ -1562,6 +1562,27 @@ pub fn rename_session(name: &str) {
     unsafe { host_run_plugin_command() };
 }
 
+/// Publish this session's per-pane agent status to the server. The server keeps
+/// the latest published map and surfaces it on this session's `SessionInfo`, so
+/// other sessions' sidebars (which poll the cross-session session list) can
+/// render this session's agents in full state fidelity.
+pub fn publish_agent_state(agent_states: BTreeMap<PaneId, PaneAgentStatus>) {
+    let plugin_command = PluginCommand::PublishAgentState(agent_states);
+    let protobuf_plugin_command: ProtobufPluginCommand = plugin_command.try_into().unwrap();
+    object_to_stdout(&protobuf_plugin_command.encode_to_vec());
+    unsafe { host_run_plugin_command() };
+}
+
+/// Publish this session's flock-sidebar open/closed state to the server. The
+/// server surfaces it on this session's `SessionInfo`, so other sessions'
+/// sidebars can follow the same presentation mode.
+pub fn publish_flock_sidebar_state(sidebar_state: FlockSidebarState) {
+    let plugin_command = PluginCommand::PublishFlockSidebarState(sidebar_state);
+    let protobuf_plugin_command: ProtobufPluginCommand = plugin_command.try_into().unwrap();
+    object_to_stdout(&protobuf_plugin_command.encode_to_vec());
+    unsafe { host_run_plugin_command() };
+}
+
 /// Unblock the input side of a pipe, requesting the next message be sent if there is one
 pub fn unblock_cli_pipe_input(pipe_name: &str) {
     let plugin_command = PluginCommand::UnblockCliPipeInput(pipe_name.to_owned());
@@ -1763,6 +1784,19 @@ pub fn close_pane_with_id(pane_id: PaneId) {
 /// Resize the specified pane (increase/decrease) with an optional direction (left/right/up/down)
 pub fn resize_pane_with_id(resize_strategy: ResizeStrategy, pane_id: PaneId) {
     let plugin_command = PluginCommand::ResizePaneIdWithDirection(resize_strategy, pane_id);
+    let protobuf_plugin_command: ProtobufPluginCommand = plugin_command.try_into().unwrap();
+    object_to_stdout(&protobuf_plugin_command.encode_to_vec());
+    unsafe { host_run_plugin_command() };
+}
+
+/// Set the specified pane's width to an exact column count. Unlike
+/// [`resize_pane_with_id`], which steps by a screen-relative percentage and
+/// won't shrink a percent-sized pane below 5% of the screen, this makes the
+/// pane fixed-width at exactly `width` columns; sibling panes reflow to fill the
+/// remaining space. Useful for a docked rail that must stay a few columns wide
+/// regardless of how wide the terminal is.
+pub fn resize_pane_id_to_fixed_width(pane_id: PaneId, width: u32) {
+    let plugin_command = PluginCommand::ResizePaneIdToFixedWidth(pane_id, width);
     let protobuf_plugin_command: ProtobufPluginCommand = plugin_command.try_into().unwrap();
     object_to_stdout(&protobuf_plugin_command.encode_to_vec());
     unsafe { host_run_plugin_command() };
@@ -2900,7 +2934,17 @@ pub fn clear_pane_highlights(pane_id: PaneId) {
     unsafe { host_run_plugin_command() };
 }
 
+#[cfg(target_family = "wasm")]
 #[link(wasm_import_module = "zellij")]
 extern "C" {
     fn host_run_plugin_command();
+}
+
+/// Native (non-wasm) stub so plugin unit-test binaries link: the shims end up
+/// in test builds via `register_plugin!`'s exported symbols even though tests
+/// never invoke them. Any actual call outside the wasm host is a bug, so it
+/// panics rather than silently doing nothing.
+#[cfg(not(target_family = "wasm"))]
+unsafe fn host_run_plugin_command() {
+    unreachable!("host_run_plugin_command is only available inside a Zellij wasm plugin");
 }

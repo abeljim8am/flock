@@ -1,6 +1,6 @@
 use super::plugin_thread_main;
 use crate::screen::ScreenInstruction;
-use crate::{channels::SenderWithContext, thread_bus::Bus, ServerInstruction};
+use crate::{channels::SenderWithContext, thread_bus::Bus, ClientId, ServerInstruction};
 use insta::assert_snapshot;
 use lazy_static::lazy_static;
 use std::collections::BTreeMap;
@@ -356,7 +356,7 @@ fn create_plugin_thread(
     let plugin_thread = std::thread::Builder::new()
         .name("plugin_thread".to_string())
         .spawn(move || {
-            set_var("ZELLIJ_SESSION_NAME", "zellij-test");
+            set_var("FLOCK_SESSION_NAME", "zellij-test");
             plugin_thread_main(
                 plugin_bus,
                 engine,
@@ -444,7 +444,7 @@ fn create_plugin_thread_with_server_receiver(
     let plugin_thread = std::thread::Builder::new()
         .name("plugin_thread".to_string())
         .spawn(move || {
-            set_var("ZELLIJ_SESSION_NAME", "zellij-test");
+            set_var("FLOCK_SESSION_NAME", "zellij-test");
             plugin_thread_main(
                 plugin_bus,
                 engine,
@@ -540,7 +540,7 @@ fn create_plugin_thread_with_pty_receiver(
     let plugin_thread = std::thread::Builder::new()
         .name("plugin_thread".to_string())
         .spawn(move || {
-            set_var("ZELLIJ_SESSION_NAME", "zellij-test");
+            set_var("FLOCK_SESSION_NAME", "zellij-test");
             plugin_thread_main(
                 plugin_bus,
                 engine,
@@ -629,7 +629,7 @@ fn create_plugin_thread_with_background_jobs_receiver(
     let plugin_thread = std::thread::Builder::new()
         .name("plugin_thread".to_string())
         .spawn(move || {
-            set_var("ZELLIJ_SESSION_NAME", "zellij-test");
+            set_var("FLOCK_SESSION_NAME", "zellij-test");
             plugin_thread_main(
                 plugin_bus,
                 engine,
@@ -679,6 +679,100 @@ lazy_static! {
         std::env::var_os("CARGO_MANIFEST_DIR")
             .unwrap()
             .to_string_lossy()
+    );
+}
+
+fn wait_for_plugin_render(
+    screen_receiver: &Receiver<(ScreenInstruction, ErrorContext)>,
+    plugin_id: u32,
+    client_id: ClientId,
+) -> Option<Vec<u8>> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        let time_left = deadline.saturating_duration_since(std::time::Instant::now());
+        if time_left.is_zero() {
+            return None;
+        }
+        let (instruction, _) = screen_receiver.recv_timeout(time_left).ok()?;
+        if let ScreenInstruction::PluginBytes(render_assets) = instruction {
+            if let Some(render_asset) = render_assets.into_iter().find(|render_asset| {
+                render_asset.plugin_id == plugin_id && render_asset.client_id == client_id
+            }) {
+                return Some(render_asset.bytes);
+            }
+        }
+    }
+}
+
+#[test]
+fn non_ui_client_disconnect_does_not_drop_warm_plugin_instances() {
+    let (plugin_thread_sender, screen_receiver, teardown) = create_plugin_thread(None, None);
+    let initial_client_id = 1;
+    let cli_client_id = 2;
+    let reattached_client_id = 3;
+    let plugin_id = 0;
+    let initial_size = Size {
+        cols: 121,
+        rows: 20,
+    };
+    let run_plugin = RunPluginOrAlias::RunPlugin(
+        RunPlugin::from_url("zellij:compact-bar").expect("built-in plugin URL should parse"),
+    );
+
+    plugin_thread_sender
+        .send(PluginInstruction::AddClient(initial_client_id))
+        .unwrap();
+    plugin_thread_sender
+        .send(PluginInstruction::Load(
+            Some(false),
+            false,
+            false,
+            Some("compact-bar".to_owned()),
+            run_plugin,
+            Some(0),
+            None,
+            initial_client_id,
+            initial_size,
+            None,
+            None,
+            false,
+            None,
+            None,
+            None,
+        ))
+        .unwrap();
+
+    if wait_for_plugin_render(&screen_receiver, plugin_id, initial_client_id).is_none() {
+        teardown();
+        panic!("built-in plugin did not render for its initial client");
+    }
+
+    // The UI detaches, leaving its plugin instance warm. A later CLI/pipe
+    // connection has its own client id but was never added as a plugin UI
+    // client; disconnecting it must not prune the warm instance.
+    plugin_thread_sender
+        .send(PluginInstruction::RemoveClient(initial_client_id))
+        .unwrap();
+    plugin_thread_sender
+        .send(PluginInstruction::RemoveClient(cli_client_id))
+        .unwrap();
+    plugin_thread_sender
+        .send(PluginInstruction::AddClient(reattached_client_id))
+        .unwrap();
+    plugin_thread_sender
+        .send(PluginInstruction::Resize(
+            plugin_id,
+            initial_size.cols + 1,
+            initial_size.rows + 1,
+        ))
+        .unwrap();
+
+    let rebound_render = wait_for_plugin_render(&screen_receiver, plugin_id, reattached_client_id);
+    teardown();
+
+    assert!(
+        rebound_render.is_some(),
+        "warm plugin instance should survive the CLI disconnect and rebind to the new UI client"
     );
 }
 

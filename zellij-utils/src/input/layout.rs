@@ -1310,6 +1310,9 @@ impl Layout {
         available_layouts.push(LayoutInfo::BuiltIn("disable-status-bar".to_owned()));
         available_layouts.push(LayoutInfo::BuiltIn("compact".to_owned()));
         available_layouts.push(LayoutInfo::BuiltIn("classic".to_owned()));
+        available_layouts.push(LayoutInfo::BuiltIn("flock".to_owned()));
+        available_layouts.push(LayoutInfo::BuiltIn("flock-selector".to_owned()));
+        available_layouts.push(LayoutInfo::BuiltIn("flock-coder-remote".to_owned()));
         available_layouts.sort_by(|a, b| {
             let a_name = a.name();
             let b_name = b.name();
@@ -1644,9 +1647,27 @@ impl Layout {
                     Self::stringified_classic_swap_from_assets()?,
                 )),
             )),
+            Some("flock") => Ok((
+                "Flock layout".into(),
+                Self::stringified_flock_from_assets()?,
+                Some((
+                    "Flock layout swap".into(),
+                    Self::stringified_flock_swap_from_assets()?,
+                )),
+            )),
             Some("welcome") => Ok((
                 "Welcome screen layout".into(),
                 Self::stringified_welcome_from_assets()?,
+                None,
+            )),
+            Some("flock-selector") => Ok((
+                "Flock selector layout".into(),
+                Self::stringified_flock_selector_from_assets()?,
+                None,
+            )),
+            Some("flock-coder-remote") => Ok((
+                "Flock Coder remote layout".into(),
+                Self::stringified_flock_coder_remote_from_assets()?,
                 None,
             )),
             None | Some(_) => Err(ConfigError::IoPath(
@@ -1690,6 +1711,24 @@ impl Layout {
 
     pub fn stringified_welcome_from_assets() -> Result<String, ConfigError> {
         Ok(String::from_utf8(setup::WELCOME_LAYOUT.to_vec())?)
+    }
+
+    pub fn stringified_flock_from_assets() -> Result<String, ConfigError> {
+        Ok(String::from_utf8(setup::FLOCK_LAYOUT.to_vec())?)
+    }
+
+    pub fn stringified_flock_swap_from_assets() -> Result<String, ConfigError> {
+        Ok(String::from_utf8(setup::FLOCK_SWAP_LAYOUT.to_vec())?)
+    }
+
+    pub fn stringified_flock_selector_from_assets() -> Result<String, ConfigError> {
+        Ok(String::from_utf8(setup::FLOCK_SELECTOR_LAYOUT.to_vec())?)
+    }
+
+    pub fn stringified_flock_coder_remote_from_assets() -> Result<String, ConfigError> {
+        Ok(String::from_utf8(
+            setup::FLOCK_CODER_REMOTE_LAYOUT.to_vec(),
+        )?)
     }
 
     pub fn new_tab(&self) -> (TiledPaneLayout, Vec<FloatingPaneLayout>) {

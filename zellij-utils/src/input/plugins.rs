@@ -69,6 +69,8 @@ impl PluginConfig {
                     || tag == "multiple-select"
                     || tag == "layout-manager"
                     || tag == "link"
+                    || tag == "flock-sidebar"
+                    || tag == "flock-selector"
                 {
                     Some(PluginConfig {
                         path: PathBuf::from(&tag),

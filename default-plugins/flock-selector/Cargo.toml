@@ -1,0 +1,18 @@
+[package]
+name = "flock-selector"
+version = "0.1.0"
+authors = ["Abel Jimenez <abel.jimenez@8am.com>"]
+edition.workspace = true
+description = "Frecency-ranked project launcher for Zellij (zellij-sessionizer replacement)"
+license.workspace = true
+
+[dependencies]
+zellij-tile = { path = "../../zellij-tile" }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+unicode-width = "0.1.8"
+
+[dev-dependencies]
+# Native-test-only: parses the generated codespace layout doc with the real
+# server-side parser so KDL drift fails in `cargo test`, not at runtime.
+zellij-utils = { workspace = true }

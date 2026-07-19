@@ -348,6 +348,29 @@ pub trait ServerOsApi: Send + Sync {
     fn get_all_cmds_by_ppid(&self, _post_hook: &Option<String>) -> HashMap<String, Vec<String>> {
         HashMap::new()
     }
+    /// Resolve the command effectively running in the foreground for each of
+    /// the given pane shell pids. The default maps each pid to its direct
+    /// child via [`get_all_cmds_by_ppid`](Self::get_all_cmds_by_ppid); unix
+    /// overrides this with a process-table walk that follows the controlling
+    /// terminal's foreground process group, so it sees through resident env
+    /// wrappers (`devenv shell`, `nix develop`) whose wrapper process is the
+    /// shell's direct child while the program the user interacts with runs
+    /// deeper in the tree.
+    fn get_foreground_cmds(
+        &self,
+        shell_pids: &[u32],
+        post_hook: &Option<String>,
+    ) -> HashMap<u32, Vec<String>> {
+        let cmds_by_ppid = self.get_all_cmds_by_ppid(post_hook);
+        shell_pids
+            .iter()
+            .filter_map(|pid| {
+                cmds_by_ppid
+                    .get(&pid.to_string())
+                    .map(|cmd| (*pid, cmd.clone()))
+            })
+            .collect()
+    }
     /// Writes the given buffer to a string
     fn write_to_file(&mut self, buf: String, file: Option<String>) -> Result<()>;
 
@@ -593,6 +616,41 @@ impl ServerOsApi for ServerOsInputOutput {
         cmds
     }
 
+    #[cfg(unix)]
+    fn get_foreground_cmds(
+        &self,
+        shell_pids: &[u32],
+        post_hook: &Option<String>,
+    ) -> HashMap<u32, Vec<String>> {
+        let table = unix_process_table();
+        let mut resolved = HashMap::new();
+        for &shell_pid in shell_pids {
+            let Some(cmd) = foreground_descendant_cmd(&table, shell_pid) else {
+                continue;
+            };
+            let cmd = match post_hook {
+                Some(post_hook) => {
+                    let stringified = cmd.join(" ");
+                    let rewritten = match run_command_hook(&stringified, post_hook) {
+                        Ok(command) => command,
+                        Err(e) => {
+                            log::error!("Post command hook failed to run: {}", e);
+                            stringified
+                        },
+                    };
+                    rewritten
+                        .trim()
+                        .split_ascii_whitespace()
+                        .map(|p| p.to_owned())
+                        .collect()
+                },
+                None => cmd,
+            };
+            resolved.insert(shell_pid, cmd);
+        }
+        resolved
+    }
+
     #[cfg(not(unix))]
     fn get_all_cmds_by_ppid(&self, post_hook: &Option<String>) -> HashMap<String, Vec<String>> {
         let mut system_info = System::new();
@@ -757,6 +815,105 @@ fn run_command_hook(
         return Err(format!("Hook failed: {}", String::from_utf8_lossy(&output.stderr)).into());
     }
     Ok(String::from_utf8(output.stdout)?.trim().to_string())
+}
+
+/// One row of the system process table, as needed to resolve the process a
+/// pane's user is actually interacting with.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ProcessEntry {
+    pub pid: u32,
+    pub ppid: u32,
+    pub pgid: u32,
+    /// Whether the process is in the foreground process group of its
+    /// controlling terminal (`+` in the `ps` STAT column).
+    pub foreground: bool,
+    pub cmd: Vec<String>,
+}
+
+/// Snapshot the system process table via `ps`. The `=` header suppressors
+/// keep the output line-per-process on both BSD/macOS and procps.
+#[cfg(unix)]
+fn unix_process_table() -> Vec<ProcessEntry> {
+    Command::new("ps")
+        .args(vec!["-Ao", "pid=,ppid=,pgid=,stat=,args="])
+        .output()
+        .ok()
+        .map(|output| parse_process_table(&String::from_utf8_lossy(&output.stdout)))
+        .unwrap_or_default()
+}
+
+#[cfg_attr(not(unix), allow(dead_code))]
+fn parse_process_table(ps_output: &str) -> Vec<ProcessEntry> {
+    ps_output
+        .lines()
+        .filter_map(|line| {
+            let mut parts = line.split_ascii_whitespace();
+            let pid = parts.next()?.parse().ok()?;
+            let ppid = parts.next()?.parse().ok()?;
+            let pgid = parts.next()?.parse().ok()?;
+            let stat = parts.next()?;
+            let cmd: Vec<String> = parts.map(|p| p.to_owned()).collect();
+            if cmd.is_empty() {
+                return None;
+            }
+            Some(ProcessEntry {
+                pid,
+                ppid,
+                pgid,
+                foreground: stat.contains('+'),
+                cmd,
+            })
+        })
+        .collect()
+}
+
+/// The command of the process the user is interacting with in the pane whose
+/// shell is `shell_pid`: the deepest descendant that *leads* its controlling
+/// terminal's foreground process group (`+` in STAT and pid == pgid).
+///
+/// Following the foreground group instead of the direct child sees through
+/// resident env wrappers — under `devenv shell` the tree is
+/// `shell → devenv → bash → claude`, where `devenv` stays the direct child
+/// while the tty's foreground group belongs to `claude`. Group *members* that
+/// aren't leaders (a tool subprocess sharing the agent's group) don't count,
+/// and a wrapper that proxies a nested pty contributes its own leader at a
+/// shallower depth, so the deepest leader is the interactive program.
+///
+/// Falls back to the newest direct child when no such process exists (the
+/// previous direct-child behavior), and `None` when the shell has no
+/// children at all.
+#[cfg_attr(not(unix), allow(dead_code))]
+fn foreground_descendant_cmd(table: &[ProcessEntry], shell_pid: u32) -> Option<Vec<String>> {
+    let mut children: HashMap<u32, Vec<&ProcessEntry>> = HashMap::new();
+    for entry in table {
+        children.entry(entry.ppid).or_default().push(entry);
+    }
+
+    let mut deepest_leader: Option<(usize, &ProcessEntry)> = None;
+    let mut stack: Vec<(u32, usize)> = vec![(shell_pid, 0)];
+    let mut visited: std::collections::HashSet<u32> = std::collections::HashSet::new();
+    while let Some((pid, depth)) = stack.pop() {
+        if !visited.insert(pid) {
+            continue;
+        }
+        for child in children.get(&pid).into_iter().flatten() {
+            if child.foreground
+                && child.pid == child.pgid
+                && deepest_leader.map_or(true, |(best_depth, _)| depth + 1 > best_depth)
+            {
+                deepest_leader = Some((depth + 1, child));
+            }
+            stack.push((child.pid, depth + 1));
+        }
+    }
+    if let Some((_, entry)) = deepest_leader {
+        return Some(entry.cmd.clone());
+    }
+
+    children
+        .get(&shell_pid)
+        .and_then(|kids| kids.iter().max_by_key(|entry| entry.pid))
+        .map(|entry| entry.cmd.clone())
 }
 
 #[cfg(test)]

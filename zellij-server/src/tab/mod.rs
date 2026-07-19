@@ -5636,6 +5636,13 @@ impl Tab {
                 .tiled_panes
                 .resize_pane_with_id(strategy, pane_id, None)
             {
+                Ok(successfully_resized) if successfully_resized => {
+                    // Pane resizes move split boundaries. Clear the host
+                    // viewport before the next full redraw so cells vacated by
+                    // a shrinking pane do not survive under the new layout.
+                    self.set_force_render();
+                    self.set_should_clear_display_before_rendering();
+                },
                 Ok(_) => {},
                 Err(err) => match err.downcast_ref::<ZellijError>() {
                     Some(ZellijError::CantResizeFixedPanes { pane_ids }) => {
@@ -5663,6 +5670,28 @@ impl Tab {
             .any(|s_p| s_p.1.pid() == pane_id)
         {
             log::error!("Cannot resize suppressed panes");
+        }
+        Ok(())
+    }
+    pub fn resize_pane_id_to_fixed_width(&mut self, pane_id: PaneId, width: usize) -> Result<()> {
+        // Only tiled panes have a meaningful split width to fix; floating /
+        // suppressed panes are positioned independently, so this is a no-op for
+        // them (the docked rail this serves is always tiled).
+        if self.tiled_panes.panes_contain(&pane_id) {
+            let pane_is_selectable = self
+                .tiled_panes
+                .get_pane(pane_id)
+                .map(|pane| pane.selectable())
+                .unwrap_or(true);
+            if self.tiled_panes.set_pane_fixed_width(pane_id, width) {
+                // Like a regular resize, the split boundary moved: force a clean
+                // redraw so cells vacated by the shrunk pane are cleared.
+                if pane_is_selectable {
+                    self.swap_layouts.set_is_tiled_damaged();
+                }
+                self.set_force_render();
+                self.set_should_clear_display_before_rendering();
+            }
         }
         Ok(())
     }

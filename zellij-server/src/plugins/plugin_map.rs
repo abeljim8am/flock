@@ -4,7 +4,7 @@ use std::io::Write;
 use std::{
     collections::{BTreeMap, HashMap, HashSet, VecDeque},
     path::PathBuf,
-    sync::{Arc, Mutex},
+    sync::{atomic::AtomicU16, Arc, Mutex},
 };
 use wasmi::{Instance, Store, StoreLimits};
 use wasmi_wasi::WasiCtx;
@@ -227,6 +227,54 @@ impl PluginMap {
             (running_plugin, subscriptions, running_workers),
         );
     }
+    /// An instance of `plugin_id` whose client has detached (and so is not in
+    /// `connected_clients`), if any. These instances stay warm in the map after
+    /// a detach; `max` keeps the pick deterministic should several linger.
+    pub fn orphaned_client_of_plugin(
+        &self,
+        plugin_id: PluginId,
+        connected_clients: &HashSet<ClientId>,
+    ) -> Option<ClientId> {
+        self.plugin_assets
+            .keys()
+            .filter(|(p_id, c_id)| *p_id == plugin_id && !connected_clients.contains(c_id))
+            .map(|(_, c_id)| *c_id)
+            .max()
+    }
+    /// Move a plugin instance to a different client, keeping the running
+    /// instance, its subscriptions and its workers intact.
+    pub fn rebind_plugin_instance(
+        &mut self,
+        plugin_id: PluginId,
+        old_client_id: ClientId,
+        new_client_id: ClientId,
+    ) -> Option<Arc<Mutex<RunningPlugin>>> {
+        let assets = self.plugin_assets.remove(&(plugin_id, old_client_id))?;
+        let running_plugin = assets.0.clone();
+        self.plugin_assets
+            .insert((plugin_id, new_client_id), assets);
+        Some(running_plugin)
+    }
+    /// Drop instances belonging to detached clients other than
+    /// `kept_client_id`, so at most one warm (rebindable) generation lingers
+    /// per plugin after a detach. Returns the removed `(plugin, client)` pairs
+    /// so lifecycle cleanup is observable in the server log.
+    pub fn remove_orphans_except(
+        &mut self,
+        kept_client_id: ClientId,
+        connected_clients: &HashSet<ClientId>,
+    ) -> Vec<(PluginId, ClientId)> {
+        let mut removed_plugin_instances = vec![];
+        self.plugin_assets.retain(|(plugin_id, client_id), _| {
+            let should_keep = *client_id == kept_client_id || connected_clients.contains(client_id);
+            if !should_keep {
+                removed_plugin_instances.push((*plugin_id, *client_id));
+            }
+            should_keep
+        });
+        removed_plugin_instances.sort_unstable();
+        removed_plugin_instances
+    }
     pub fn run_plugin_of_plugin_id(&self, plugin_id: PluginId) -> Option<RunPlugin> {
         self.plugin_assets
             .iter()
@@ -279,6 +327,11 @@ pub struct PluginEnv {
     pub wasi_ctx: WasiCtx,
     pub tab_index: Option<usize>,
     pub client_id: ClientId,
+    /// The client this instance is currently bound to, shared with async work
+    /// (eg. pending `set_timeout` tasks) that must route back to the instance
+    /// after it is rebound to a different client on re-attach. `client_id`
+    /// above is the value at arm/call time; this cell is the live one.
+    pub live_client_id: Arc<AtomicU16>,
     #[allow(dead_code)]
     pub plugin_own_data_dir: PathBuf,
     pub plugin_own_cache_dir: PathBuf,

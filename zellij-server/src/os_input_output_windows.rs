@@ -169,19 +169,18 @@ fn build_command_line(cmd: &RunCommand) -> Vec<u16> {
 }
 
 /// Build a UTF-16 environment block (each entry `KEY=VALUE\0`, terminated by
-/// an extra `\0`) from the current process environment, adding
-/// `ZELLIJ_PANE_ID`.
+/// an extra `\0`) from the current process environment, adding `FLOCK_PANE_ID`.
 fn build_environment_block(terminal_id: u32) -> Vec<u16> {
     let mut block: Vec<u16> = Vec::new();
     for (key, value) in std::env::vars() {
-        if key == "ZELLIJ_PANE_ID" {
+        if key == zellij_utils::envs::PANE_ID_ENV_KEY {
             continue;
         }
         let entry = format!("{}={}", key, value);
         block.extend(OsStr::new(&entry).encode_wide());
         block.push(0);
     }
-    let pane_entry = format!("ZELLIJ_PANE_ID={}", terminal_id);
+    let pane_entry = format!("{}={}", zellij_utils::envs::PANE_ID_ENV_KEY, terminal_id);
     block.extend(OsStr::new(&pane_entry).encode_wide());
     block.push(0);
     block.push(0); // double-null terminator

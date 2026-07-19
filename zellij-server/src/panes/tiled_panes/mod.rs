@@ -24,7 +24,7 @@ use zellij_utils::{
         command::RunCommand,
         layout::{Run, RunPluginOrAlias, SplitDirection},
     },
-    pane_size::{Offset, PaneGeom, Size, SizeInPixels, Viewport},
+    pane_size::{Dimension, Offset, PaneGeom, Size, SizeInPixels, Viewport},
 };
 
 use std::{
@@ -529,13 +529,19 @@ impl TiledPanes {
         self.panes.keys()
     }
     pub fn relayout(&mut self, direction: SplitDirection) {
+        self.try_relayout(direction).non_fatal();
+    }
+    /// The fallible core of [`Self::relayout`]: recompute the layout along
+    /// `direction`, returning the solver's error instead of swallowing it so
+    /// callers can roll back geometry changes that turned out unsatisfiable.
+    fn try_relayout(&mut self, direction: SplitDirection) -> Result<()> {
         let mut pane_grid = TiledPaneGrid::new(
             &mut self.panes,
             &self.panes_to_hide,
             *self.display_area.borrow(),
             *self.viewport.borrow(),
         );
-        match direction {
+        let result = match direction {
             SplitDirection::Horizontal => {
                 pane_grid.layout(direction, (*self.display_area.borrow()).cols)
             },
@@ -544,10 +550,10 @@ impl TiledPanes {
             },
         }
         .or_else(|e| Err(anyError::msg(e)))
-        .with_context(|| format!("{:?} relayout of tab failed", direction))
-        .non_fatal();
+        .with_context(|| format!("{:?} relayout of tab failed", direction));
 
         self.set_pane_frames(self.draw_pane_frames);
+        result
     }
     pub fn reapply_pane_frames(&mut self) {
         // same as set_pane_frames except it reapplies the current situation
@@ -1783,6 +1789,162 @@ impl TiledPanes {
         }
         self.reset_boundaries();
         Ok(pane_size_changed)
+    }
+
+    /// Set a pane's width to an exact column count. The pane's `cols` constraint
+    /// becomes `Fixed(width)` and the layout is recomputed, so the solver gives
+    /// it exactly `width` columns and flexible siblings absorb the rest — the
+    /// same way a layout `size=N` pane is laid out. Unlike the increment-based
+    /// `resize_pane_with_id`, this is not bounded by the per-step / 5%-of-screen
+    /// floor, so a docked rail can be a few columns wide on any screen. Returns
+    /// whether the target pane was found.
+    pub fn set_pane_fixed_width(&mut self, pane_id: PaneId, width: usize) -> bool {
+        // While a pane is fullscreened the hidden panes' saved geometry must
+        // not be rewritten — the solver only sees the visible panes, so the
+        // recomputed percents would be wrong inputs to the unfullscreen
+        // re-solve.
+        if self.fullscreen_is_active.is_some() {
+            log::error!("Cannot set a fixed pane width while a pane is fullscreen");
+            return false;
+        }
+        // Reject obviously unsatisfiable widths before mutating any geometry.
+        let display_cols = self.display_area.borrow().cols;
+        if width == 0 || width > display_cols {
+            log::error!(
+                "Cannot set fixed pane width {}: must be between 1 and the display width ({})",
+                width,
+                display_cols
+            );
+            return false;
+        }
+        // Snapshot all geometries: a Fixed constraint the solver cannot
+        // satisfy must not leave the tab with half-applied geometry and a
+        // permanently unresizable pane.
+        let previous_geoms: Vec<(PaneId, PaneGeom)> = self
+            .panes
+            .iter()
+            .map(|(id, pane)| (*id, pane.position_and_size()))
+            .collect();
+        match self.panes.get_mut(&pane_id) {
+            Some(pane) => {
+                let mut geom = pane.position_and_size();
+                geom.cols = Dimension::fixed(width);
+                pane.set_geom(geom);
+            },
+            None => {
+                log::error!(
+                    "Failed to find pane with id: {:?} to set fixed width",
+                    pane_id
+                );
+                return false;
+            },
+        }
+        // Recompute the horizontal split so the now-fixed pane keeps `width` and
+        // the flexible sibling(s) reflow into the remaining columns.
+        if let Err(e) = self.try_relayout(SplitDirection::Horizontal) {
+            log::error!(
+                "Cannot fix pane {:?} to width {}, restoring previous geometry: {:?}",
+                pane_id,
+                width,
+                e
+            );
+            for (id, geom) in previous_geoms {
+                if let Some(pane) = self.panes.get_mut(&id) {
+                    pane.set_geom(geom);
+                }
+            }
+            self.set_pane_frames(self.draw_pane_frames);
+            self.reset_boundaries();
+            return false;
+        }
+        self.normalize_flexible_widths_overlapping_pane(pane_id);
+        for pane in self.panes.values_mut() {
+            resize_pty!(pane, self.os_api, self.senders, self.character_cell_size).unwrap();
+        }
+        self.reset_boundaries();
+        true
+    }
+
+    fn normalize_flexible_widths_overlapping_pane(&mut self, pane_id: PaneId) {
+        let Some(target_geom) = self
+            .panes
+            .get(&pane_id)
+            .map(|pane| pane.position_and_size())
+        else {
+            return;
+        };
+        let target_top = target_geom.y;
+        let target_bottom = target_geom.y + target_geom.rows.as_usize();
+        if target_top >= target_bottom {
+            return;
+        }
+
+        let display_cols = self.display_area.borrow().cols;
+        if display_cols == 0 {
+            return;
+        }
+
+        let mut edges = vec![target_top, target_bottom];
+        for pane in self.panes.values() {
+            let geom = pane.position_and_size();
+            let top = geom.y.max(target_top);
+            let bottom = (geom.y + geom.rows.as_usize()).min(target_bottom);
+            if top < bottom {
+                edges.push(top);
+                edges.push(bottom);
+            }
+        }
+        edges.sort_unstable();
+        edges.dedup();
+
+        let mut percent_updates = vec![];
+        for boundary in edges.windows(2) {
+            let boundary_top = boundary[0];
+            let boundary_bottom = boundary[1];
+            if boundary_top >= boundary_bottom {
+                continue;
+            }
+
+            let panes_in_boundary: Vec<_> = self
+                .panes
+                .iter()
+                .filter(|(_, pane)| {
+                    let geom = pane.position_and_size();
+                    geom.y <= boundary_top
+                        && geom.y + geom.rows.as_usize() >= boundary_bottom
+                        && !self.panes_to_hide.contains(&pane.pid())
+                })
+                .collect();
+            let fixed_cols: usize = panes_in_boundary
+                .iter()
+                .filter_map(|(_, pane)| {
+                    let geom = pane.position_and_size();
+                    geom.cols.is_fixed().then_some(geom.cols.as_usize())
+                })
+                .sum();
+            let flex_cols = display_cols.saturating_sub(fixed_cols);
+            if flex_cols == 0 {
+                continue;
+            }
+
+            for (pane_id, pane) in panes_in_boundary {
+                let geom = pane.position_and_size();
+                if !geom.cols.is_fixed() {
+                    let percent = (geom.cols.as_usize() as f64 / flex_cols as f64) * 100.0;
+                    percent_updates.push((*pane_id, percent));
+                }
+            }
+        }
+
+        percent_updates.sort_by_key(|(pane_id, _)| *pane_id);
+        percent_updates.dedup_by_key(|(pane_id, _)| *pane_id);
+        for (pane_id, percent) in percent_updates {
+            if let Some(pane) = self.panes.get_mut(&pane_id) {
+                let mut geom = pane.position_and_size();
+                geom.cols.set_percent(percent);
+                pane.set_geom(geom);
+            }
+        }
     }
 
     pub fn resize_pane_with_strategies(

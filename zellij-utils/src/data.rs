@@ -1057,7 +1057,16 @@ pub enum WebServerStatus {
     PartialOrd,
     Ord,
 )]
-#[strum_discriminants(derive(EnumString, Hash, Serialize, Deserialize, Display, PartialOrd, Ord))]
+#[strum_discriminants(derive(
+    EnumString,
+    EnumIter,
+    Hash,
+    Serialize,
+    Deserialize,
+    Display,
+    PartialOrd,
+    Ord
+))]
 #[strum_discriminants(name(PermissionType))]
 #[non_exhaustive]
 pub enum Permission {
@@ -1081,6 +1090,11 @@ pub enum Permission {
 }
 
 impl PermissionType {
+    /// Every permission type, eg. for pre-granting built-in plugins.
+    pub fn all() -> impl Iterator<Item = PermissionType> {
+        use strum::IntoEnumIterator;
+        PermissionType::iter()
+    }
     pub fn display_name(&self) -> String {
         match self {
             PermissionType::ReadApplicationState => {
@@ -1780,6 +1794,138 @@ impl ModeInfo {
     }
 }
 
+/// The run-state of an agent in a pane, as published cross-session for the
+/// flock-sidebar. A serializable, transport-friendly mirror of the sidebar
+/// plugin's internal agent state: it rides `SessionInfo` (and the disk-polled
+/// session metadata that backs cross-session discovery) so every session's
+/// sidebar can render every other session's agents in full state fidelity.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+pub enum AgentRunState {
+    /// No agent, or an unrecognized program.
+    #[default]
+    Unknown,
+    /// Agent finished, prompt visible, nothing happening.
+    Idle,
+    /// Agent is actively working / processing.
+    Working,
+    /// Agent needs human input and is blocked on a response.
+    Blocked,
+}
+
+impl AgentRunState {
+    /// A stable, lower-case wire name used for KDL serialization (the disk
+    /// session-metadata round-trip that crosses the session boundary).
+    pub fn as_wire_str(&self) -> &'static str {
+        match self {
+            AgentRunState::Unknown => "unknown",
+            AgentRunState::Idle => "idle",
+            AgentRunState::Working => "working",
+            AgentRunState::Blocked => "blocked",
+        }
+    }
+
+    /// Parse the wire name produced by [`as_wire_str`](Self::as_wire_str),
+    /// falling back to `Unknown` for anything unrecognized.
+    pub fn from_wire_str(s: &str) -> Self {
+        match s {
+            "idle" => AgentRunState::Idle,
+            "working" => AgentRunState::Working,
+            "blocked" => AgentRunState::Blocked,
+            _ => AgentRunState::Unknown,
+        }
+    }
+
+    /// Numeric wire value used for the protobuf round-trip (server → plugin and
+    /// in the `PublishAgentState` command). Kept in sync with
+    /// [`from_wire_u32`](Self::from_wire_u32).
+    pub fn as_wire_u32(&self) -> u32 {
+        match self {
+            AgentRunState::Unknown => 0,
+            AgentRunState::Idle => 1,
+            AgentRunState::Working => 2,
+            AgentRunState::Blocked => 3,
+        }
+    }
+
+    /// Inverse of [`as_wire_u32`](Self::as_wire_u32); unrecognized values map to
+    /// `Unknown`.
+    pub fn from_wire_u32(v: u32) -> Self {
+        match v {
+            1 => AgentRunState::Idle,
+            2 => AgentRunState::Working,
+            3 => AgentRunState::Blocked,
+            _ => AgentRunState::Unknown,
+        }
+    }
+}
+
+/// A single pane's published agent status, keyed by [`PaneId`] in
+/// [`SessionInfo::agent_states`]. This is the cross-session unit of the
+/// flock-sidebar's "one sidebar, every project, every agent" view.
+#[derive(Debug, Default, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub struct PaneAgentStatus {
+    pub state: AgentRunState,
+    /// Display label for the agent (e.g. "claude", "codex").
+    pub label: String,
+    /// Whether the user has looked at this pane since it last finished in the
+    /// background — drives the sidebar's Done-unseen notification across
+    /// sessions.
+    pub seen: bool,
+}
+
+/// The flock-sidebar presentation mode, shared across live sessions through
+/// `SessionInfo`.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+pub enum FlockSidebarMode {
+    #[default]
+    Open,
+    Closed,
+}
+
+impl FlockSidebarMode {
+    /// A stable, lower-case wire name used for KDL serialization.
+    pub fn as_wire_str(&self) -> &'static str {
+        match self {
+            FlockSidebarMode::Open => "open",
+            FlockSidebarMode::Closed => "closed",
+        }
+    }
+
+    /// Parse the wire name produced by [`as_wire_str`](Self::as_wire_str),
+    /// falling back to `Open` for anything unrecognized.
+    pub fn from_wire_str(s: &str) -> Self {
+        match s {
+            "closed" => FlockSidebarMode::Closed,
+            _ => FlockSidebarMode::Open,
+        }
+    }
+
+    /// Numeric wire value used for protobuf round-trips.
+    pub fn as_wire_u32(&self) -> u32 {
+        match self {
+            FlockSidebarMode::Open => 0,
+            FlockSidebarMode::Closed => 1,
+        }
+    }
+
+    /// Inverse of [`as_wire_u32`](Self::as_wire_u32); unrecognized values map to
+    /// `Open`.
+    pub fn from_wire_u32(v: u32) -> Self {
+        match v {
+            1 => FlockSidebarMode::Closed,
+            _ => FlockSidebarMode::Open,
+        }
+    }
+}
+
+/// Latest flock-sidebar mode update published by a session. The timestamp lets
+/// sidebars converge on the most recent toggle when multiple sessions are live.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+pub struct FlockSidebarState {
+    pub mode: FlockSidebarMode,
+    pub updated_at_millis: u64,
+}
+
 #[derive(Debug, Default, Clone, PartialEq, Eq, Deserialize, Serialize)]
 pub struct SessionInfo {
     pub name: String,
@@ -1794,6 +1940,27 @@ pub struct SessionInfo {
     pub tab_history: BTreeMap<ClientId, Vec<usize>>,
     pub pane_history: BTreeMap<ClientId, Vec<PaneId>>,
     pub creation_time: Duration,
+    /// The folder the session was started in (the server's launch cwd). Empty
+    /// when unknown. Used as the session's stable workspace identity so plugins
+    /// can group sessions by the project folder they belong to.
+    pub workspace_root: PathBuf,
+    /// The session's `default_command` option (command + args every new
+    /// pane/tab runs instead of the default shell), when one was injected at
+    /// session creation — e.g. the flock codespace binding
+    /// `["gh", "codespace", "ssh", "-c", "<name>"]`. `None` for ordinary
+    /// sessions. Carried on `SessionInfo` so plugins can recognize bound
+    /// sessions (selector: switch-vs-create; sidebar: listing/badging).
+    #[serde(default)]
+    pub default_command: Option<Vec<String>>,
+    /// Per-pane agent status published by this session's flock-sidebar plugin
+    /// (via `PublishAgentState`). Carried on `SessionInfo` so it rides the
+    /// existing cross-session metadata transport: another session's sidebar
+    /// reads this to render that session's agents in full state fidelity.
+    pub agent_states: BTreeMap<PaneId, PaneAgentStatus>,
+    /// The latest open/closed sidebar mode published by this session's
+    /// flock-sidebar plugin. Other sessions adopt the newest published mode so
+    /// the sidebar presentation follows the user across sessions.
+    pub flock_sidebar_state: Option<FlockSidebarState>,
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Eq, Deserialize, Serialize)]
@@ -3452,6 +3619,11 @@ pub enum PluginCommand {
     OpenCommandPaneBackground(CommandToRun, Context),
     RerunCommandPane(u32), // u32  - terminal pane id
     ResizePaneIdWithDirection(ResizeStrategy, PaneId),
+    /// Set a pane's width to an exact column count, bypassing the increment /
+    /// percent-floor resize (which can't shrink a percent-sized pane below 5% of
+    /// the screen). The pane becomes fixed-width and siblings reflow to fill the
+    /// rest, the same way a layout `size=N` pane is laid out. u32 -> target cols.
+    ResizePaneIdToFixedWidth(PaneId, u32),
     EditScrollbackForPaneWithId(PaneId),
     GetPaneScrollback {
         pane_id: PaneId,
@@ -3610,6 +3782,14 @@ pub enum PluginCommand {
     KillSessionsAndReply(Vec<String>), // one or more session names; sends a response back
     DeleteDeadSessionAndReply(String), // session name; sends a response back
     DeleteAllDeadSessionsAndReply,     // no payload; sends a response back
+    /// Publish this session's per-pane agent status to the server, which stores
+    /// it and surfaces it on `SessionInfo` so other sessions' sidebars can see
+    /// it (the flock-sidebar Phase 7 cross-session agent view).
+    PublishAgentState(BTreeMap<PaneId, PaneAgentStatus>),
+    /// Publish this session's flock-sidebar open/closed state to the server,
+    /// which stores it and surfaces it on `SessionInfo` so other sessions'
+    /// sidebars can follow the same presentation mode.
+    PublishFlockSidebarState(FlockSidebarState),
 }
 
 // Response type for plugin API methods that open a pane in a new tab

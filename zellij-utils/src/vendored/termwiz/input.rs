@@ -1798,6 +1798,13 @@ impl InputParser {
                             // already treats unwhitelisted-final CSIs
                             // as `Malformed` and pushes them through.
                             if let Some(len) = complete_csi_len(self.buf.as_slice()) {
+                                // Like the structured-sequence branches above:
+                                // a complete CSI is an autonomous sequence that
+                                // cannot be ALT-combined, so a parked ESC must
+                                // be emitted as a real Esc keystroke before we
+                                // skip past it — otherwise the ESC would
+                                // ALT-combine with the next unrelated key.
+                                self.flush_parked_esc_if_held(&mut callback);
                                 self.buf.advance(len);
                                 continue;
                             }
@@ -2679,6 +2686,33 @@ mod test {
                 );
             }
         }
+    }
+
+    /// Esc keystroke followed by a structurally complete CSI that the
+    /// keymap does not know (e.g. a Kitty keyboard-protocol event) takes
+    /// the unrecognised-CSI skip path. The parked Esc must be flushed
+    /// before the skip, otherwise it survives and ALT-combines with the
+    /// next unrelated keystroke.
+    #[test]
+    fn esc_then_unrecognized_csi_flushes_parked_esc() {
+        let mut p = InputParser::new();
+        let mut res = p.parse_as_vec(b"\x1b\x1b[57441;1u", MAYBE_MORE);
+        res.extend(p.parse_as_vec(b"a", MAYBE_MORE));
+        assert_eq!(
+            res,
+            vec![
+                InputEvent::Key(KeyEvent {
+                    key: KeyCode::Escape,
+                    modifiers: Modifiers::NONE,
+                }),
+                InputEvent::Key(KeyEvent {
+                    key: KeyCode::Char('a'),
+                    modifiers: Modifiers::NONE,
+                }),
+            ],
+            "parked Esc must flush before the unrecognised-CSI skip; \
+             Alt+a means the Esc was wrongly combined with the next key"
+        );
     }
 
     #[test]

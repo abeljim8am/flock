@@ -1,0 +1,20 @@
+layout {
+    pane size=1 borderless=true {
+        plugin location="tab-bar"
+    }
+    pane split_direction="Vertical" {
+        // Docked sidebar. A percent (not a fixed cell count) keeps it resizable
+        // — zellij won't resize fixed-size panes — so Super b (a MessagePlugin
+        // "flock-toggle-width") can toggle it in place, leaving the content
+        // panes' arrangement intact. The plugin drives it to fixed column
+        // targets (slim ~3, expanded ~40) and on load resizes this percent to
+        // the expanded width, so the sidebar starts in the full labeled view.
+        pane size="25%" borderless=true {
+            plugin location="zellij:flock-sidebar"
+        }
+        pane
+    }
+    pane size=2 borderless=true {
+        plugin location="status-bar"
+    }
+}

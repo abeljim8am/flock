@@ -1073,6 +1073,54 @@ dependencies = [
 ]
 
 [[package]]
+name = "flock"
+version = "26.0.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "dialoguer",
+ "embed-resource",
+ "humantime",
+ "insta",
+ "interprocess",
+ "isahc",
+ "log",
+ "miette",
+ "names",
+ "nix",
+ "rand 0.8.5",
+ "regex",
+ "ssh2",
+ "suggest",
+ "thiserror 1.0.61",
+ "vte 0.11.0",
+ "zellij-client",
+ "zellij-server",
+ "zellij-utils",
+]
+
+[[package]]
+name = "flock-selector"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "unicode-width 0.1.10",
+ "zellij-tile",
+ "zellij-utils",
+]
+
+[[package]]
+name = "flock-sidebar"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "unicode-width 0.1.10",
+ "zellij-tile",
+]
+
+[[package]]
 name = "fnv"
 version = "1.0.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4787,35 +4835,8 @@ dependencies = [
 ]
 
 [[package]]
-name = "zellij"
-version = "0.45.0"
-dependencies = [
- "anyhow",
- "clap",
- "dialoguer",
- "embed-resource",
- "humantime",
- "insta",
- "interprocess",
- "isahc",
- "log",
- "miette",
- "names",
- "nix",
- "rand 0.8.5",
- "regex",
- "ssh2",
- "suggest",
- "thiserror 1.0.61",
- "vte 0.11.0",
- "zellij-client",
- "zellij-server",
- "zellij-utils",
-]
-
-[[package]]
 name = "zellij-client"
-version = "0.45.0"
+version = "26.0.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -4863,7 +4884,7 @@ dependencies = [
 
 [[package]]
 name = "zellij-server"
-version = "0.45.0"
+version = "26.0.0"
 dependencies = [
  "ansi_term",
  "anyhow",
@@ -4913,7 +4934,7 @@ dependencies = [
 
 [[package]]
 name = "zellij-tile"
-version = "0.45.0"
+version = "26.0.0"
 dependencies = [
  "clap",
  "prost",
@@ -4926,14 +4947,14 @@ dependencies = [
 
 [[package]]
 name = "zellij-tile-utils"
-version = "0.45.0"
+version = "26.0.0"
 dependencies = [
  "ansi_term",
 ]
 
 [[package]]
 name = "zellij-utils"
-version = "0.45.0"
+version = "26.0.0"
 dependencies = [
  "anyhow",
  "backtrace",

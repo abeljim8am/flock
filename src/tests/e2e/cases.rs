@@ -732,7 +732,7 @@ pub fn close_pane() {
 
 #[test]
 #[ignore]
-pub fn exit_zellij() {
+pub fn exit_flock() {
     let fake_win_size = Size {
         cols: 120,
         rows: 24,
@@ -758,7 +758,7 @@ pub fn exit_zellij() {
             instruction: |remote_terminal: RemoteTerminal| -> bool {
                 let mut step_is_complete = false;
                 if !remote_terminal.status_bar_appears()
-                    && remote_terminal.snapshot_contains("Bye from Zellij!")
+                    && remote_terminal.snapshot_contains("Bye from Flock!")
                 {
                     step_is_complete = true;
                 }
@@ -766,12 +766,12 @@ pub fn exit_zellij() {
             },
         })
     };
-    assert!(last_snapshot.contains("Bye from Zellij!"));
+    assert!(last_snapshot.contains("Bye from Flock!"));
 }
 
 #[test]
 #[ignore]
-pub fn closing_last_pane_exits_zellij() {
+pub fn closing_last_pane_exits_flock() {
     let fake_win_size = Size {
         cols: 120,
         rows: 24,
@@ -802,14 +802,14 @@ pub fn closing_last_pane_exits_zellij() {
             name: "Wait for app to exit",
             instruction: |remote_terminal: RemoteTerminal| -> bool {
                 let mut step_is_complete = false;
-                if remote_terminal.snapshot_contains("Bye from Zellij!") {
+                if remote_terminal.snapshot_contains("Bye from Flock!") {
                     step_is_complete = true;
                 }
                 step_is_complete
             },
         });
     };
-    assert!(last_snapshot.contains("Bye from Zellij!"));
+    assert!(last_snapshot.contains("Bye from Flock!"));
 }
 
 #[test]
@@ -1139,10 +1139,10 @@ pub fn detach_and_attach_session() {
                 instruction: |mut remote_terminal: RemoteTerminal| -> bool {
                     let mut step_is_complete = false;
                     if !remote_terminal.status_bar_appears()
-                        && remote_terminal.snapshot_contains("Bye from Zellij!")
+                        && remote_terminal.snapshot_contains("Bye from Flock!")
                     {
-                        // we don't see the toolbar and Zellij's exit message is visible,
-                        // so Zellij has fully exited and the server is ready to accept connections
+                        // we don't see the toolbar and Flock's exit message is visible,
+                        // so Flock has fully exited and the server is ready to accept connections
                         remote_terminal.attach_to_original_session();
                         step_is_complete = true;
                     }
@@ -1204,7 +1204,7 @@ pub fn quit_and_resurrect_session() {
                 name: "Resurrect session by attaching",
                 instruction: |mut remote_terminal: RemoteTerminal| -> bool {
                     let mut step_is_complete = false;
-                    if remote_terminal.snapshot_contains("Bye from Zellij!") {
+                    if remote_terminal.snapshot_contains("Bye from Flock!") {
                         remote_terminal.attach_to_original_session();
                         step_is_complete = true;
                     }
@@ -1263,7 +1263,7 @@ pub fn quit_and_resurrect_session_with_viewport_serialization() {
             name: "Resurrect session by attaching",
             instruction: |mut remote_terminal: RemoteTerminal| -> bool {
                 let mut step_is_complete = false;
-                if remote_terminal.snapshot_contains("Bye from Zellij!") {
+                if remote_terminal.snapshot_contains("Bye from Flock!") {
                     remote_terminal.attach_to_original_session();
                     step_is_complete = true;
                 }
@@ -2890,7 +2890,7 @@ pub fn override_layout_from_default_to_compact() {
             .add_step(Step {
                 name: "Override to compact layout",
                 instruction: |mut remote_terminal: RemoteTerminal| -> bool {
-                    remote_terminal.run_zellij_action("override-layout compact");
+                    remote_terminal.run_flock_action("override-layout compact");
                     std::thread::sleep(std::time::Duration::from_millis(500));
                     remote_terminal.send_key(&ENTER);
                     true

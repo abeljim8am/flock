@@ -441,6 +441,12 @@ fn host_run_plugin_command(mut caller: Caller<'_, PluginEnv>) {
                     PluginCommand::DeleteAllDeadSessionsAndReply => {
                         delete_all_dead_sessions_and_reply(env)
                     },
+                    PluginCommand::PublishAgentState(agent_states) => {
+                        publish_agent_state(env, agent_states)
+                    },
+                    PluginCommand::PublishFlockSidebarState(sidebar_state) => {
+                        publish_flock_sidebar_state(env, sidebar_state)
+                    },
                     PluginCommand::ScanHostFolder(folder_to_scan) => {
                         scan_host_folder(env, folder_to_scan)
                     },
@@ -475,6 +481,9 @@ fn host_run_plugin_command(mut caller: Caller<'_, PluginEnv>) {
                     },
                     PluginCommand::ResizePaneIdWithDirection(resize, pane_id) => {
                         resize_pane_with_id(env, resize, pane_id.into())
+                    },
+                    PluginCommand::ResizePaneIdToFixedWidth(pane_id, width) => {
+                        resize_pane_id_to_fixed_width(env, pane_id.into(), width as usize)
                     },
                     PluginCommand::EditScrollbackForPaneWithId(pane_id) => {
                         edit_scrollback_for_pane_with_id(env, pane_id.into())
@@ -892,8 +901,13 @@ fn show_cursor(env: &PluginEnv, cursor_position: Option<(usize, usize)>) {
 }
 
 fn request_permission(env: &PluginEnv, permissions: Vec<PermissionType>) -> Result<()> {
-    if PermissionCache::from_path_or_default(None)
-        .check_permissions(env.plugin.location.to_string(), &permissions)
+    // Built-in plugins are part of the application itself — `check_command_permission`
+    // already grants them everything ("there's no use to deny them anything"), so the
+    // approval prompt is pure friction with no security value. Auto-grant them, just
+    // like an already-cached grant, instead of showing the permission screen.
+    if env.plugin.is_builtin()
+        || PermissionCache::from_path_or_default(None)
+            .check_permissions(env.plugin.location.to_string(), &permissions)
     {
         return env
             .senders
@@ -2462,7 +2476,11 @@ fn switch_tab_to(env: &PluginEnv, tab_idx: u32) {
 fn set_timeout(env: &PluginEnv, secs: f64) {
     let send_plugin_instructions = env.senders.to_plugin.clone();
     let update_target = Some(env.plugin_id);
-    let client_id = env.client_id;
+    // read the instance's client binding at fire time, not arm time: a client
+    // re-attach can rebind the instance to a new client id while the timer is
+    // sleeping, and an event addressed to the old id would be dropped —
+    // permanently killing self re-arming timer chains
+    let live_client_id = env.live_client_id.clone();
     let plugin_name = env.name();
     // Use tokio runtime for async I/O (timer operation)
     get_tokio_runtime().spawn(async move {
@@ -2471,6 +2489,7 @@ fn set_timeout(env: &PluginEnv, secs: f64) {
         // FIXME: The way that elapsed time is being calculated here is not exact; it doesn't take into account the
         // time it takes an event to actually reach the plugin after it's sent to the `wasm` thread.
         let elapsed_time = Instant::now().duration_since(start_time).as_secs_f64();
+        let client_id = live_client_id.load(std::sync::atomic::Ordering::SeqCst);
 
         send_plugin_instructions
             .ok_or(anyhow!("found no sender to send plugin instruction to"))
@@ -3273,6 +3292,26 @@ fn disconnect_other_clients(env: &PluginEnv) {
         .context("failed to send disconnect other clients instruction");
 }
 
+fn publish_agent_state(
+    env: &PluginEnv,
+    agent_states: BTreeMap<zellij_utils::data::PaneId, zellij_utils::data::PaneAgentStatus>,
+) {
+    let _ = env
+        .senders
+        .send_to_screen(ScreenInstruction::PublishAgentState(agent_states))
+        .context("failed to publish agent state");
+}
+
+fn publish_flock_sidebar_state(
+    env: &PluginEnv,
+    sidebar_state: zellij_utils::data::FlockSidebarState,
+) {
+    let _ = env
+        .senders
+        .send_to_screen(ScreenInstruction::PublishFlockSidebarState(sidebar_state))
+        .context("failed to publish flock sidebar state");
+}
+
 fn kill_sessions(session_names: Vec<String>) {
     for session_name in session_names {
         let path = &*ZELLIJ_SOCK_DIR.join(&session_name);
@@ -3307,50 +3346,48 @@ fn kill_sessions(session_names: Vec<String>) {
 // Wedge timeout: only guards against a peer that neither shuts down nor
 // crashes. Normal kill latency is tens of milliseconds (peer's route loop
 // reads the message, server sends Exit back), so 500 ms is several times the
-// expected worst case while still feeling instant to the user. Applied as a
-// single budget over the whole batch -- per-session kills are issued
-// concurrently so killing many sessions does not multiply the wait.
+// expected worst case while still feeling instant to the user. Applied per
+// session -- kills are issued concurrently, so the whole batch is still
+// bounded by a single budget of wall time while one wedged peer cannot mark
+// the kills that succeeded as failed.
 const KILL_WEDGE_TIMEOUT: Duration = Duration::from_millis(500);
 
 fn kill_sessions_and_reply(env: &PluginEnv, session_names: Vec<String>) {
     use tokio::task::JoinSet;
     let runtime = get_tokio_runtime();
     let result: Result<(), String> = runtime.block_on(async {
-        let mut set: JoinSet<(String, std::io::Result<()>)> = JoinSet::new();
+        let mut set: JoinSet<(String, Result<(), String>)> = JoinSet::new();
         for name in session_names {
             let path = ZELLIJ_SOCK_DIR.join(&name);
             set.spawn(async move {
-                let res = zellij_utils::ipc::async_send_kill_and_await(&path).await;
+                let res = match tokio::time::timeout(
+                    KILL_WEDGE_TIMEOUT,
+                    zellij_utils::ipc::async_send_kill_and_await(&path),
+                )
+                .await
+                {
+                    Ok(Ok(())) => Ok(()),
+                    Ok(Err(e)) => Err(e.to_string()),
+                    Err(_) => Err("timed out waiting for kill acknowledgement".to_string()),
+                };
                 (name, res)
             });
         }
-        let drain = async {
-            let mut first_err: Option<String> = None;
-            while let Some(joined) = set.join_next().await {
-                match joined {
-                    Ok((_name, Ok(()))) => {},
-                    Ok((name, Err(e))) => {
-                        if first_err.is_none() {
-                            first_err = Some(format!("Failed to kill session {}: {}", name, e));
-                        }
-                    },
-                    Err(e) => {
-                        if first_err.is_none() {
-                            first_err = Some(format!("Internal error in kill task: {}", e));
-                        }
-                    },
-                }
+        let mut failures: Vec<String> = Vec::new();
+        while let Some(joined) = set.join_next().await {
+            match joined {
+                Ok((_name, Ok(()))) => {},
+                Ok((name, Err(e))) => failures.push(format!("{}: {}", name, e)),
+                Err(e) => failures.push(format!("internal error in kill task: {}", e)),
             }
-            match first_err {
-                Some(e) => Err(e),
-                None => Ok(()),
-            }
-        };
-        match tokio::time::timeout(KILL_WEDGE_TIMEOUT, drain).await {
-            Ok(res) => res,
-            Err(_) => {
-                Err("Timed out waiting for one or more sessions to acknowledge kill".to_string())
-            },
+        }
+        if failures.is_empty() {
+            Ok(())
+        } else {
+            Err(format!(
+                "Failed to kill session(s): {}",
+                failures.join(", ")
+            ))
         }
     });
     let response = match result {
@@ -3984,6 +4021,12 @@ fn resize_pane_with_id(env: &PluginEnv, resize: ResizeStrategy, pane_id: PaneId)
         .send_to_screen(ScreenInstruction::ResizePaneWithId(resize, pane_id));
 }
 
+fn resize_pane_id_to_fixed_width(env: &PluginEnv, pane_id: PaneId, width: usize) {
+    let _ = env
+        .senders
+        .send_to_screen(ScreenInstruction::ResizePaneIdToFixedWidth(pane_id, width));
+}
+
 fn edit_scrollback_for_pane_with_id(env: &PluginEnv, pane_id: PaneId) {
     let _ = env
         .senders
@@ -4190,15 +4233,63 @@ fn get_session_list(env: &PluginEnv) {
                 (name, info.available_layouts, plugins)
             };
 
-            let (live_sessions_map, resurrectable_sessions_map) =
-                scan_session_list_default_dirs(&session_name, &available_layouts, &plugin_list);
-
-            let _ = env
-                .senders
-                .send_to_screen(ScreenInstruction::UpdateSessionInfos(
-                    live_sessions_map.clone(),
-                    resurrectable_sessions_map.clone(),
-                ));
+            let cached_scan = state.last_scan_result.lock().unwrap().clone();
+            let (live_sessions_map, resurrectable_sessions_map) = match cached_scan {
+                Some(last_scan) => {
+                    // serve the last scan immediately and refresh it
+                    // off-thread: the scan's socket liveness handshakes can
+                    // block, and this runs on the calling plugin's event
+                    // thread. The refreshed scan reaches plugins through the
+                    // UpdateSessionInfos -> SessionUpdate broadcast and the
+                    // next poll of this command.
+                    if !state
+                        .scan_in_flight
+                        .swap(true, std::sync::atomic::Ordering::SeqCst)
+                    {
+                        let state = state.clone();
+                        let senders = env.senders.clone();
+                        get_tokio_runtime().spawn(async move {
+                            let scan = tokio::task::spawn_blocking(move || {
+                                scan_session_list_default_dirs(
+                                    &session_name,
+                                    &available_layouts,
+                                    &plugin_list,
+                                )
+                            })
+                            .await;
+                            if let Ok((live_sessions, resurrectable_sessions)) = scan {
+                                *state.last_scan_result.lock().unwrap() =
+                                    Some((live_sessions.clone(), resurrectable_sessions.clone()));
+                                let _ =
+                                    senders.send_to_screen(ScreenInstruction::UpdateSessionInfos(
+                                        live_sessions,
+                                        resurrectable_sessions,
+                                    ));
+                            }
+                            state
+                                .scan_in_flight
+                                .store(false, std::sync::atomic::Ordering::SeqCst);
+                        });
+                    }
+                    last_scan
+                },
+                None => {
+                    // first call in this session: prime the cache synchronously
+                    let scan = scan_session_list_default_dirs(
+                        &session_name,
+                        &available_layouts,
+                        &plugin_list,
+                    );
+                    *state.last_scan_result.lock().unwrap() = Some(scan.clone());
+                    let _ = env
+                        .senders
+                        .send_to_screen(ScreenInstruction::UpdateSessionInfos(
+                            scan.0.clone(),
+                            scan.1.clone(),
+                        ));
+                    scan
+                },
+            };
 
             let snapshot = SessionListSnapshot {
                 live_sessions: live_sessions_map.into_values().collect(),
@@ -5392,6 +5483,7 @@ fn check_command_permission(
         | PluginCommand::HidePaneWithId(..)
         | PluginCommand::RerunCommandPane(..)
         | PluginCommand::ResizePaneIdWithDirection(..)
+        | PluginCommand::ResizePaneIdToFixedWidth(..)
         | PluginCommand::CloseTabWithIndex(..)
         | PluginCommand::BreakPanesToNewTab(..)
         | PluginCommand::BreakPanesToTabWithIndex(..)
@@ -5428,6 +5520,8 @@ fn check_command_permission(
         | PluginCommand::ShowFloatingPanes { .. }
         | PluginCommand::HideFloatingPanes { .. }
         | PluginCommand::SetPaneRegexHighlights(..)
+        | PluginCommand::PublishAgentState(..)
+        | PluginCommand::PublishFlockSidebarState(..)
         | PluginCommand::ClearPaneHighlights(..) => PermissionType::ChangeApplicationState,
         PluginCommand::UnblockCliPipeInput(..)
         | PluginCommand::BlockCliPipeInput(..)

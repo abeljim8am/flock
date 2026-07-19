@@ -3,7 +3,7 @@ source: src/tests/e2e/cases.rs
 expression: last_snapshot
 ---
 ┌ Pane #1 ─────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
-│$ /usr/src/zellij/zellij action override-layout compact                                                               │
+│$ /usr/src/flock/flock action override-layout compact                                                                 │
 │$                                                                                                                     │
 │$ █                                                                                                                   │
 │                                                                                                                      │

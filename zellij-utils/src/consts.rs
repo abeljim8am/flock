@@ -7,18 +7,18 @@ use lazy_static::lazy_static;
 use std::{path::PathBuf, sync::OnceLock};
 use uuid::Uuid;
 
-pub const ZELLIJ_CONFIG_FILE_ENV: &str = "ZELLIJ_CONFIG_FILE";
-pub const ZELLIJ_CONFIG_DIR_ENV: &str = "ZELLIJ_CONFIG_DIR";
-pub const ZELLIJ_LAYOUT_DIR_ENV: &str = "ZELLIJ_LAYOUT_DIR";
+pub const ZELLIJ_CONFIG_FILE_ENV: &str = "FLOCK_CONFIG_FILE";
+pub const ZELLIJ_CONFIG_DIR_ENV: &str = "FLOCK_CONFIG_DIR";
+pub const ZELLIJ_LAYOUT_DIR_ENV: &str = "FLOCK_LAYOUT_DIR";
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 pub const DEFAULT_SCROLL_BUFFER_SIZE: usize = 10_000;
 pub static SCROLL_BUFFER_SIZE: OnceLock<usize> = OnceLock::new();
 pub static DEBUG_MODE: OnceLock<bool> = OnceLock::new();
 
 #[cfg(not(windows))]
-pub const SYSTEM_DEFAULT_CONFIG_DIR: &str = "/etc/zellij";
+pub const SYSTEM_DEFAULT_CONFIG_DIR: &str = "/etc/flock";
 #[cfg(windows)]
-pub const SYSTEM_DEFAULT_CONFIG_DIR: &str = "C:\\ProgramData\\Zellij";
+pub const SYSTEM_DEFAULT_CONFIG_DIR: &str = "C:\\ProgramData\\Flock";
 pub const SYSTEM_DEFAULT_DATA_DIR_PREFIX: &str = system_default_data_dir();
 
 pub static ZELLIJ_DEFAULT_THEMES: Dir = include_dir!("$CARGO_MANIFEST_DIR/assets/themes");
@@ -80,7 +80,7 @@ const fn system_default_data_dir() -> &'static str {
     if let Some(data_dir) = std::option_env!("PREFIX") {
         data_dir
     } else if cfg!(windows) {
-        "C:\\ProgramData\\Zellij"
+        "C:\\ProgramData\\Flock"
     } else {
         "/usr"
     }
@@ -91,9 +91,9 @@ lazy_static! {
         format!("contract_version_{}", CLIENT_SERVER_CONTRACT_VERSION);
     pub static ref ZELLIJ_PROJ_DIR: ProjectDirs = {
         if cfg!(windows) {
-            ProjectDirs::from("", "", "Zellij").unwrap()
+            ProjectDirs::from("", "", "Flock").unwrap()
         } else {
-            ProjectDirs::from("org", "Zellij Contributors", "Zellij").unwrap()
+            ProjectDirs::from("dev", "Flock", "Flock").unwrap()
         }
     };
     pub static ref ZELLIJ_CACHE_DIR: PathBuf = ZELLIJ_PROJ_DIR.cache_dir().to_path_buf();
@@ -115,6 +115,35 @@ pub const FEATURES: &[&str] = &[
     #[cfg(feature = "disable_automatic_asset_installation")]
     "disable_automatic_asset_installation",
 ];
+
+#[cfg(test)]
+mod flock_namespace_tests {
+    use super::*;
+
+    fn assert_flock_product_dir(path: &std::path::Path) {
+        assert!(
+            path.components().any(|component| component
+                .as_os_str()
+                .to_string_lossy()
+                .to_ascii_lowercase()
+                .contains("flock")),
+            "expected Flock-specific project directory, got {path:?}"
+        );
+    }
+
+    #[test]
+    fn flock_uses_product_specific_config_and_storage_roots() {
+        assert_eq!(ZELLIJ_CONFIG_FILE_ENV, "FLOCK_CONFIG_FILE");
+        assert_eq!(ZELLIJ_CONFIG_DIR_ENV, "FLOCK_CONFIG_DIR");
+        assert_eq!(ZELLIJ_LAYOUT_DIR_ENV, "FLOCK_LAYOUT_DIR");
+        assert_flock_product_dir(&ZELLIJ_CACHE_DIR);
+        assert_flock_product_dir(ZELLIJ_PROJ_DIR.config_dir());
+        assert_flock_product_dir(ZELLIJ_PROJ_DIR.data_dir());
+        assert!(ZELLIJ_TMP_DIR
+            .file_name()
+            .is_some_and(|name| name.to_string_lossy().starts_with("flock")));
+    }
+}
 
 #[cfg(not(target_family = "wasm"))]
 pub use not_wasm::*;
@@ -171,6 +200,8 @@ mod not_wasm {
             add_plugin!(assets, "multiple-select.wasm");
             add_plugin!(assets, "layout-manager.wasm");
             add_plugin!(assets, "link.wasm");
+            add_plugin!(assets, "flock-sidebar.wasm");
+            add_plugin!(assets, "flock-selector.wasm");
             assets
         };
     }
@@ -310,9 +341,9 @@ mod unix_only {
 
     lazy_static! {
         static ref UID: Uid = Uid::current();
-        pub static ref ZELLIJ_TMP_DIR: PathBuf = temp_dir().join(format!("zellij-{}", *UID));
-        pub static ref ZELLIJ_TMP_LOG_DIR: PathBuf = ZELLIJ_TMP_DIR.join("zellij-log");
-        pub static ref ZELLIJ_TMP_LOG_FILE: PathBuf = ZELLIJ_TMP_LOG_DIR.join("zellij.log");
+        pub static ref ZELLIJ_TMP_DIR: PathBuf = temp_dir().join(format!("flock-{}", *UID));
+        pub static ref ZELLIJ_TMP_LOG_DIR: PathBuf = ZELLIJ_TMP_DIR.join("flock-log");
+        pub static ref ZELLIJ_TMP_LOG_FILE: PathBuf = ZELLIJ_TMP_LOG_DIR.join("flock.log");
         pub static ref ZELLIJ_SOCK_DIR: PathBuf = {
             let mut ipc_dir = envs::get_socket_dir().map_or_else(
                 |_| {
@@ -357,10 +388,10 @@ mod not_unix {
     lazy_static! {
         pub static ref ZELLIJ_TMP_DIR: PathBuf = {
             let tmp_dir = canonicalize_path(temp_dir());
-            tmp_dir.join("zellij")
+            tmp_dir.join("flock")
         };
-        pub static ref ZELLIJ_TMP_LOG_DIR: PathBuf = ZELLIJ_TMP_DIR.join("zellij-log");
-        pub static ref ZELLIJ_TMP_LOG_FILE: PathBuf = ZELLIJ_TMP_LOG_DIR.join("zellij.log");
+        pub static ref ZELLIJ_TMP_LOG_DIR: PathBuf = ZELLIJ_TMP_DIR.join("flock-log");
+        pub static ref ZELLIJ_TMP_LOG_FILE: PathBuf = ZELLIJ_TMP_LOG_DIR.join("flock.log");
         pub static ref ZELLIJ_SOCK_DIR: PathBuf = {
             let mut ipc_dir = canonicalize_path(envs::get_socket_dir().map_or_else(
                 |_| {
