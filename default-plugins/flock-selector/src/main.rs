@@ -201,6 +201,19 @@ mod tests {
     }
 
     #[test]
+    fn fresh_session_snapshot_replaces_the_startup_cache() {
+        let mut state = State::default();
+        let sessions = vec![SessionInfo {
+            name: "already-running".into(),
+            ..SessionInfo::default()
+        }];
+
+        assert!(state.update_sessions(sessions.clone()));
+        assert_eq!(state.sessions, sessions);
+        assert!(!state.update_sessions(sessions));
+    }
+
+    #[test]
     fn coder_creation_keys_edit_filter_name_and_navigate_back() {
         let mut state = State {
             permissions_granted: true,
@@ -298,6 +311,11 @@ impl ZellijPlugin for State {
             Event::PermissionRequestResult(result) => {
                 self.permissions_granted = matches!(result, PermissionStatus::Granted);
                 if self.permissions_granted {
+                    // SessionUpdate is a broadcast, so the initial update can
+                    // race plugin startup (or be filtered before the read
+                    // permission is granted). Pull a snapshot explicitly so
+                    // sessions that were already running appear immediately.
+                    self.refresh_session_list();
                     self.fire_scans();
                     if self.config.devcontainers_enabled {
                         self.fire_devcontainer_scans();
@@ -320,7 +338,7 @@ impl ZellijPlugin for State {
                 should_render = true;
             },
             Event::SessionUpdate(session_infos, _resurrectable) => {
-                self.sessions = session_infos;
+                self.update_sessions(session_infos);
                 should_render = true;
             },
             Event::Timer(_) => {
@@ -329,6 +347,9 @@ impl ZellijPlugin for State {
                     self.coder_create_notice = None;
                 }
                 if self.permissions_granted {
+                    // Keep the list correct even when no SessionUpdate is
+                    // broadcast after this selector instance subscribes.
+                    should_render |= self.refresh_session_list();
                     self.fire_scans();
                     if self.config.devcontainers_enabled {
                         self.fire_devcontainer_scans();
@@ -611,6 +632,28 @@ impl ZellijPlugin for State {
 }
 
 impl State {
+    /// Replace the local live-session cache with a fresh host snapshot.
+    fn update_sessions(&mut self, sessions: Vec<SessionInfo>) -> bool {
+        if self.sessions == sessions {
+            false
+        } else {
+            self.sessions = sessions;
+            true
+        }
+    }
+
+    /// Ask the host for the current session list instead of relying solely on
+    /// SessionUpdate broadcasts, which can be missed during plugin startup.
+    fn refresh_session_list(&mut self) -> bool {
+        match get_session_list() {
+            Ok(snapshot) => self.update_sessions(snapshot.live_sessions),
+            Err(reason) => {
+                eprintln!("flock-selector: failed to refresh session list: {reason}");
+                false
+            },
+        }
+    }
+
     /// Re-derive the candidate project set from the individual dirs plus the
     /// latest per-root scan results, and re-clamp the selection.
     fn rebuild_projects(&mut self) {
