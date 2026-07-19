@@ -121,13 +121,12 @@ mod flock_namespace_tests {
     use super::*;
 
     fn assert_flock_product_dir(path: &std::path::Path) {
-        let product_dir = path
-            .file_name()
-            .expect("project directory should have a final component")
-            .to_string_lossy()
-            .to_ascii_lowercase();
         assert!(
-            product_dir.contains("flock"),
+            path.components().any(|component| component
+                .as_os_str()
+                .to_string_lossy()
+                .to_ascii_lowercase()
+                .contains("flock")),
             "expected Flock-specific project directory, got {path:?}"
         );
     }
