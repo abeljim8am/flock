@@ -21,7 +21,7 @@ pub const RELEASE_BASE_URL: &str = "https://github.com/abeljim8am/zellij/release
 /// The host-side gateway is deliberately an exact argv shape. Both Flock
 /// plugins recognize this as the durable Coder binding, while the shell body
 /// remains an implementation detail that can evolve without changing identity.
-pub const GATEWAY_SCRIPT: &str = r#"trap 'exit 130' INT; trap 'exit 143' TERM; identifier="$1"; remote="$HOME/.local/share/flock/current/zellij"; while :; do coder ssh -t "$identifier" -- "$remote" attach --create flock options --default-layout flock-coder-remote; status=$?; [ "$status" -eq 0 ] && exit 0; printf '\nflock: Coder connection lost; retrying in 2s (Ctrl-c to stop)\n' >&2; sleep 2 || exit "$status"; done"#;
+pub const GATEWAY_SCRIPT: &str = r#"trap 'exit 130' INT; trap 'exit 143' TERM; identifier="$1"; while :; do coder ssh -t "$identifier" -- '"$HOME/.local/share/flock/current/zellij"' attach --create flock options --default-layout flock-coder-remote; status=$?; [ "$status" -eq 0 ] && exit 0; printf '\nflock: Coder connection lost; retrying in 2s (Ctrl-c to stop)\n' >&2; sleep 2 || exit "$status"; done"#;
 
 const CACHE_PATH: &str = "/data/coder-workspaces.json";
 const FALLBACK_NAME: &str = "coder";
@@ -153,8 +153,14 @@ ln -sfn "$dest/zellij" "$HOME/.local/bin/zellij""#,
         "--".into(),
         "sh".into(),
         "-lc".into(),
-        script,
+        quote_coder_remote_arg(&script),
     ]
+}
+
+/// `coder ssh` joins command arguments into a command line for the workspace's
+/// login shell. Keep a script as one `sh -lc` argument across that extra parse.
+fn quote_coder_remote_arg(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\"'\"'"))
 }
 
 pub fn bootstrap_context(identifier: &str) -> BTreeMap<String, String> {
@@ -1108,10 +1114,20 @@ mod tests {
         let gateway = gateway_argv("alice/api");
         assert_eq!(parse_gateway(&gateway), Some("alice/api"));
         assert_eq!(parse_coder_ssh(&gateway), Some("alice/api"));
+        assert!(GATEWAY_SCRIPT.contains("-- '\"$HOME/.local/share/flock/current/zellij\"'"));
         let bootstrap = bootstrap_argv("alice/api");
         assert_eq!(&bootstrap[..3], &["coder", "ssh", "alice/api"]);
-        assert!(bootstrap.last().unwrap().contains("x86_64-unknown-linux-musl"));
+        assert!(bootstrap
+            .last()
+            .unwrap()
+            .contains("x86_64-unknown-linux-musl"));
         assert!(bootstrap.last().unwrap().contains("sha256sum"));
         assert!(!bootstrap.last().unwrap().contains("alice/api"));
+        assert!(bootstrap.last().unwrap().starts_with("'set -eu"));
+        assert!(bootstrap.last().unwrap().ends_with('\''));
+        assert_eq!(
+            quote_coder_remote_arg("printf '%s'"),
+            r#"'printf '"'"'%s'"'"''"#
+        );
     }
 }

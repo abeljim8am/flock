@@ -9,7 +9,7 @@ pub const SNAPSHOT_PIPE_NAME: &str = "flock-state-snapshot-v1";
 pub const SNAPSHOT_CONTEXT_KEY: &str = "flock_coder_snapshot";
 pub const REMOTE_SESSION_NAME: &str = "flock";
 pub const GATEWAY_WRAPPER_ARG0: &str = "flock-coder-gateway";
-pub const GATEWAY_SCRIPT: &str = r#"trap 'exit 130' INT; trap 'exit 143' TERM; identifier="$1"; remote="$HOME/.local/share/flock/current/zellij"; while :; do coder ssh -t "$identifier" -- "$remote" attach --create flock options --default-layout flock-coder-remote; status=$?; [ "$status" -eq 0 ] && exit 0; printf '\nflock: Coder connection lost; retrying in 2s (Ctrl-c to stop)\n' >&2; sleep 2 || exit "$status"; done"#;
+pub const GATEWAY_SCRIPT: &str = r#"trap 'exit 130' INT; trap 'exit 143' TERM; identifier="$1"; while :; do coder ssh -t "$identifier" -- '"$HOME/.local/share/flock/current/zellij"' attach --create flock options --default-layout flock-coder-remote; status=$?; [ "$status" -eq 0 ] && exit 0; printf '\nflock: Coder connection lost; retrying in 2s (Ctrl-c to stop)\n' >&2; sleep 2 || exit "$status"; done"#;
 const SNAPSHOT_CACHE_PATH: &str = "/data/coder-snapshots-v1.json";
 
 pub fn parse_coder_ssh(argv: &[String]) -> Option<&str> {
@@ -77,12 +77,12 @@ pub fn snapshot_argv(identifier: &str) -> Vec<String> {
         "ssh".into(),
         identifier.into(),
         "--".into(),
-        "sh".into(),
-        "-lc".into(),
-        format!(
-            r#"exec "$HOME/.local/share/flock/current/zellij" --session {} pipe --name {}"#,
-            REMOTE_SESSION_NAME, SNAPSHOT_PIPE_NAME
-        ),
+        r#""$HOME/.local/share/flock/current/zellij""#.into(),
+        "--session".into(),
+        REMOTE_SESSION_NAME.into(),
+        "pipe".into(),
+        "--name".into(),
+        SNAPSHOT_PIPE_NAME.into(),
     ]
 }
 
@@ -92,10 +92,11 @@ pub fn focus_argv(identifier: &str, pane_id: &str) -> Vec<String> {
         "ssh".into(),
         identifier.into(),
         "--".into(),
-        "sh".into(),
-        "-lc".into(),
-        r#"exec "$HOME/.local/share/flock/current/zellij" --session flock action focus-pane-id "$1""#.into(),
-        "flock-focus-pane".into(),
+        r#""$HOME/.local/share/flock/current/zellij""#.into(),
+        "--session".into(),
+        REMOTE_SESSION_NAME.into(),
+        "action".into(),
+        "focus-pane-id".into(),
         pane_id.into(),
     ]
 }
@@ -194,8 +195,19 @@ mod tests {
     fn snapshot_and_focus_commands_keep_identifiers_as_single_arguments() {
         let snapshot = snapshot_argv("alice/api");
         assert_eq!(&snapshot[..3], &["coder", "ssh", "alice/api"]);
-        assert!(snapshot.last().unwrap().contains(SNAPSHOT_PIPE_NAME));
+        assert_eq!(
+            &snapshot[4..],
+            &[
+                r#""$HOME/.local/share/flock/current/zellij""#,
+                "--session",
+                REMOTE_SESSION_NAME,
+                "pipe",
+                "--name",
+                SNAPSHOT_PIPE_NAME,
+            ]
+        );
         let focus = focus_argv("alice/api", "terminal_7");
+        assert_eq!(focus[4], r#""$HOME/.local/share/flock/current/zellij""#);
         assert_eq!(focus.last().map(String::as_str), Some("terminal_7"));
     }
 }

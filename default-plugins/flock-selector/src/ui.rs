@@ -351,6 +351,17 @@ pub fn render(input: RenderInput) -> RenderOutput {
                 None,
                 &[Span::new(" ✓ ", p.green), Span::new(notice, p.text).bold()],
             );
+        } else if total > 0 {
+            if let Some(error) = coder_error {
+                render_row(
+                    &mut out,
+                    0,
+                    input_y.saturating_sub(1),
+                    cols,
+                    None,
+                    &coder_error_spans(error, p),
+                );
+            }
         }
     }
 
@@ -1350,6 +1361,44 @@ mod tests {
         assert!(output.ansi.contains("running"));
         assert!(output.ansi.contains("Coder"));
         assert!(!output.ansi.contains("Codespaces"));
+
+        let output_with_error = render(RenderInput {
+            coder_error: Some(&crate::coder::CoderError::Other("bootstrap failed".into())),
+            ..RenderInput {
+                permissions_granted: true,
+                configured: false,
+                query: "",
+                mode: PickerMode::Coder,
+                enabled_modes: &[
+                    PickerMode::Sessions,
+                    PickerMode::Projects,
+                    PickerMode::Coder,
+                ],
+                session_results: &[],
+                results: &[],
+                open_paths: &std::collections::HashSet::new(),
+                codespace_results: &[],
+                bound_codespaces: &std::collections::HashSet::new(),
+                codespaces_error: None,
+                codespaces_refreshing: false,
+                pending_stop: None,
+                coder_results: &ranked,
+                bound_coder_workspaces: &std::collections::HashSet::new(),
+                coder_error: None,
+                coder_refreshing: false,
+                pending_coder_stop: None,
+                coder_create: None,
+                coder_create_notice: None,
+                pending_devcontainer: None,
+                palette: &theme,
+                selected: 0,
+                scroll: 0,
+                total_candidates: 1,
+                rows: 5,
+                cols: 80,
+            }
+        });
+        assert!(output_with_error.ansi.contains("bootstrap failed"));
     }
 
     #[test]
