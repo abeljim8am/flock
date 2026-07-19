@@ -199,6 +199,13 @@ pub fn zellij_server_listener(
 
                                 if let Some(config_file_path) = &config_file_path {
                                     if let Ok(new_config) = Config::from_path(&config_file_path, Some(config.clone())) {
+                                        // The seed resolves the theme via `config_options`,
+                                        // which otherwise still holds the options from the
+                                        // last attach — refresh it (and the cached config)
+                                        // so OSC 10/11/4 replies match the theme the
+                                        // browser repaints with below.
+                                        config = new_config.clone();
+                                        config_options = new_config.options.clone();
                                         // Re-seed host-query cache for this client
                                         // so OSC 10/11/4 replies follow the new theme.
                                         for seed in build_host_query_seed_msgs(&new_config, &config_options) {

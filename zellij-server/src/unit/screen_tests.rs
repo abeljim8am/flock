@@ -378,6 +378,7 @@ impl MockScreen {
                     config,
                     debug,
                     Box::new(Layout::default()),
+                    None,
                 )
                 .expect("TEST")
             })
@@ -464,6 +465,7 @@ impl MockScreen {
                     config,
                     debug,
                     Box::new(Layout::default()),
+                    None,
                 )
                 .expect("TEST")
             })
@@ -627,6 +629,7 @@ impl MockScreen {
         SessionMetaData {
             senders: self.session_metadata.senders.clone(),
             default_shell: self.session_metadata.default_shell.clone(),
+            session_default_command: self.session_metadata.session_default_command.clone(),
             screen_thread: None,
             pty_thread: None,
             plugin_thread: None,
@@ -680,6 +683,7 @@ impl MockScreen {
                 should_silently_fail: true,
             },
             default_shell: None,
+            session_default_command: None,
             screen_thread: None,
             pty_thread: None,
             plugin_thread: None,

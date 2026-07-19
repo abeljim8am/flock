@@ -8535,6 +8535,341 @@ fn new_pane_in_auto_layout() {
 }
 
 #[test]
+fn fixed_width_resize_of_unselectable_sidebar_preserves_auto_layout() {
+    let size = Size {
+        cols: 120,
+        rows: 30,
+    };
+    let client_id = 1;
+    let base_layout = r#"
+        layout {
+            pane size=1 borderless=true {
+                plugin location="zellij:tab-bar"
+            }
+            pane split_direction="vertical" {
+                pane size="25%" borderless=true {
+                    plugin location="zellij:flock-sidebar"
+                }
+                pane
+            }
+            pane size=2 borderless=true {
+                plugin location="zellij:status-bar"
+            }
+        }
+    "#;
+    let swap_layouts = r#"
+        layout {
+            swap_tiled_layout {
+                tab max_panes=5 {
+                    pane size=1 borderless=true {
+                        plugin location="zellij:tab-bar"
+                    }
+                    pane split_direction="vertical" {
+                        pane size=40 borderless=true {
+                            plugin location="zellij:flock-sidebar"
+                        }
+                        pane split_direction="vertical" {
+                            pane { children; }
+                            pane
+                        }
+                    }
+                    pane size=2 borderless=true {
+                        plugin location="zellij:status-bar"
+                    }
+                }
+            }
+        }
+    "#;
+    let (base_layout, base_floating_layout) =
+        Layout::from_kdl(base_layout, Some("file_name.kdl".into()), None, None)
+            .unwrap()
+            .template
+            .unwrap();
+
+    let new_terminal_ids = vec![(1, None)];
+    let new_floating_terminal_ids = vec![];
+    let mut new_plugin_ids = HashMap::new();
+    new_plugin_ids.insert(
+        RunPluginOrAlias::from_url("zellij:tab-bar", &None, None, None).unwrap(),
+        vec![1],
+    );
+    new_plugin_ids.insert(
+        RunPluginOrAlias::from_url("zellij:flock-sidebar", &None, None, None).unwrap(),
+        vec![2],
+    );
+    new_plugin_ids.insert(
+        RunPluginOrAlias::from_url("zellij:status-bar", &None, None, None).unwrap(),
+        vec![3],
+    );
+
+    let swap_layout =
+        Layout::from_kdl(swap_layouts, Some("file_name.kdl".into()), None, None).unwrap();
+    let swap_tiled_layouts = swap_layout.swap_tiled_layouts.clone();
+    let swap_floating_layouts = swap_layout.swap_floating_layouts.clone();
+    let stacked_resize = true;
+    let mut tab = create_new_tab_with_swap_layouts(
+        size,
+        ModeInfo::default(),
+        (swap_tiled_layouts, swap_floating_layouts),
+        Some((
+            base_layout,
+            base_floating_layout,
+            new_terminal_ids,
+            new_floating_terminal_ids,
+            new_plugin_ids,
+        )),
+        true,
+        stacked_resize,
+    );
+
+    tab.set_pane_selectable(PaneId::Plugin(1), false);
+    tab.set_pane_selectable(PaneId::Plugin(2), false);
+    tab.set_pane_selectable(PaneId::Plugin(3), false);
+    tab.resize_pane_id_to_fixed_width(PaneId::Plugin(2), 40)
+        .unwrap();
+    assert!(
+        !tab.swap_layouts.is_tiled_damaged(),
+        "resizing non-selectable UI panes should not disable auto layout"
+    );
+
+    tab.new_pane(
+        PaneId::Terminal(2),
+        None,
+        None,
+        false,
+        true,
+        NewPanePlacement::default(),
+        Some(client_id),
+        None,
+    )
+    .unwrap();
+
+    let sidebar_geom = tab
+        .tiled_panes
+        .panes
+        .get(&PaneId::Plugin(2))
+        .unwrap()
+        .position_and_size();
+    let first_terminal_geom = tab
+        .tiled_panes
+        .panes
+        .get(&PaneId::Terminal(1))
+        .unwrap()
+        .position_and_size();
+    let second_terminal_geom = tab
+        .tiled_panes
+        .panes
+        .get(&PaneId::Terminal(2))
+        .unwrap()
+        .position_and_size();
+
+    assert_eq!(sidebar_geom.x, 0, "sidebar x position");
+    assert_eq!(sidebar_geom.cols.as_usize(), 40, "sidebar column count");
+    assert_eq!(first_terminal_geom.x, 40, "first terminal x position");
+    assert_eq!(
+        first_terminal_geom.cols.as_usize(),
+        40,
+        "first terminal column count"
+    );
+    assert_eq!(second_terminal_geom.x, 80, "second terminal x position");
+    assert_eq!(
+        second_terminal_geom.cols.as_usize(),
+        40,
+        "second terminal column count"
+    );
+}
+
+#[test]
+fn fixed_width_resize_rejects_unsatisfiable_widths() {
+    let size = Size {
+        cols: 120,
+        rows: 30,
+    };
+    let base_layout = r#"
+        layout {
+            pane split_direction="vertical" {
+                pane size="25%" borderless=true {
+                    plugin location="zellij:flock-sidebar"
+                }
+                pane
+            }
+        }
+    "#;
+    let (base_layout, base_floating_layout) =
+        Layout::from_kdl(base_layout, Some("file_name.kdl".into()), None, None)
+            .unwrap()
+            .template
+            .unwrap();
+    let new_terminal_ids = vec![(1, None)];
+    let mut new_plugin_ids = HashMap::new();
+    new_plugin_ids.insert(
+        RunPluginOrAlias::from_url("zellij:flock-sidebar", &None, None, None).unwrap(),
+        vec![2],
+    );
+    let mut tab = create_new_tab_with_swap_layouts(
+        size,
+        ModeInfo::default(),
+        (vec![], vec![]),
+        Some((
+            base_layout,
+            base_floating_layout,
+            new_terminal_ids,
+            vec![],
+            new_plugin_ids,
+        )),
+        true,
+        true,
+    );
+
+    let geom_before = tab
+        .tiled_panes
+        .panes
+        .get(&PaneId::Plugin(2))
+        .unwrap()
+        .position_and_size();
+
+    // Width 0 and widths beyond the display must be rejected before any
+    // geometry is touched — otherwise the pane is left with an unsatisfiable
+    // Fixed constraint that no resize can ever undo.
+    tab.resize_pane_id_to_fixed_width(PaneId::Plugin(2), 0)
+        .unwrap();
+    tab.resize_pane_id_to_fixed_width(PaneId::Plugin(2), size.cols + 80)
+        .unwrap();
+
+    let geom_after = tab
+        .tiled_panes
+        .panes
+        .get(&PaneId::Plugin(2))
+        .unwrap()
+        .position_and_size();
+    assert_eq!(
+        geom_before, geom_after,
+        "rejected fixed-width resizes must not change the pane geometry"
+    );
+    assert!(
+        !geom_after.cols.is_fixed(),
+        "rejected fixed-width resizes must not leave a Fixed cols constraint"
+    );
+}
+
+#[test]
+fn directional_split_after_fixed_width_sidebar_splits_content_evenly() {
+    let size = Size {
+        cols: 120,
+        rows: 30,
+    };
+    let client_id = 1;
+    let base_layout = r#"
+        layout {
+            pane size=1 borderless=true {
+                plugin location="zellij:tab-bar"
+            }
+            pane split_direction="vertical" {
+                pane size="25%" borderless=true {
+                    plugin location="zellij:flock-sidebar"
+                }
+                pane
+            }
+            pane size=2 borderless=true {
+                plugin location="zellij:status-bar"
+            }
+        }
+    "#;
+    let (base_layout, base_floating_layout) =
+        Layout::from_kdl(base_layout, Some("file_name.kdl".into()), None, None)
+            .unwrap()
+            .template
+            .unwrap();
+
+    let new_terminal_ids = vec![(1, None)];
+    let new_floating_terminal_ids = vec![];
+    let mut new_plugin_ids = HashMap::new();
+    new_plugin_ids.insert(
+        RunPluginOrAlias::from_url("zellij:tab-bar", &None, None, None).unwrap(),
+        vec![1],
+    );
+    new_plugin_ids.insert(
+        RunPluginOrAlias::from_url("zellij:flock-sidebar", &None, None, None).unwrap(),
+        vec![2],
+    );
+    new_plugin_ids.insert(
+        RunPluginOrAlias::from_url("zellij:status-bar", &None, None, None).unwrap(),
+        vec![3],
+    );
+
+    let stacked_resize = true;
+    let mut tab = create_new_tab_with_swap_layouts(
+        size,
+        ModeInfo::default(),
+        (vec![], vec![]),
+        Some((
+            base_layout,
+            base_floating_layout,
+            new_terminal_ids,
+            new_floating_terminal_ids,
+            new_plugin_ids,
+        )),
+        true,
+        stacked_resize,
+    );
+
+    tab.set_pane_selectable(PaneId::Plugin(1), false);
+    tab.set_pane_selectable(PaneId::Plugin(2), false);
+    tab.set_pane_selectable(PaneId::Plugin(3), false);
+    tab.resize_pane_id_to_fixed_width(PaneId::Plugin(2), 40)
+        .unwrap();
+
+    tab.new_pane(
+        PaneId::Terminal(2),
+        None,
+        None,
+        false,
+        true,
+        NewPanePlacement::Tiled {
+            direction: Some(Direction::Right),
+            borderless: Some(false),
+        },
+        Some(client_id),
+        None,
+    )
+    .unwrap();
+
+    let sidebar_geom = tab
+        .tiled_panes
+        .panes
+        .get(&PaneId::Plugin(2))
+        .unwrap()
+        .position_and_size();
+    let first_terminal_geom = tab
+        .tiled_panes
+        .panes
+        .get(&PaneId::Terminal(1))
+        .unwrap()
+        .position_and_size();
+    let second_terminal_geom = tab
+        .tiled_panes
+        .panes
+        .get(&PaneId::Terminal(2))
+        .unwrap()
+        .position_and_size();
+
+    assert_eq!(sidebar_geom.x, 0, "sidebar x position");
+    assert_eq!(sidebar_geom.cols.as_usize(), 40, "sidebar column count");
+    assert_eq!(first_terminal_geom.x, 40, "first terminal x position");
+    assert_eq!(
+        first_terminal_geom.cols.as_usize(),
+        40,
+        "first terminal column count"
+    );
+    assert_eq!(second_terminal_geom.x, 80, "second terminal x position");
+    assert_eq!(
+        second_terminal_geom.cols.as_usize(),
+        40,
+        "second terminal column count"
+    );
+}
+
+#[test]
 fn new_pane_in_stacked_resizes() {
     let size = Size {
         cols: 200,

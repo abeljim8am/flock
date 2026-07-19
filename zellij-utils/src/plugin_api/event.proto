@@ -333,6 +333,25 @@ message SessionManifest {
   repeated ClientTabHistory tab_history = 10;
   repeated ClientPaneHistory pane_history = 11;
   uint64 creation_time = 12;
+  string workspace_root = 13;
+  repeated PaneAgentStatus agent_states = 14;
+  optional FlockSidebarState flock_sidebar_state = 15;
+  // The session's injected default command (command + args every new pane/tab
+  // runs instead of the default shell), e.g. a flock codespace binding.
+  // Empty means unset.
+  repeated string default_command = 16;
+}
+
+message PaneAgentStatus {
+  PaneId pane_id = 1;
+  uint32 state = 2;
+  string label = 3;
+  bool seen = 4;
+}
+
+message FlockSidebarState {
+  uint32 mode = 1;
+  uint64 updated_at_millis = 2;
 }
 
 message ClientTabHistory {

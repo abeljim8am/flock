@@ -336,11 +336,11 @@ fn main() {
                     if version != VERSION {
                         println!("");
                         println!(
-                            "Note: this version differs from the current Zellij version: {}.",
+                            "Note: this version differs from the current Flock version: {}.",
                             VERSION
                         );
-                        println!("Consider stopping the server with: zellij web --stop");
-                        println!("And then restarting it with: zellij web --start");
+                        println!("Consider stopping the server with: flock web --stop");
+                        println!("And then restarting it with: flock web --start");
                     }
                 },
                 Err(_e) => {

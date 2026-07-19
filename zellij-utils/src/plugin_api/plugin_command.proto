@@ -207,6 +207,9 @@ enum CommandName {
   KillSessionsAndReply = 212;
   DeleteDeadSessionAndReply = 213;
   DeleteAllDeadSessionsAndReply = 214;
+  PublishAgentState = 215;
+  ResizePaneIdToFixedWidth = 216;
+  PublishFlockSidebarState = 217;
 }
 
 message PluginCommand {
@@ -361,7 +364,31 @@ message PluginCommand {
     GetSessionListPayload get_session_list_payload = 161;
     KillSessionsPayload kill_sessions_and_reply_payload = 162;
     string delete_dead_session_and_reply_payload = 163;
+    PublishAgentStatePayload publish_agent_state_payload = 164;
+    ResizePaneIdToFixedWidthPayload resize_pane_id_to_fixed_width_payload = 165;
+    FlockSidebarState publish_flock_sidebar_state_payload = 166;
   }
+}
+
+message PublishAgentStatePayload {
+  repeated PaneAgentStatus agent_states = 1;
+}
+
+message FlockSidebarState {
+  uint32 mode = 1;
+  uint64 updated_at_millis = 2;
+}
+
+message ResizePaneIdToFixedWidthPayload {
+  PaneId pane_id = 1;
+  uint32 width = 2;
+}
+
+message PaneAgentStatus {
+  PaneId pane_id = 1;
+  uint32 state = 2;
+  string label = 3;
+  bool seen = 4;
 }
 
 message NewTabPayload {

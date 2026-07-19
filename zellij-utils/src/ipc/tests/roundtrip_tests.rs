@@ -437,6 +437,13 @@ fn test_client_messages() {
                 theme_light: Some("theme_light".to_owned()),
                 default_mode: Some(InputMode::Normal),
                 default_shell: Some(PathBuf::from("default_shell")),
+                default_command: Some(vec![
+                    "gh".to_owned(),
+                    "codespace".to_owned(),
+                    "ssh".to_owned(),
+                    "-c".to_owned(),
+                    "my-codespace".to_owned(),
+                ]),
                 default_cwd: Some(PathBuf::from("default_cwd")),
                 default_layout: Some(PathBuf::from("default_layout")),
                 layout_dir: Some(PathBuf::from("layout_dir")),

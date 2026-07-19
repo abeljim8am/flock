@@ -323,7 +323,7 @@ fn spawn_web_server(cli_args: &CliArgs) -> Result<String, String> {
 #[cfg(not(feature = "web_server_capability"))]
 fn spawn_web_server(_cli_args: &CliArgs) -> Result<String, String> {
     log::error!(
-        "This version of Zellij was compiled without web server support, cannot run web server!"
+        "This version of Flock was compiled without web server support, cannot run web server!"
     );
     Ok("".to_owned())
 }
@@ -336,7 +336,7 @@ fn check_ipc_pipe_length(ipc_pipe: &Path) {
             "Error: the IPC socket path is too long ({} bytes, max {}):\n  {}\n\n\
              This is usually caused by a long $TMPDIR path.\n\
              To fix this, set a shorter socket directory, eg.:\n  \
-             ZELLIJ_SOCKET_DIR=/tmp/zellij zellij",
+             ZELLIJ_SOCKET_DIR=/tmp/zellij flock",
             path_len,
             ZELLIJ_SOCK_MAX_LENGTH - 1,
             ipc_pipe.display()
@@ -702,7 +702,7 @@ pub fn start_remote_client(
         connections,
     ))?;
 
-    let exit_msg = String::from("Bye from Zellij!");
+    let exit_msg = String::from("Bye from Flock!");
 
     if reconnect_to_session.is_none() {
         reset_controlling_terminal_state(exit_msg, 0);
@@ -1185,6 +1185,16 @@ pub fn start_client(
                 reconnect_to_session = Some(connect_to_session);
                 os_input.send_to_server(ClientToServerMsg::ClientExited);
                 break;
+            },
+            ClientInstruction::RenamedSession(new_session_name) => {
+                // Keep this process's view of its own session current; the
+                // reconnect flow compares ZELLIJ_SESSION_NAME against switch
+                // targets, and a stale name makes a later legitimate switch
+                // look like an attach-to-self (panic in commands.rs). Note:
+                // `os_input.update_session_name` must NOT be called here — that
+                // field is the stdin-handoff token compared around blocking
+                // reads, and changing it mid-session discards all input.
+                envs::set_session_name(new_session_name);
             },
             ClientInstruction::SetSynchronizedOutput(enabled) => {
                 synchronised_output = enabled;

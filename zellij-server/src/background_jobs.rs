@@ -121,6 +121,15 @@ pub struct SessionScanState {
     pub current_session_name: Arc<Mutex<String>>,
     pub current_session_info: Arc<Mutex<SessionInfo>>,
     pub current_session_plugin_list: Arc<Mutex<BTreeMap<PluginId, RunPlugin>>>,
+    /// The result of the last full session scan. `get_session_list` serves
+    /// this immediately and refreshes it off-thread: the scan's socket
+    /// liveness handshakes can block, and they must never stall the calling
+    /// plugin's event loop.
+    pub last_scan_result:
+        Arc<Mutex<Option<(BTreeMap<String, SessionInfo>, BTreeMap<String, Duration>)>>>,
+    /// Guards against stacking scans when plugins poll faster than a slow
+    /// scan completes.
+    pub scan_in_flight: Arc<AtomicBool>,
 }
 
 static SESSION_SCAN_STATE: std::sync::OnceLock<SessionScanState> = std::sync::OnceLock::new();
@@ -149,6 +158,8 @@ pub(crate) fn background_jobs_main(
         current_session_name: current_session_name.clone(),
         current_session_info: current_session_info.clone(),
         current_session_plugin_list: current_session_plugin_list.clone(),
+        last_scan_result: Arc::new(Mutex::new(None)),
+        scan_in_flight: Arc::new(AtomicBool::new(false)),
     });
     let last_serialization_time = Arc::new(Mutex::new(Instant::now()));
     let serialization_interval = serialization_interval.map(|s| s * 1000); // convert to

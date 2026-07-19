@@ -2535,3 +2535,50 @@ fn tiled_pane_still_rejects_zero_percent() {
     let result = SplitSize::from_str("1%");
     assert!(result.is_ok());
 }
+
+#[test]
+fn flock_bundled_layout_parses() {
+    // The bundled flock layout (slim docked flock-sidebar rail beside a content
+    // pane); make sure it parses as shipped.
+    let kdl_layout = include_str!("../../../assets/layouts/flock.kdl");
+    Layout::from_kdl(kdl_layout, Some("flock.kdl".into()), None, None).unwrap();
+}
+
+#[test]
+fn flock_coder_remote_bundled_layout_parses() {
+    let kdl_layout = include_str!("../../../assets/layouts/flock-coder-remote.kdl");
+    Layout::from_kdl(
+        kdl_layout,
+        Some("flock-coder-remote.kdl".into()),
+        None,
+        None,
+    )
+    .unwrap();
+}
+
+#[test]
+fn flock_bundled_layout_parses_with_swap_layout() {
+    let kdl_layout = include_str!("../../../assets/layouts/flock.kdl");
+    let kdl_swap_layout = include_str!("../../../assets/layouts/flock.swap.kdl");
+    Layout::from_kdl(
+        kdl_layout,
+        Some("flock.kdl".into()),
+        Some(("flock.swap.kdl".into(), kdl_swap_layout)),
+        None,
+    )
+    .unwrap();
+}
+
+#[test]
+fn flock_builtin_layout_loads_with_swap_layout() {
+    let (layout_path, kdl_layout, swap_layout) =
+        Layout::stringified_from_default_assets(std::path::Path::new("flock")).unwrap();
+    let (swap_layout_path, kdl_swap_layout) = swap_layout.unwrap();
+    Layout::from_kdl(
+        &kdl_layout,
+        Some(layout_path),
+        Some((swap_layout_path.as_str(), kdl_swap_layout.as_str())),
+        None,
+    )
+    .unwrap();
+}

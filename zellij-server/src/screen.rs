@@ -87,7 +87,10 @@ use crate::{
     ClientId, ServerInstruction,
 };
 use zellij_utils::{
-    data::{Event, InputMode, ModeInfo, Palette, PaletteColor, PluginCapabilities, Style},
+    data::{
+        Event, InputMode, ModeInfo, Palette, PaletteColor, PaneAgentStatus, PluginCapabilities,
+        Style,
+    },
     errors::{ContextType, ScreenContext},
     input::get_mode_info,
     ipc::{ClientAttributes, PixelDimensions},
@@ -694,6 +697,8 @@ pub enum ScreenInstruction {
         BTreeMap<String, SessionInfo>, // String is the session name
         BTreeMap<String, Duration>,    // resurrectable sessions - <name, created>
     ),
+    PublishAgentState(BTreeMap<zellij_utils::data::PaneId, PaneAgentStatus>),
+    PublishFlockSidebarState(zellij_utils::data::FlockSidebarState),
     ReplacePane(
         PaneId,
         HoldForCommand,
@@ -745,9 +750,15 @@ pub enum ScreenInstruction {
         visual_bell: bool,
         focus_follows_mouse: bool,
         mouse_click_through: bool,
+        /// Whether this reconfigure represents the session's saved (on-disk)
+        /// configuration, as opposed to a runtime-only change for
+        /// `client_id`. Only saved-config changes may update session-wide
+        /// fallbacks like `default_mode_info`.
+        write_config_to_disk: bool,
     },
     RerunCommandPane(u32, Option<NotificationEnd>), // u32 - terminal pane id
     ResizePaneWithId(ResizeStrategy, PaneId),
+    ResizePaneIdToFixedWidth(PaneId, usize), // usize - target width in columns
     EditScrollbackForPaneWithId(PaneId, Option<NotificationEnd>),
     WriteToPaneId(Vec<u8>, PaneId, Option<NotificationEnd>),
     Paste(Vec<u8>, Option<PaneId>, ClientId, Option<NotificationEnd>),
@@ -1072,6 +1083,10 @@ impl From<&ScreenInstruction> for ScreenContext {
             ScreenInstruction::BreakPaneRight(..) => ScreenContext::BreakPaneRight,
             ScreenInstruction::BreakPaneLeft(..) => ScreenContext::BreakPaneLeft,
             ScreenInstruction::UpdateSessionInfos(..) => ScreenContext::UpdateSessionInfos,
+            ScreenInstruction::PublishAgentState(..) => ScreenContext::PublishAgentState,
+            ScreenInstruction::PublishFlockSidebarState(..) => {
+                ScreenContext::PublishFlockSidebarState
+            },
             ScreenInstruction::ReplacePane(..) => ScreenContext::ReplacePane,
             ScreenInstruction::NewInPlacePluginPane(..) => ScreenContext::NewInPlacePluginPane,
             ScreenInstruction::SerializeLayoutForResurrection => {
@@ -1085,6 +1100,9 @@ impl From<&ScreenInstruction> for ScreenContext {
             ScreenInstruction::Reconfigure { .. } => ScreenContext::Reconfigure,
             ScreenInstruction::RerunCommandPane { .. } => ScreenContext::RerunCommandPane,
             ScreenInstruction::ResizePaneWithId(..) => ScreenContext::ResizePaneWithId,
+            ScreenInstruction::ResizePaneIdToFixedWidth(..) => {
+                ScreenContext::ResizePaneIdToFixedWidth
+            },
             ScreenInstruction::EditScrollbackForPaneWithId(..) => {
                 ScreenContext::EditScrollbackForPaneWithId
             },
@@ -1465,6 +1483,26 @@ pub(crate) struct Screen {
     /// Resolved styling to apply when `host_terminal_theme_mode == Light`.
     /// `None` disables auto-switch. Refreshed on each reconfigure.
     host_theme_light_styling: Option<Styling>,
+    /// The folder this session was started in (the server's launch cwd). This
+    /// is the session's stable workspace identity, surfaced on `SessionInfo`
+    /// so plugins can group sessions by the project folder they belong to.
+    /// Empty until set (in `screen_thread_main`).
+    workspace_root: PathBuf,
+    /// The `default_command` option this session was created with (command +
+    /// args every new pane/tab runs instead of the default shell — e.g. a
+    /// layout-injected flock codespace binding). Surfaced on `SessionInfo` so
+    /// plugins can recognize bound sessions. `None` for ordinary sessions.
+    session_default_command: Option<Vec<String>>,
+    /// The latest per-pane agent status published by this session's
+    /// flock-sidebar plugin (via `PluginCommand::PublishAgentState`). Stored
+    /// here and copied onto every `SessionInfo` we generate, so it rides the
+    /// cross-session metadata transport to other sessions' sidebars. Keyed by
+    /// the plugin-facing `data::PaneId`.
+    published_agent_states: BTreeMap<zellij_utils::data::PaneId, PaneAgentStatus>,
+    /// The latest flock-sidebar open/closed state published by this session's
+    /// flock-sidebar plugin. Stored here and copied onto every `SessionInfo` we
+    /// generate, so other sessions' sidebars can follow the same presentation.
+    published_flock_sidebar_state: Option<zellij_utils::data::FlockSidebarState>,
 }
 
 /// A pending forward waiting to be dispatched once the current in-flight
@@ -1619,6 +1657,10 @@ impl Screen {
             host_terminal_theme_mode: None,
             host_theme_dark_styling: None,
             host_theme_light_styling: None,
+            workspace_root: PathBuf::new(),
+            session_default_command: None,
+            published_agent_states: BTreeMap::new(),
+            published_flock_sidebar_state: None,
         }
     }
 
@@ -3462,6 +3504,10 @@ impl Screen {
                 .map(|(k, v)| (*k, v.iter().map(|v| (*v).into()).collect()))
                 .collect(),
             creation_time,
+            workspace_root: self.workspace_root.clone(),
+            default_command: self.session_default_command.clone(),
+            agent_states: self.published_agent_states.clone(),
+            flock_sidebar_state: self.published_flock_sidebar_state,
         };
         self.bus
             .senders
@@ -4135,6 +4181,23 @@ impl Screen {
             log::error!("Failed to find pane with id: {:?} to resize", pane_id);
         }
     }
+    pub fn resize_pane_id_to_fixed_width(&mut self, pane_id: PaneId, width: usize) {
+        let mut found = false;
+        for tab in self.tabs.values_mut() {
+            if tab.has_pane_with_pid(&pane_id) {
+                tab.resize_pane_id_to_fixed_width(pane_id, width)
+                    .non_fatal();
+                found = true;
+                break;
+            }
+        }
+        if !found {
+            log::error!(
+                "Failed to find pane with id: {:?} to set fixed width",
+                pane_id
+            );
+        }
+    }
     pub fn break_pane(
         &mut self,
         default_shell: Option<TerminalAction>,
@@ -4565,6 +4628,7 @@ impl Screen {
         visual_bell: bool,
         focus_follows_mouse: bool,
         mouse_click_through: bool,
+        write_config_to_disk: bool,
         client_id: ClientId,
     ) -> Result<()> {
         let should_support_arrow_fonts = !simplified_ui;
@@ -4575,9 +4639,14 @@ impl Screen {
             .update_rounded_corners(rounded_corners);
         // `default_mode_info` is the fallback used by `change_mode` for
         // clients that don't yet have a per-client `mode_info` entry, so its
-        // keybinds and base mode must be kept in sync with reconfigures.
-        self.default_mode_info.update_keybinds(new_keybinds.clone());
-        self.default_mode_info.update_default_mode(new_default_mode);
+        // keybinds and base mode must be kept in sync with saved-config
+        // reconfigures. Runtime-only changes are scoped to `client_id`:
+        // absorbing them here would leak one client's private rebinds into
+        // every later-attaching client's ModeUpdate events.
+        if write_config_to_disk {
+            self.default_mode_info.update_keybinds(new_keybinds.clone());
+            self.default_mode_info.update_default_mode(new_default_mode);
+        }
         self.default_shell = default_shell.clone().unwrap_or_else(|| get_default_shell());
         self.default_editor = default_editor.clone().or_else(|| get_default_editor());
         self.auto_layout = auto_layout;
@@ -5644,6 +5713,10 @@ pub(crate) fn screen_thread_main(
     config: Config,
     debug: bool,
     default_layout: Box<Layout>,
+    // The cwd this session was created with (e.g. the folder a
+    // `switch_session_with_layout(.., cwd)` opened it in). Used as the session's
+    // workspace identity; `None` falls back to the server process cwd.
+    session_cwd: Option<PathBuf>,
 ) -> Result<()> {
     // Resolve `theme_dark` / `theme_light` to concrete `Styling` from the
     // bundled themes BEFORE `config.options` is moved out below. These
@@ -5672,6 +5745,7 @@ pub(crate) fn screen_thread_main(
         );
     }
 
+    let session_default_command = config.options.default_command.clone();
     let config_options = config.options;
     let arrow_fonts = !config_options.simplified_ui.unwrap_or_default();
     let draw_pane_frames = config_options.pane_frames.unwrap_or(true);
@@ -5773,6 +5847,16 @@ pub(crate) fn screen_thread_main(
     );
     screen.host_theme_dark_styling = host_theme_dark_styling;
     screen.host_theme_light_styling = host_theme_light_styling;
+    // The session's workspace identity is the cwd it was created with (the folder
+    // a `switch_session_with_layout(.., cwd)` opened it in), so each project is
+    // its own workspace even when several sessions are spawned from one launcher.
+    // Fall back to the server process cwd for the initial launch.
+    screen.workspace_root = session_cwd
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| {
+            std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."))
+        });
+    screen.session_default_command = session_default_command;
 
     let mut pending_tab_ids: HashSet<usize> = HashSet::new();
     let mut pending_tab_switches: HashSet<(usize, ClientId)> = HashSet::new(); // usize is the
@@ -8626,6 +8710,24 @@ pub(crate) fn screen_thread_main(
             ScreenInstruction::UpdateSessionInfos(new_session_infos, resurrectable_sessions) => {
                 screen.update_session_infos(new_session_infos, resurrectable_sessions)?;
             },
+            ScreenInstruction::PublishAgentState(agent_states) => {
+                // Only re-report (and re-serialize to disk) when the published
+                // picture actually changed, so a plugin republishing an
+                // unchanged map doesn't spam the session-metadata writer.
+                if screen.published_agent_states != agent_states {
+                    screen.published_agent_states = agent_states;
+                    screen.log_and_report_session_state()?;
+                }
+            },
+            ScreenInstruction::PublishFlockSidebarState(sidebar_state) => {
+                // Same diff guard as agent state: sidebars may republish adopted
+                // state while converging, but unchanged values shouldn't rewrite
+                // session metadata.
+                if screen.published_flock_sidebar_state != Some(sidebar_state) {
+                    screen.published_flock_sidebar_state = Some(sidebar_state);
+                    screen.log_and_report_session_state()?;
+                }
+            },
             ScreenInstruction::UpdateAvailableLayouts(layouts, errors) => {
                 screen.update_available_layouts(layouts, errors);
             },
@@ -8703,6 +8805,10 @@ pub(crate) fn screen_thread_main(
                         .map(|(k, v)| (*k, v.iter().map(|v| (*v).into()).collect()))
                         .collect(),
                     creation_time,
+                    workspace_root: screen.workspace_root.clone(),
+                    default_command: screen.session_default_command.clone(),
+                    agent_states: screen.published_agent_states.clone(),
+                    flock_sidebar_state: screen.published_flock_sidebar_state,
                 };
 
                 let session_layout_metadata = if screen.session_serialization {
@@ -8752,12 +8858,37 @@ pub(crate) fn screen_thread_main(
                             },
                         );
                     }
+                } else if ZELLIJ_SOCK_DIR.join(&name).exists()
+                    && zellij_utils::sessions::session_exists(&name).unwrap_or(false)
+                {
+                    // The peer cache is filled asynchronously, so early in this
+                    // server's life it can miss a live session holding the
+                    // target name; renaming would fs::rename our socket over
+                    // that session's socket, orphaning it. `session_exists`
+                    // probes the socket, so a stale file left by a dead server
+                    // doesn't block the rename (the probe also cleans it up).
+                    let error_text = "A session by this name already exists.";
+                    log::error!("{}", error_text);
+                    if let Some(os_input) = &mut screen.bus.os_input {
+                        let _ = os_input.send_to_client(
+                            client_id,
+                            ServerToClientMsg::LogError {
+                                lines: vec![error_text.to_owned()],
+                            },
+                        );
+                    }
                 } else {
                     let err_context = || format!("Failed to rename session");
                     let old_session_name = screen.session_name.clone();
 
                     // update state
                     screen.session_name = name.clone();
+                    // Drop the cache entry made under the old name, otherwise
+                    // SessionUpdates keep advertising a ghost session (the old
+                    // name is never refreshed away in sessions that don't run
+                    // a get_session_list scan) and switching to it strands the
+                    // client.
+                    screen.peer_sessions_cache.remove(&old_session_name);
                     screen.default_mode_info.session_name = Some(name.clone());
                     for (_client_id, mode_info) in screen.mode_info.iter_mut() {
                         mode_info.session_name = Some(name.clone());
@@ -8827,6 +8958,7 @@ pub(crate) fn screen_thread_main(
                 visual_bell,
                 focus_follows_mouse,
                 mouse_click_through,
+                write_config_to_disk,
             } => {
                 screen.host_theme_dark_styling = host_theme_dark;
                 screen.host_theme_light_styling = host_theme_light;
@@ -8851,6 +8983,7 @@ pub(crate) fn screen_thread_main(
                         visual_bell,
                         focus_follows_mouse,
                         mouse_click_through,
+                        write_config_to_disk,
                         client_id,
                     )
                     .non_fatal();
@@ -8859,7 +8992,16 @@ pub(crate) fn screen_thread_main(
                 screen.rerun_command_pane_with_id(terminal_pane_id, completion_tx)
             },
             ScreenInstruction::ResizePaneWithId(resize, pane_id) => {
-                screen.resize_pane_with_id(resize, pane_id)
+                screen.resize_pane_with_id(resize, pane_id);
+                // Repaint so the resize is reflected and a shrunk pane's vacated
+                // cells are cleared rather than left as garbage.
+                screen.render(None)?;
+            },
+            ScreenInstruction::ResizePaneIdToFixedWidth(pane_id, width) => {
+                screen.resize_pane_id_to_fixed_width(pane_id, width);
+                // Repaint so the resize is reflected and a shrunk pane's vacated
+                // cells are cleared rather than left as garbage.
+                screen.render(None)?;
             },
             ScreenInstruction::EditScrollbackForPaneWithId(pane_id, completion_tx) => {
                 let all_tabs = screen.get_tabs_mut();
