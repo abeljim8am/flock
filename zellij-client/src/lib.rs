@@ -336,7 +336,7 @@ fn check_ipc_pipe_length(ipc_pipe: &Path) {
             "Error: the IPC socket path is too long ({} bytes, max {}):\n  {}\n\n\
              This is usually caused by a long $TMPDIR path.\n\
              To fix this, set a shorter socket directory, eg.:\n  \
-             ZELLIJ_SOCKET_DIR=/tmp/zellij flock",
+             FLOCK_SOCKET_DIR=/tmp/flock flock",
             path_len,
             ZELLIJ_SOCK_MAX_LENGTH - 1,
             ipc_pipe.display()
@@ -1188,7 +1188,7 @@ pub fn start_client(
             },
             ClientInstruction::RenamedSession(new_session_name) => {
                 // Keep this process's view of its own session current; the
-                // reconnect flow compares ZELLIJ_SESSION_NAME against switch
+                // reconnect flow compares FLOCK_SESSION_NAME against switch
                 // targets, and a stale name makes a later legitimate switch
                 // look like an attach-to-self (panic in commands.rs). Note:
                 // `os_input.update_session_name` must NOT be called here — that

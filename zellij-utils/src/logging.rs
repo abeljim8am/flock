@@ -31,7 +31,7 @@ pub fn configure_logger() {
     let roller = FixedWindowRoller::builder()
         .build(
             ZELLIJ_TMP_LOG_DIR
-                .join("zellij.log.old.{}")
+                .join("flock.log.old.{}")
                 .to_str()
                 .unwrap(),
             1,
@@ -66,7 +66,7 @@ pub fn configure_logger() {
         )
         .unwrap();
 
-    // Set the default logging level to "info" and log it to zellij.log file
+    // Set the default logging level to "info" and log it to flock.log file
     // Decrease verbosity for `wasmtime_wasi` module because it has a lot of useless info logs
     // For `zellij_server::logging_pipe`, we use custom format as we use logging macros to forward stderr output from plugins
     let config = Config::builder()

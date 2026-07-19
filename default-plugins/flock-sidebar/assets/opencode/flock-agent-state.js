@@ -2,7 +2,7 @@
 // managed by flock-sidebar; reinstalling or updating the integration overwrites this file.
 // add custom hooks/plugins beside this file instead of editing it.
 // FLOCK_INTEGRATION_ID=opencode
-// FLOCK_INTEGRATION_VERSION=3
+// FLOCK_INTEGRATION_VERSION=4
 //
 // Ported from herdr's opencode integration plugin (herdr-agent-state.js,
 // HERDR_INTEGRATION_VERSION=8). Instead of writing herdr's unix socket, it
@@ -10,7 +10,7 @@
 //
 //   flock pipe --name flock-state --args 'pane_id=<id>,state=<state>,agent=opencode,...'
 //
-// Zellij exports the running pane's id as $ZELLIJ_PANE_ID, which the plugin maps
+// Flock exports the running pane's id as $FLOCK_PANE_ID, which the plugin maps
 // back to the pane it tracks. Install by copying this file to
 // ~/.config/opencode/plugins/flock-agent-state.js (the directory herdr installs
 // its plugin to). herdr's session reporting (pane.report_agent_session) is
@@ -19,7 +19,7 @@
 // root-agent state.
 //
 // v2 added a devcontainer file channel. v3 makes the transport explicit:
-// flock's devcontainer wrappers forward both ZELLIJ_PANE_ID and
+// flock's devcontainer wrappers forward both FLOCK_PANE_ID and
 // FLOCK_STATE_CHANNEL=file. Reports are written to /tmp/flock-state/pane-<id>
 // (one line, the same key=value format as the pipe args, plus ts=<epoch secs>),
 // which flock-sidebar polls from the host via `docker exec … cat`. For older
@@ -38,18 +38,18 @@ const AGENT = "opencode";
 const STATE_DIR = "/tmp/flock-state";
 
 // Bound devcontainer sessions mark the file transport explicitly. The common
-// devcontainer markers cover older wrappers; absence of ZELLIJ_SESSION_NAME
+// devcontainer markers cover older wrappers; absence of FLOCK_SESSION_NAME
 // lets a failed pipe below identify the older pane-id-only handoff without
 // turning a transient failure in a real local session into a permanent switch.
 const fileChannelRequested =
   process.env.FLOCK_STATE_CHANNEL?.trim().toLowerCase() === "file" ||
   Boolean(process.env.REMOTE_CONTAINERS || process.env.DEVCONTAINER);
-const fileFallbackAllowed = !process.env.ZELLIJ_SESSION_NAME;
+const fileFallbackAllowed = !process.env.FLOCK_SESSION_NAME;
 let useFileChannel = fileChannelRequested;
 
 // Best-effort atomic write (tmp + rename) so the sidebar's poll never reads a
 // half-written line. The pane id lands in the filename, so only the server's
-// bare-integer $ZELLIJ_PANE_ID shape is accepted.
+// bare-integer $FLOCK_PANE_ID shape is accepted.
 function writeStateFile(paneId, state) {
   if (!/^\d+$/.test(paneId)) {
     return;
@@ -100,7 +100,7 @@ function stateFromSessionStatus(status) {
 }
 
 function reportState(state) {
-  const paneId = process.env.ZELLIJ_PANE_ID;
+  const paneId = process.env.FLOCK_PANE_ID;
   if (!paneId) {
     return Promise.resolve();
   }
@@ -113,22 +113,6 @@ function reportState(state) {
   const args = `pane_id=${paneId},state=${state},agent=${AGENT},source=${SOURCE}`;
 
   return new Promise((resolve) => {
-    let child;
-    try {
-      // stdio must be closed: `flock pipe` blocks reading stdin otherwise
-      // (the shell hooks pipe from /dev/null for the same reason).
-      child = spawn("flock", ["pipe", "--name", "flock-state", "--args", args], {
-        stdio: "ignore",
-        timeout: 2000,
-      });
-    } catch {
-      if (fileFallbackAllowed) {
-        useFileChannel = true;
-        writeStateFile(paneId, state);
-      }
-      resolve();
-      return;
-    }
     let settled = false;
     const finish = (delivered) => {
       if (settled) return;
@@ -142,13 +126,34 @@ function reportState(state) {
       }
       resolve();
     };
+    let child;
+    try {
+      // stdio must be closed: `flock pipe` blocks reading stdin otherwise
+      // (the shell hooks pipe from /dev/null for the same reason).
+      const flockExecutable = process.env.FLOCK_EXECUTABLE;
+      if (!flockExecutable) {
+        finish(false);
+        return;
+      }
+      child = spawn(flockExecutable, ["pipe", "--name", "flock-state", "--args", args], {
+        stdio: "ignore",
+        timeout: 2000,
+      });
+    } catch {
+      if (fileFallbackAllowed) {
+        useFileChannel = true;
+        writeStateFile(paneId, state);
+      }
+      resolve();
+      return;
+    }
     child.once("error", () => finish(false));
     child.once("exit", (code) => finish(code === 0));
   });
 }
 
 export const FlockAgentStatePlugin = async () => {
-  if (!process.env.ZELLIJ_PANE_ID) {
+  if (!process.env.FLOCK_PANE_ID) {
     return {};
   }
 

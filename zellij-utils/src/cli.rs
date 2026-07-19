@@ -1653,7 +1653,7 @@ tail -f /tmp/my-live-logfile | flock action pipe --name logs --plugin https://ex
     /// Set the default foreground/background color of a pane
     SetPaneColor {
         /// The pane_id of the pane, eg. terminal_1, plugin_2 or 3 (equivalent to terminal_3).
-        /// Defaults to $ZELLIJ_PANE_ID if not provided.
+        /// Defaults to $FLOCK_PANE_ID if not provided.
         #[clap(short, long, value_parser)]
         pane_id: Option<String>,
         /// Foreground color (e.g. "#00e000", "rgb:00/e0/00")

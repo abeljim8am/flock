@@ -3,7 +3,7 @@
 # managed by flock-sidebar; reinstalling or updating the integration overwrites this file.
 # add custom hooks beside this file instead of editing it.
 # FLOCK_INTEGRATION_ID=claude
-# FLOCK_INTEGRATION_VERSION=1
+# FLOCK_INTEGRATION_VERSION=2
 #
 # Ported from herdr's claude integration hook. Instead of writing herdr's unix
 # socket, it reports the agent's state to the flock-sidebar plugin over a Zellij
@@ -11,7 +11,7 @@
 #
 #   flock pipe --name flock-state --args 'pane_id=<id>,state=<state>,agent=claude,...'
 #
-# Zellij exports the running pane's id as $ZELLIJ_PANE_ID, which the plugin maps
+# Flock exports the running pane's id as $FLOCK_PANE_ID, which the plugin maps
 # back to the pane it tracks. The subagent-suppression logic is herdr's, kept
 # verbatim so recap/away-summary frames can't revive an idle pane.
 
@@ -27,9 +27,9 @@ case "$action" in
   *) exit 0 ;;
 esac
 
-# Only report from inside a Zellij pane, and only if the CLI is available.
-[ -n "${ZELLIJ_PANE_ID:-}" ] || exit 0
-command -v flock >/dev/null 2>&1 || exit 0
+# Only report from inside a Flock pane, using the exact running executable.
+[ -n "${FLOCK_PANE_ID:-}" ] || exit 0
+[ -n "${FLOCK_EXECUTABLE:-}" ] && [ -x "$FLOCK_EXECUTABLE" ] || exit 0
 command -v python3 >/dev/null 2>&1 || exit 0
 
 FLOCK_ACTION="$action" FLOCK_HOOK_INPUT_FILE="$hook_input_file" python3 - <<'PY'
@@ -39,10 +39,11 @@ import subprocess
 
 source = "flock:claude"
 action = os.environ.get("FLOCK_ACTION", "")
-pane_id = os.environ.get("ZELLIJ_PANE_ID")
+pane_id = os.environ.get("FLOCK_PANE_ID")
+flock_executable = os.environ.get("FLOCK_EXECUTABLE")
 hook_input_file = os.environ.get("FLOCK_HOOK_INPUT_FILE")
 
-if not pane_id:
+if not pane_id or not flock_executable:
     raise SystemExit(0)
 
 hook_input = {}
@@ -69,7 +70,7 @@ args = f"pane_id={pane_id},state={action},agent=claude,source={source}"
 
 try:
     subprocess.run(
-        ["flock", "pipe", "--name", "flock-state", "--args", args],
+        [flock_executable, "pipe", "--name", "flock-state", "--args", args],
         stdin=subprocess.DEVNULL,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,

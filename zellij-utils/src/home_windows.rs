@@ -13,7 +13,7 @@ pub(crate) fn try_create_home_config_dir() {
     }
 }
 
-/// System-wide data directory (`C:\ProgramData\Zellij\data`).
+/// System-wide data directory (`C:\ProgramData\Flock\data`).
 pub(crate) fn system_data_dir() -> PathBuf {
     use crate::consts::SYSTEM_DEFAULT_DATA_DIR_PREFIX;
     std::path::Path::new(SYSTEM_DEFAULT_DATA_DIR_PREFIX).join("data")

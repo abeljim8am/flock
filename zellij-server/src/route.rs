@@ -1575,7 +1575,7 @@ pub(crate) fn route_action(
             if let Some(name) = name.take() {
                 let should_open_in_place = in_place.unwrap_or(false);
                 if should_open_in_place && pane_id.is_none() {
-                    log::error!("Was asked to open a new plugin in-place, but cannot identify the pane id... is the ZELLIJ_PANE_ID variable set?");
+                    log::error!("Was asked to open a new plugin in-place, but cannot identify the pane id... is the FLOCK_PANE_ID variable set?");
                 }
                 let pane_id_to_replace = if should_open_in_place { pane_id } else { None };
                 senders

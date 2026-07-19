@@ -221,7 +221,10 @@ fn handle_openpty(
         }
         command
             .args(&cmd.args)
-            .env("ZELLIJ_PANE_ID", &format!("{}", terminal_id))
+            .env(
+                zellij_utils::envs::PANE_ID_ENV_KEY,
+                &format!("{}", terminal_id),
+            )
             .pre_exec(move || -> io::Result<()> {
                 if libc::login_tty(pid_secondary) != 0 {
                     panic!("failed to set controlling terminal");

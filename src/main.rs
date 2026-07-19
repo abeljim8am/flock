@@ -15,6 +15,9 @@ use zellij_utils::{
 };
 
 fn main() {
+    if let Ok(executable) = std::env::current_exe() {
+        envs::set_executable(executable.to_string_lossy().into_owned());
+    }
     configure_logger();
     create_config_and_cache_folders();
     let opts = CliArgs::parse();

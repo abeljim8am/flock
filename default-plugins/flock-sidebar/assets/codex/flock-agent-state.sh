@@ -3,7 +3,7 @@
 # managed by flock-sidebar; reinstalling or updating the integration overwrites this file.
 # add custom hooks beside this file instead of editing it.
 # FLOCK_INTEGRATION_ID=codex
-# FLOCK_INTEGRATION_VERSION=1
+# FLOCK_INTEGRATION_VERSION=2
 #
 # Ported from herdr's codex integration hook. Instead of writing herdr's unix
 # socket, it reports the agent's state to the flock-sidebar plugin over a Zellij
@@ -21,10 +21,18 @@ case "$action" in
   *) exit 0 ;;
 esac
 
-# Only report from inside a Zellij pane, and only if the CLI is available.
-[ -n "${ZELLIJ_PANE_ID:-}" ] || exit 0
-command -v flock >/dev/null 2>&1 || exit 0
+# Only report from inside a Flock pane. FLOCK_EXECUTABLE is exported by Flock
+# so this cannot accidentally resolve to the unrelated util-linux `flock`.
+[ -n "${FLOCK_PANE_ID:-}" ] || exit 0
+flock_executable="${FLOCK_EXECUTABLE:-}"
+[ -n "$flock_executable" ] && [ -x "$flock_executable" ] || exit 0
 
-flock pipe --name flock-state \
-  --args "pane_id=${ZELLIJ_PANE_ID},state=${action},agent=codex,source=flock:codex" \
-  </dev/null >/dev/null 2>&1 || true
+"$flock_executable" pipe --name flock-state \
+  --args "pane_id=${FLOCK_PANE_ID},state=${action},agent=codex,source=flock:codex" \
+  </dev/null >/dev/null 2>&1 &
+pipe_pid=$!
+(sleep 2; kill "$pipe_pid" 2>/dev/null || true) &
+watchdog_pid=$!
+wait "$pipe_pid" 2>/dev/null || true
+kill "$watchdog_pid" 2>/dev/null || true
+wait "$watchdog_pid" 2>/dev/null || true

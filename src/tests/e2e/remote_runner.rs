@@ -71,10 +71,10 @@ fn stop_flock(channel: &mut ssh2::Channel) {
     channel.write_all(b"rm -rf /tmp/*\n").unwrap(); // remove temporary artifacts from previous
     channel.write_all(b"rm -rf /tmp/*\n").unwrap(); // remove temporary artifacts from previous
     channel
-        .write_all(b"rm -rf ~/.cache/zellij/*/session_info\n")
+        .write_all(b"rm -rf ~/.cache/flock/*/session_info\n")
         .unwrap();
     channel
-        .write_all(b"rm -rf ~/.cache/zellij/permissions.kdl\n")
+        .write_all(b"rm -rf ~/.cache/flock/permissions.kdl\n")
         .unwrap();
     // create an arch-independent symlink so the binary path in snapshots is stable across
     // x86_64 (CI) and aarch64 (Apple Silicon local dev)

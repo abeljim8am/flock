@@ -168,8 +168,8 @@ pub fn dump_layout(layout_name: &str) -> Result<String, String> {
 /// This is the directory where Zellij looks for layout files. It can be:
 /// - The directory specified via CLI `--layout-dir` flag
 /// - The directory specified in the config file
-/// - The directory specified via ZELLIJ_LAYOUT_DIR env var
-/// - The default: `~/.config/zellij/layouts`
+/// - The directory specified via FLOCK_LAYOUT_DIR env var
+/// - The default: `~/.config/flock/layouts`
 ///
 /// # Returns
 /// A String containing the absolute path to the layout directory.
@@ -321,7 +321,7 @@ pub fn get_tab_info(tab_id: usize) -> Option<TabInfo> {
 /// Save the current session state to disk immediately.
 ///
 /// This triggers an immediate write of the current session metadata and layout
-/// to the session cache directory (~/.cache/zellij/contract_version_1/session_info/<session_name>/).
+/// to the session cache directory (~/.cache/flock/contract_version_1/session_info/<session_name>/).
 ///
 /// # Returns
 ///

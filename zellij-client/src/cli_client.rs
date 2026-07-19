@@ -31,7 +31,7 @@ pub fn start_cli_client(
     crate::check_ipc_pipe_length(&zellij_ipc_pipe);
     os_input.connect_to_server(&*zellij_ipc_pipe);
     let pane_id = os_input
-        .env_variable("ZELLIJ_PANE_ID")
+        .env_variable(zellij_utils::envs::PANE_ID_ENV_KEY)
         .and_then(|e| e.trim().parse().ok());
 
     for action in actions {

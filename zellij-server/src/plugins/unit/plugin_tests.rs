@@ -356,7 +356,7 @@ fn create_plugin_thread(
     let plugin_thread = std::thread::Builder::new()
         .name("plugin_thread".to_string())
         .spawn(move || {
-            set_var("ZELLIJ_SESSION_NAME", "zellij-test");
+            set_var("FLOCK_SESSION_NAME", "zellij-test");
             plugin_thread_main(
                 plugin_bus,
                 engine,
@@ -444,7 +444,7 @@ fn create_plugin_thread_with_server_receiver(
     let plugin_thread = std::thread::Builder::new()
         .name("plugin_thread".to_string())
         .spawn(move || {
-            set_var("ZELLIJ_SESSION_NAME", "zellij-test");
+            set_var("FLOCK_SESSION_NAME", "zellij-test");
             plugin_thread_main(
                 plugin_bus,
                 engine,
@@ -540,7 +540,7 @@ fn create_plugin_thread_with_pty_receiver(
     let plugin_thread = std::thread::Builder::new()
         .name("plugin_thread".to_string())
         .spawn(move || {
-            set_var("ZELLIJ_SESSION_NAME", "zellij-test");
+            set_var("FLOCK_SESSION_NAME", "zellij-test");
             plugin_thread_main(
                 plugin_bus,
                 engine,
@@ -629,7 +629,7 @@ fn create_plugin_thread_with_background_jobs_receiver(
     let plugin_thread = std::thread::Builder::new()
         .name("plugin_thread".to_string())
         .spawn(move || {
-            set_var("ZELLIJ_SESSION_NAME", "zellij-test");
+            set_var("FLOCK_SESSION_NAME", "zellij-test");
             plugin_thread_main(
                 plugin_bus,
                 engine,

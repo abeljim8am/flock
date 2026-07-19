@@ -101,7 +101,7 @@ pub fn parse_hook_report(args: &BTreeMap<String, String>) -> Result<HookReport, 
 
 /// Parse the `pane_id` arg into a terminal [`PaneId`].
 ///
-/// Zellij exports the running pane's id as `$ZELLIJ_PANE_ID` (a bare integer;
+/// Flock exports the running pane's id as `$FLOCK_PANE_ID` (a bare integer;
 /// see `zellij-server/src/os_input_output_unix.rs`), which the hooks forward
 /// verbatim. herdr's own hooks prefix it `p_<n>`, so tolerate that prefix too
 /// for operators reusing herdr's scripts unchanged.

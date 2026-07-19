@@ -664,10 +664,10 @@ impl ClientMetadata {
         default_editor: &Option<PathBuf>,
     ) -> String {
         let mut lines = vec![];
-        lines.push(String::from("CLIENT_ID ZELLIJ_PANE_ID RUNNING_COMMAND"));
+        lines.push(String::from("CLIENT_ID FLOCK_PANE_ID RUNNING_COMMAND"));
 
         for (client_id, client_metadata) in clients_metadata.iter() {
-            // 9 - CLIENT_ID, 14 - ZELLIJ_PANE_ID, 15 - RUNNING_COMMAND
+            // 9 - CLIENT_ID, 14 - FLOCK_PANE_ID, 15 - RUNNING_COMMAND
             lines.push(format!(
                 "{} {} {}",
                 format!("{0: <9}", client_id),
