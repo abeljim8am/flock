@@ -1,6 +1,6 @@
 <?xml version="1.0" encoding="utf-8"?>
 <!--
-  Zellij MSI installer (WiX v6).
+  Flock MSI installer (WiX v6).
 
   Custom UI built from individual WixToolset.UI.wixext stock dialogs plus a
   custom welcome/EULA dialog (ZellijWelcomeDlg).  We do NOT use the stock
@@ -26,19 +26,19 @@
 
   Build:
     wix build wix\main.wxs wix\Zellij.wxl -d Version=X.Y.Z -arch x64
-      -ext WixToolset.UI.wixext -o target\wix\zellij-x86_64-pc-windows-msvc.msi
+      -ext WixToolset.UI.wixext -o target\wix\flock-x86_64-pc-windows-msvc.msi
 -->
 <Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
 
-  <Package Name="Zellij"
-           Manufacturer="Zellij Contributors"
+  <Package Name="Flock"
+           Manufacturer="Flock Contributors"
            Version="$(var.Version)"
-           UpgradeCode="BEE7A897-6DE0-4243-9977-5924C8CDB391"
+           UpgradeCode="32D9E98B-DE38-485D-B5A9-0B5BB6BC91FF"
            Scope="perUserOrMachine"
            InstallerVersion="500">
 
     <!-- Properties used by stock InstallScopeDlg and InstallDirDlg -->
-    <Property Id="ApplicationFolderName" Value="Zellij" />
+    <Property Id="ApplicationFolderName" Value="Flock" />
     <Property Id="WixAppFolder" Value="WixPerUserFolder" />
     <Property Id="WIXUI_INSTALLDIR" Value="APPLICATIONFOLDER" />
 
@@ -47,14 +47,14 @@
     <Property Id="ARPPRODUCTICON" Value="ZellijIcon" />
 
     <!-- Auto-remove previous versions -->
-    <MajorUpgrade DowngradeErrorMessage="A newer version of Zellij is already installed." />
+    <MajorUpgrade DowngradeErrorMessage="A newer version of Flock is already installed." />
 
     <!-- Embed the .cab inside the MSI -->
     <MediaTemplate EmbedCab="yes" />
 
     <!-- ===== Directory tree ===== -->
     <StandardDirectory Id="ProgramFilesFolder">
-      <Directory Id="APPLICATIONFOLDER" Name="Zellij" />
+      <Directory Id="APPLICATIONFOLDER" Name="Flock" />
     </StandardDirectory>
 
     <!-- ===== Custom actions for folder resolution =====
@@ -64,10 +64,10 @@
          APPLICATIONFOLDER to explicit paths based on MSIINSTALLPERUSER. -->
     <CustomAction Id="SetFolderPerUser"
                   Property="APPLICATIONFOLDER"
-                  Value="[LocalAppDataFolder]Zellij" />
+                  Value="[LocalAppDataFolder]Flock" />
     <CustomAction Id="SetFolderPerMachine"
                   Property="APPLICATIONFOLDER"
-                  Value="[ProgramFilesFolder]Zellij" />
+                  Value="[ProgramFilesFolder]Flock" />
 
     <!-- Schedule in both UI and Execute sequences so the correct path is set
          even after UAC elevation re-launches the server process. -->
@@ -93,18 +93,18 @@
 
     <Component Id="binary"
                Directory="APPLICATIONFOLDER"
-               Guid="BC9D18AE-17CA-4790-ADB0-C64530DEDE57">
-      <File Id="zellij_exe"
-            Source="target\release\zellij.exe"
+               Guid="DFCFD2C4-35D6-42E5-B753-CCD0DE3F6FF0">
+      <File Id="flock_exe"
+            Source="target\release\flock.exe"
             KeyPath="yes" />
     </Component>
 
     <Component Id="path_machine"
                Directory="APPLICATIONFOLDER"
-               Guid="85C2CC85-8379-4C27-8337-A90EAD9AC265"
+               Guid="4CCCD2FE-A813-4729-9476-5CFDE0E0CCD0"
                Condition="ALLUSERS = 1">
       <RegistryValue Root="HKLM"
-                     Key="Software\Zellij"
+                     Key="Software\Flock"
                      Name="InstallPath"
                      Type="string"
                      Value="[APPLICATIONFOLDER]"
@@ -120,10 +120,10 @@
 
     <Component Id="path_user"
                Directory="APPLICATIONFOLDER"
-               Guid="EED3D01E-8FBC-4F3D-A3E5-DF55939970CD"
+               Guid="385C8903-9559-44DD-BD1A-D245BBA85816"
                Condition="ALLUSERS &lt;&gt; 1">
       <RegistryValue Root="HKCU"
-                     Key="Software\Zellij"
+                     Key="Software\Flock"
                      Name="InstallPath"
                      Type="string"
                      Value="[APPLICATIONFOLDER]"
@@ -138,7 +138,7 @@
     </Component>
 
     <!-- ===== Feature ===== -->
-    <Feature Id="MainFeature" Title="Zellij" Level="1">
+    <Feature Id="MainFeature" Title="Flock" Level="1">
       <ComponentRef Id="binary" />
       <ComponentRef Id="path_machine" />
       <ComponentRef Id="path_user" />

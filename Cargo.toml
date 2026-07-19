@@ -1,9 +1,9 @@
 [package]
-name = "zellij"
+name = "flock"
 build = "src/build.rs"
 authors = ["Aram Drevekenin <aram@poor.dev>"]
-description = "A terminal workspace with batteries included"
-homepage = "https://zellij.dev"
+description = "An agent-aware terminal workspace built on Zellij"
+homepage = "https://github.com/abeljim8am/flock"
 include = ["src/**/*", "assets/layouts/*", "assets/config/*", "LICENSE.md", "README.md", "!**/*_test.*", "!**/tests/**/*"]
 # See 'workspace.package' for concrete values
 license.workspace = true
@@ -15,8 +15,8 @@ rust-version.workspace = true
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-zellij-client = { path = "zellij-client/", version = "0.45.0" }
-zellij-server = { path = "zellij-server/", version = "0.45.0" }
+zellij-client = { path = "zellij-client/", version = "26.0.0" }
+zellij-server = { path = "zellij-server/", version = "26.0.0" }
 zellij-utils = { workspace = true }
 anyhow = { workspace = true }
 clap = { workspace = true }
@@ -58,6 +58,8 @@ members = [
     "default-plugins/multiple-select",
     "default-plugins/layout-manager",
     "default-plugins/link",
+    "default-plugins/flock-sidebar",
+    "default-plugins/flock-selector",
     "zellij-client",
     "zellij-server",
     "zellij-utils",
@@ -70,8 +72,8 @@ members = [
 [workspace.package]
 edition = "2021"
 license = "MIT"
-repository = "https://github.com/zellij-org/zellij"
-version = "0.45.0"
+repository = "https://github.com/abeljim8am/flock"
+version = "26.0.0"
 # NOTE: When updating this, modify `channel` in `rust-toolchain.toml` accordingly
 rust-version = "1.92"
 
@@ -115,7 +117,7 @@ windows-sys = { version = "0.59", default-features = false }
 names = { version = "0.14.0", default-features = false }
 include_dir = { version = "0.7.3", default-features = false }
 sha2 = { version = "0.10", default-features = false }
-zellij-utils = { path = "zellij-utils/", version = "0.45.0" }
+zellij-utils = { path = "zellij-utils/", version = "26.0.0" }
 
 [profile.dev-opt]
 inherits = "dev"
@@ -132,15 +134,15 @@ codegen-units = 1
 depends = "$auto"
 license-file = ["LICENSE.md", "4"]
 assets = [
-  ["assets/man/zellij.1", "usr/share/man/man1/zellij.1", "644"],
-  ["target/release/zellij", "usr/bin/zellij", "755"],
-  ["GOVERNANCE.md", "usr/share/doc/zellij/GOVERNANCE.md", "644"],
-  ["README.md", "usr/share/doc/zellij/README.md", "644"],
+  ["assets/man/zellij.1", "usr/share/man/man1/flock.1", "644"],
+  ["target/release/flock", "usr/bin/flock", "755"],
+  ["GOVERNANCE.md", "usr/share/doc/flock/GOVERNANCE.md", "644"],
+  ["README.md", "usr/share/doc/flock/README.md", "644"],
   ["assets/layouts/*", "usr/share/zellij/layouts/", "644"],
   ["assets/plugins/*", "usr/share/zellij/plugins/", "644"],
-  ["assets/completions/zellij.bash", "usr/share/bash-completion/completions/zellij.bash", "644"],
-  ["assets/completions/zellij.fish", "usr/share/fish/vendor_completions.d/zellij.fish", "644"],
-  ["assets/completions/_zellij", "usr/share/zsh/vendor-completions/_zellij", "644"],
+  ["assets/completions/zellij.bash", "usr/share/bash-completion/completions/flock", "644"],
+  ["assets/completions/zellij.fish", "usr/share/fish/vendor_completions.d/flock.fish", "644"],
+  ["assets/completions/_zellij", "usr/share/zsh/vendor-completions/_flock", "644"],
 ]
 
 [package.metadata.binstall]

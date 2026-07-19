@@ -96,7 +96,7 @@ pub fn install(sh: &Shell, flags: flags::Install) -> anyhow::Result<()> {
             .join(&flags.destination)
     };
     sh.change_dir(crate::project_root());
-    sh.copy_file("target/release/zellij", &destination)
+    sh.copy_file("target/release/flock", &destination)
         .with_context(err_context)
 }
 
@@ -130,7 +130,7 @@ pub fn run(sh: &Shell, mut flags: flags::Run) -> anyhow::Result<()> {
         crate::cargo()
             .and_then(|cargo| {
                 cmd!(sh, "{cargo} run")
-                    .args(["--package", "zellij"])
+                    .args(["--package", "flock"])
                     .arg("--no-default-features")
                     .args(["--features", features])
                     .args(["--profile", profile])
@@ -210,7 +210,7 @@ pub fn dist(sh: &Shell, _flags: flags::Dist) -> anyhow::Result<()> {
             install(
                 sh,
                 flags::Install {
-                    destination: crate::project_root().join("./target/dist/zellij"),
+                    destination: crate::project_root().join("./target/dist/flock"),
                     no_web: false,
                 },
             )
