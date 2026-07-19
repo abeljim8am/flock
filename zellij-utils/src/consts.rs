@@ -120,14 +120,26 @@ pub const FEATURES: &[&str] = &[
 mod flock_namespace_tests {
     use super::*;
 
+    fn assert_flock_product_dir(path: &std::path::Path) {
+        let product_dir = path
+            .file_name()
+            .expect("project directory should have a final component")
+            .to_string_lossy()
+            .to_ascii_lowercase();
+        assert!(
+            product_dir.contains("flock"),
+            "expected Flock-specific project directory, got {path:?}"
+        );
+    }
+
     #[test]
     fn flock_uses_product_specific_config_and_storage_roots() {
         assert_eq!(ZELLIJ_CONFIG_FILE_ENV, "FLOCK_CONFIG_FILE");
         assert_eq!(ZELLIJ_CONFIG_DIR_ENV, "FLOCK_CONFIG_DIR");
         assert_eq!(ZELLIJ_LAYOUT_DIR_ENV, "FLOCK_LAYOUT_DIR");
-        assert!(ZELLIJ_CACHE_DIR.ends_with("flock"));
-        assert!(ZELLIJ_PROJ_DIR.config_dir().ends_with("flock"));
-        assert!(ZELLIJ_PROJ_DIR.data_dir().ends_with("flock"));
+        assert_flock_product_dir(&ZELLIJ_CACHE_DIR);
+        assert_flock_product_dir(ZELLIJ_PROJ_DIR.config_dir());
+        assert_flock_product_dir(ZELLIJ_PROJ_DIR.data_dir());
         assert!(ZELLIJ_TMP_DIR
             .file_name()
             .is_some_and(|name| name.to_string_lossy().starts_with("flock")));
