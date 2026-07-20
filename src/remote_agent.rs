@@ -16,7 +16,7 @@ use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
-use std::process::{ChildStdin, Command, Stdio};
+use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc, Condvar, Mutex};
 use std::thread;
@@ -204,7 +204,7 @@ impl PaneState {
     }
 }
 
-type TransportWriter = Arc<Mutex<ChildStdin>>;
+type TransportWriter = Arc<Mutex<Box<dyn Write + Send>>>;
 
 struct InputRouter {
     pane_id: Uuid,
@@ -597,7 +597,9 @@ fn run_coder_transport(
         .stderr(Stdio::inherit())
         .spawn()
         .context("start coder ssh remote-agent transport")?;
-    let child_stdin = Arc::new(Mutex::new(child.stdin.take().context("open coder stdin")?));
+    let child_stdin: TransportWriter = Arc::new(Mutex::new(Box::new(
+        child.stdin.take().context("open coder stdin")?,
+    )));
     let mut child_stdout = child.stdout.take().context("open coder stdout")?;
     write_frame(
         &mut *child_stdin.lock().unwrap(),
@@ -1194,6 +1196,18 @@ mod tests {
     use nix::sys::termios::{InputFlags, LocalFlags, OutputFlags};
     use std::fs::OpenOptions;
 
+    struct BrokenWriter;
+
+    impl Write for BrokenWriter {
+        fn write(&mut self, _buffer: &[u8]) -> io::Result<usize> {
+            Err(io::Error::from(io::ErrorKind::BrokenPipe))
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
     #[test]
     fn frames_round_trip_and_reject_malformed_lengths() {
         let message = ClientMessage::Hello {
@@ -1279,14 +1293,8 @@ mod tests {
     fn input_router_retries_a_chunk_on_the_replacement_transport() {
         let pane_id = Uuid::new_v4();
         let router = Arc::new(InputRouter::new(pane_id));
-        let mut stale = Command::new("sh")
-            .args(["-c", "exit 0"])
-            .stdin(Stdio::piped())
-            .spawn()
-            .unwrap();
-        let stale_stdin = Arc::new(Mutex::new(stale.stdin.take().unwrap()));
-        stale.wait().unwrap();
-        let _stale = router.activate(stale_stdin);
+        let stale: TransportWriter = Arc::new(Mutex::new(Box::new(BrokenWriter)));
+        let _stale = router.activate(stale);
 
         let forwarding_router = router.clone();
         let forwarding = thread::spawn(move || forwarding_router.forward(b"kept".to_vec()));
@@ -1303,7 +1311,8 @@ mod tests {
             .stdout(Stdio::piped())
             .spawn()
             .unwrap();
-        let replacement_stdin = Arc::new(Mutex::new(replacement.stdin.take().unwrap()));
+        let replacement_stdin: TransportWriter =
+            Arc::new(Mutex::new(Box::new(replacement.stdin.take().unwrap())));
         let active = router.activate(replacement_stdin.clone());
         forwarding.join().unwrap();
         drop(active);
@@ -1456,7 +1465,16 @@ mod tests {
             .intersects(InputFlags::ICRNL | InputFlags::IXON));
         assert!(!raw.output_flags.contains(OutputFlags::OPOST));
         drop(guard);
-        assert_eq!(termios::tcgetattr(slave_fd).unwrap(), original);
+        let restored = termios::tcgetattr(slave_fd).unwrap();
+        assert_eq!(restored.input_flags, original.input_flags);
+        assert_eq!(restored.output_flags, original.output_flags);
+        assert_eq!(restored.control_flags, original.control_flags);
+        // macOS may add PENDIN while applying otherwise identical settings.
+        assert_eq!(
+            restored.local_flags - LocalFlags::PENDIN,
+            original.local_flags - LocalFlags::PENDIN
+        );
+        assert_eq!(restored.control_chars, original.control_chars);
         unsafe {
             libc::close(master_fd);
             libc::close(slave_fd);
