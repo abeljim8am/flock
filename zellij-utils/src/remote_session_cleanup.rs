@@ -180,10 +180,14 @@ mod tests {
 
     #[test]
     fn pending_request_is_written_atomically() {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
         let root = std::env::temp_dir().join(format!(
             "flock-close-pending-{}-{}",
             std::process::id(),
-            std::thread::current().name().unwrap_or("test")
+            nonce
         ));
         let path = root.join("pane.close-pending");
         persist_pending(&path, "alice/api").unwrap();
