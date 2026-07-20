@@ -18,10 +18,12 @@ then adds a control plane for coding agents and remote development environments.
 - **Authoritative agent hooks** for Codex, Claude Code, and OpenCode, with
   screen detection as the zero-config fallback.
 - **Remote providers** for GitHub Codespaces, devcontainers, and Coder.
-- **Persistent Coder sessions** backed by Zellij inside the workspace, so tabs,
-  panes, jobs, and scrollback survive laptop and network disconnects.
-- **Coder workspace creation** with optional dotfiles and reconnecting remote
-  state snapshots in the local sidebar.
+- **Persistent Coder processes** backed by a small remote PTY daemon, while the
+  Flock multiplexer, layouts, configuration, and plugins remain on the laptop.
+  Remote shells, jobs, and bounded output replay survive laptop and network
+  disconnects.
+- **Coder workspace creation** with optional dotfiles and typed connection state
+  in the local sidebar.
 
 Everything else is still Zellij. The executable is named `flock`, and the
 upstream [Zellij documentation](https://zellij.dev/documentation/) applies
@@ -75,6 +77,12 @@ Provider requirements:
 - Devcontainers: `devcontainer` CLI and Docker.
 - Coder: authenticated `coder` CLI. Persistent sessions currently require a
   Linux x86_64 workspace with `tar`, `sha256sum`, and `curl`, `wget`, or Python 3.
+
+Debug builds pass their exact `FLOCK_EXECUTABLE` path into generated local Coder
+bridge panes, so `cargo run -- ...` tests the binary you just built instead of a
+different `flock` on `PATH`. Set `FLOCK_EXECUTABLE=/absolute/path/to/flock` to
+override it explicitly. The workspace agent remains the matching,
+checksum-verified Linux x86_64 release installed during bootstrap.
 
 Agent hook integrations live in
 [`default-plugins/flock-sidebar/assets`](default-plugins/flock-sidebar/assets).

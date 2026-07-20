@@ -2,8 +2,9 @@ mod kdl_layout_parser;
 use crate::data::{
     AgentRunState, BareKey, Direction, FloatingPaneCoordinates, FlockSidebarMode,
     FlockSidebarState, InputMode, KeyWithModifier, LayoutInfo, LayoutMetadata, MultiplayerColors,
-    Palette, PaletteColor, PaneAgentStatus, PaneId, PaneInfo, PaneManifest, PermissionType, Resize,
-    SessionInfo, StyleDeclaration, Styling, TabInfo, WebSharing, DEFAULT_STYLES,
+    Palette, PaletteColor, PaneAgentStatus, PaneId, PaneInfo, PaneManifest, PermissionType,
+    RemoteBackend, RemoteConnectionState, RemotePaneMetadata, Resize, SessionInfo,
+    StyleDeclaration, Styling, TabInfo, WebSharing, DEFAULT_STYLES,
 };
 use crate::envs::EnvironmentVariables;
 use crate::home::{find_default_config_dir, get_layout_dir};
@@ -2687,6 +2688,9 @@ impl Options {
             },
             None => None,
         };
+        let remote_backend =
+            kdl_property_first_arg_as_string_or_error!(kdl_options, "remote_backend")
+                .and_then(|(value, _)| serde_json::from_str::<RemoteBackend>(value).ok());
         let default_cwd = kdl_property_first_arg_as_string_or_error!(kdl_options, "default_cwd")
             .map(|(string, _entry)| PathBuf::from(string));
         let pane_frames =
@@ -2851,6 +2855,7 @@ impl Options {
             default_mode,
             default_shell,
             default_command,
+            remote_backend,
             default_cwd,
             default_layout,
             layout_dir,
@@ -3103,6 +3108,12 @@ impl Options {
         for arg in default_command {
             node.push(arg.to_owned());
         }
+        Some(node)
+    }
+    fn remote_backend_to_kdl(&self) -> Option<KdlNode> {
+        let backend = self.remote_backend.as_ref()?;
+        let mut node = KdlNode::new("remote_backend");
+        node.push(serde_json::to_string(backend).ok()?);
         Some(node)
     }
     fn default_cwd_to_kdl(&self, add_comments: bool) -> Option<KdlNode> {
@@ -4298,6 +4309,9 @@ impl Options {
         }
         if let Some(default_command) = self.default_command_to_kdl(add_comments) {
             nodes.push(default_command);
+        }
+        if let Some(remote_backend) = self.remote_backend_to_kdl() {
+            nodes.push(remote_backend);
         }
         if let Some(default_cwd) = self.default_cwd_to_kdl(add_comments) {
             nodes.push(default_cwd);
@@ -5698,6 +5712,72 @@ impl SessionInfo {
                 Some(args)
             }
         });
+        let remote_backend = kdl_document
+            .get("remote_backend")
+            .and_then(|n| n.entries().iter().next())
+            .and_then(|e| e.value().as_string())
+            .and_then(|value| serde_json::from_str(value).ok());
+        let remote_connection_state = kdl_document
+            .get("remote_connection_state")
+            .and_then(|n| n.entries().iter().next())
+            .and_then(|e| e.value().as_string())
+            .map(|state| match state {
+                "connecting" => RemoteConnectionState::Connecting,
+                "connected" => RemoteConnectionState::Connected,
+                "reconnecting" => RemoteConnectionState::Reconnecting,
+                _ => RemoteConnectionState::Disconnected,
+            })
+            .unwrap_or_default();
+        let mut remote_panes = BTreeMap::new();
+        if let Some(nodes) = kdl_document.get("remote_panes").and_then(|n| n.children()) {
+            for node in nodes
+                .nodes()
+                .iter()
+                .filter(|node| node.name().value() == "pane")
+            {
+                let value = |name| {
+                    node.entries()
+                        .iter()
+                        .find(|e| e.name().map(|n| n.value()) == Some(name))
+                };
+                let pane_type = value("type").and_then(|e| e.value().as_string());
+                let pane_id = value("id")
+                    .and_then(|e| e.value().as_i64())
+                    .map(|id| id as u32);
+                let pane_id = match (pane_type, pane_id) {
+                    (Some("terminal"), Some(id)) => Some(PaneId::Terminal(id)),
+                    (Some("plugin"), Some(id)) => Some(PaneId::Plugin(id)),
+                    _ => None,
+                };
+                if let (Some(pane_id), Some(uuid)) =
+                    (pane_id, value("uuid").and_then(|e| e.value().as_string()))
+                {
+                    remote_panes.insert(
+                        pane_id,
+                        RemotePaneMetadata {
+                            pane_uuid: uuid.to_owned(),
+                            replay_cursor: value("cursor")
+                                .and_then(|e| e.value().as_i64())
+                                .unwrap_or_default()
+                                as u64,
+                            close_pending: value("close_pending")
+                                .and_then(|e| e.value().as_bool())
+                                .unwrap_or(false),
+                            foreground_argv: node
+                                .children()
+                                .and_then(|c| c.get("foreground_argv"))
+                                .map(|n| {
+                                    n.entries()
+                                        .iter()
+                                        .filter_map(|e| e.value().as_string().map(str::to_owned))
+                                        .collect()
+                                })
+                                .unwrap_or_default(),
+                        },
+                    );
+                }
+            }
+        }
         let mut agent_states = BTreeMap::new();
         if let Some(kdl_agent_states) = kdl_document.get("agent_states").and_then(|p| p.children())
         {
@@ -5782,6 +5862,9 @@ impl SessionInfo {
             creation_time,
             workspace_root,
             default_command,
+            remote_backend,
+            remote_connection_state,
+            remote_panes,
             agent_states,
             flock_sidebar_state,
         })
@@ -5901,6 +5984,54 @@ impl SessionInfo {
                 default_command_node.push(arg.clone());
             }
             kdl_document.nodes_mut().push(default_command_node);
+        }
+
+        if let Some(remote_backend) = &self.remote_backend {
+            if let Ok(json) = serde_json::to_string(remote_backend) {
+                let mut node = KdlNode::new("remote_backend");
+                node.push(json);
+                kdl_document.nodes_mut().push(node);
+            }
+        }
+        if self.remote_backend.is_some()
+            || self.remote_connection_state != RemoteConnectionState::Disconnected
+        {
+            let mut connection_node = KdlNode::new("remote_connection_state");
+            connection_node.push(match self.remote_connection_state {
+                RemoteConnectionState::Connecting => "connecting",
+                RemoteConnectionState::Connected => "connected",
+                RemoteConnectionState::Reconnecting => "reconnecting",
+                RemoteConnectionState::Disconnected => "disconnected",
+            });
+            kdl_document.nodes_mut().push(connection_node);
+        }
+        if !self.remote_panes.is_empty() {
+            let mut remote_panes_node = KdlNode::new("remote_panes");
+            let mut remote_panes_children = KdlDocument::new();
+            for (pane_id, metadata) in &self.remote_panes {
+                let mut node = KdlNode::new("pane");
+                let (pane_type, id) = match pane_id {
+                    PaneId::Terminal(id) => ("terminal", *id),
+                    PaneId::Plugin(id) => ("plugin", *id),
+                };
+                node.push(KdlEntry::new_prop("type", pane_type));
+                node.push(KdlEntry::new_prop("id", id as i64));
+                node.push(KdlEntry::new_prop("uuid", metadata.pane_uuid.clone()));
+                node.push(KdlEntry::new_prop("cursor", metadata.replay_cursor as i64));
+                node.push(KdlEntry::new_prop("close_pending", metadata.close_pending));
+                if !metadata.foreground_argv.is_empty() {
+                    let mut children = KdlDocument::new();
+                    let mut argv = KdlNode::new("foreground_argv");
+                    for arg in &metadata.foreground_argv {
+                        argv.push(arg.clone());
+                    }
+                    children.nodes_mut().push(argv);
+                    node.set_children(children);
+                }
+                remote_panes_children.nodes_mut().push(node);
+            }
+            remote_panes_node.set_children(remote_panes_children);
+            kdl_document.nodes_mut().push(remote_panes_node);
         }
 
         let mut agent_states_node = KdlNode::new("agent_states");
@@ -6517,6 +6648,9 @@ fn serialize_and_deserialize_session_info_with_data() {
         creation_time: Duration::from_secs(300),
         workspace_root: PathBuf::from("/home/aviram/my-project"),
         default_command: None,
+        remote_backend: None,
+        remote_connection_state: Default::default(),
+        remote_panes: Default::default(),
         agent_states: {
             let mut agent_states = BTreeMap::new();
             agent_states.insert(
@@ -7399,6 +7533,34 @@ fn session_info_default_command_round_trips() {
     let serialized = session_info.to_string();
     let deserialized = SessionInfo::from_string(&serialized, "not this session").unwrap();
     assert_eq!(deserialized.default_command, session_info.default_command);
+}
+
+#[test]
+fn session_info_remote_backend_and_pane_cursor_round_trip() {
+    let mut session_info = SessionInfo::new("coder".to_owned());
+    session_info.remote_backend = Some(RemoteBackend::Coder {
+        workspace: "alice/api".into(),
+        local_session_id: "coder".into(),
+        legacy: false,
+    });
+    session_info.remote_connection_state = RemoteConnectionState::Reconnecting;
+    session_info.remote_panes.insert(
+        PaneId::Terminal(7),
+        RemotePaneMetadata {
+            pane_uuid: "12345678-1234-4123-a123-123456789abc".into(),
+            replay_cursor: 42,
+            close_pending: true,
+            foreground_argv: vec!["codex".into(), "--resume".into()],
+        },
+    );
+    let serialized = session_info.to_string();
+    let deserialized = SessionInfo::from_string(&serialized, "other").unwrap();
+    assert_eq!(deserialized.remote_backend, session_info.remote_backend);
+    assert_eq!(
+        deserialized.remote_connection_state,
+        session_info.remote_connection_state
+    );
+    assert_eq!(deserialized.remote_panes, session_info.remote_panes);
 }
 
 #[test]

@@ -105,6 +105,11 @@ impl CliArgs {
 
 #[derive(Debug, Subcommand, Clone, Serialize, Deserialize)]
 pub enum Command {
+    /// Internal persistent PTY backend used by remote workspace providers.
+    #[clap(name = "remote-agent", hide = true)]
+    #[clap(subcommand)]
+    RemoteAgent(RemoteAgentCommand),
+
     /// Change the behaviour of Flock
     #[clap(name = "options", value_parser)]
     Options(Options),
@@ -131,6 +136,40 @@ pub enum Command {
         "flock [--session <OTHER SESSION NAME>] subscribe [OPTIONS] --pane-id..."
     ))]
     Subscribe(SubscribeCli),
+}
+
+#[derive(Debug, Subcommand, Clone, Serialize, Deserialize)]
+pub enum RemoteAgentCommand {
+    /// Run the per-user remote PTY daemon.
+    #[clap(hide = true)]
+    Serve {
+        #[clap(long, value_parser)]
+        socket: Option<PathBuf>,
+        #[clap(long, hide = true, value_parser)]
+        foreground: bool,
+    },
+    /// Connect framed stdin/stdout to the per-user remote PTY daemon.
+    #[clap(hide = true)]
+    Connect {
+        #[clap(long, value_parser)]
+        socket: Option<PathBuf>,
+    },
+    /// Local terminal bridge for a Coder-owned remote PTY.
+    #[clap(name = "coder-pty", hide = true)]
+    CoderPty {
+        #[clap(long, value_parser)]
+        workspace: String,
+        #[clap(long, value_parser)]
+        pane_id: Option<String>,
+    },
+    /// Close a Coder-owned remote PTY after an explicit local pane close.
+    #[clap(name = "coder-close", hide = true)]
+    CoderClose {
+        #[clap(long, value_parser)]
+        workspace: String,
+        #[clap(long, value_parser)]
+        pane_id: String,
+    },
 }
 
 #[derive(Debug, Parser, Clone, Serialize, Deserialize)]

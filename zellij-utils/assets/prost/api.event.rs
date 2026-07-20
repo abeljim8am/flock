@@ -410,6 +410,26 @@ pub struct SessionManifest {
     /// Empty means unset.
     #[prost(string, repeated, tag="16")]
     pub default_command: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+    #[prost(string, optional, tag="17")]
+    pub remote_backend: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(uint32, tag="18")]
+    pub remote_connection_state: u32,
+    #[prost(message, repeated, tag="19")]
+    pub remote_panes: ::prost::alloc::vec::Vec<RemotePaneMetadata>,
+}
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct RemotePaneMetadata {
+    #[prost(message, optional, tag="1")]
+    pub pane_id: ::core::option::Option<PaneId>,
+    #[prost(string, tag="2")]
+    pub pane_uuid: ::prost::alloc::string::String,
+    #[prost(uint64, tag="3")]
+    pub replay_cursor: u64,
+    #[prost(bool, tag="4")]
+    pub close_pending: bool,
+    #[prost(string, repeated, tag="5")]
+    pub foreground_argv: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
 }
 #[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Clone, PartialEq, ::prost::Message)]

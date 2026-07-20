@@ -207,6 +207,7 @@ pub(crate) struct Pty {
     pane_activity_flags: HashMap<u32, std::sync::Arc<std::sync::atomic::AtomicBool>>,
     terminal_cmds: HashMap<u32, Vec<String>>,
     terminal_foreground_cmds: HashMap<u32, Vec<String>>,
+    is_shutting_down: bool,
 }
 
 pub(crate) fn pty_thread_main(mut pty: Pty, layout: Box<Layout>) -> Result<()> {
@@ -923,6 +924,7 @@ impl Pty {
             pane_activity_flags: HashMap::new(),
             terminal_cmds: HashMap::new(),
             terminal_foreground_cmds: HashMap::new(),
+            is_shutting_down: false,
         }
     }
     pub fn get_default_terminal(
@@ -1797,6 +1799,11 @@ impl Pty {
         let err_context = || format!("failed to close for pane {id:?}");
         match id {
             PaneId::Terminal(id) => {
+                if !self.is_shutting_down {
+                    if let Some(workspace) = self.coder_workspace_for_pane(id) {
+                        self.request_remote_pane_close(id, &workspace);
+                    }
+                }
                 if let Some(handle) = self.task_handles.remove(&id) {
                     handle.abort();
                 }
@@ -1829,6 +1836,64 @@ impl Pty {
             ),
         }
         Ok(())
+    }
+
+    fn coder_workspace_for_pane(&self, id: u32) -> Option<String> {
+        let from_argv = |argv: &[String]| -> Option<String> {
+            argv.windows(3).find_map(|window| match window {
+                [coder_pty, workspace_flag, workspace]
+                    if coder_pty == "coder-pty" && workspace_flag == "--workspace" =>
+                {
+                    Some(workspace.clone())
+                },
+                [coder, ssh, workspace] if coder.ends_with("coder") && ssh == "ssh" => {
+                    Some(workspace.clone())
+                },
+                _ => None,
+            })
+        };
+        self.id_to_child_pid
+            .get(&id)
+            .and_then(|pid| std::fs::read(format!("/proc/{pid}/cmdline")).ok())
+            .map(|bytes| {
+                bytes
+                    .split(|byte| *byte == 0)
+                    .filter(|arg| !arg.is_empty())
+                    .map(|arg| String::from_utf8_lossy(arg).into_owned())
+                    .collect::<Vec<_>>()
+            })
+            .as_deref()
+            .and_then(from_argv)
+            .or_else(|| self.terminal_cmds.get(&id).and_then(|argv| from_argv(argv)))
+            .or_else(|| {
+                self.terminal_foreground_cmds
+                    .get(&id)
+                    .and_then(|argv| from_argv(argv))
+            })
+    }
+
+    fn request_remote_pane_close(&self, id: u32, workspace: &str) {
+        let session = zellij_utils::envs::get_session_name().unwrap_or_else(|_| "flock".into());
+        let pane_uuid = zellij_utils::data::stable_remote_pane_uuid(
+            workspace,
+            &session,
+            zellij_utils::data::PaneId::Terminal(id),
+        );
+        if let Ok(executable) = std::env::current_exe() {
+            let _ = std::process::Command::new(executable)
+                .args([
+                    "remote-agent",
+                    "coder-close",
+                    "--workspace",
+                    workspace,
+                    "--pane-id",
+                    &pane_uuid,
+                ])
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn();
+        }
     }
     pub fn close_tab(&mut self, ids: Vec<PaneId>) -> Result<()> {
         for id in ids {
@@ -2385,6 +2450,7 @@ impl Pty {
 
 impl Drop for Pty {
     fn drop(&mut self) {
+        self.is_shutting_down = true;
         let child_ids: Vec<u32> = self.id_to_child_pid.keys().copied().collect();
         for id in child_ids {
             self.close_pane(PaneId::Terminal(id))

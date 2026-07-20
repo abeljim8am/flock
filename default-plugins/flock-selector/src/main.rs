@@ -134,6 +134,10 @@ struct State {
     /// loaded) falls back to the built-in flock chrome mirror. Devcontainer
     /// sessions share this base — both bindings want the same chrome.
     remote_layout_base: Option<String>,
+    /// Exact host executable used for local Coder bridge panes. Debug builds
+    /// therefore launch the binary under test instead of a separately installed
+    /// `flock` from PATH.
+    flock_executable: Option<String>,
     /// Projects whose folder carries a `.devcontainer` marker, per scan scope
     /// (see [`devcontainers::SCAN_CONTEXT_KEY`]), so the Enter-time prompt
     /// check is a set lookup.
@@ -280,6 +284,9 @@ register_plugin!(State);
 impl ZellijPlugin for State {
     fn load(&mut self, configuration: BTreeMap<String, String>) {
         self.config = SelectorConfig::from_args(&configuration);
+        self.flock_executable = get_session_environment_variables()
+            .remove("FLOCK_EXECUTABLE")
+            .filter(|executable| !executable.trim().is_empty());
         // When launched as the cold-shell entry point, the layout passes a fixed
         // `session_name` so the picker's throwaway session always carries the
         // same stable name (which the sidebar hides) rather than a random one. A
@@ -459,6 +466,7 @@ impl ZellijPlugin for State {
                                 &pending.identifier,
                                 &self.config.sidebar_args,
                                 None,
+                                self.flock_executable.as_deref(),
                             ));
                             switch_session_with_layout(Some(&pending.session_name), layout, None);
                             self.discard_throwaway_session(pending.previous_session.as_deref());
@@ -1142,12 +1150,13 @@ impl State {
         }
         self.sessions
             .iter()
-            .filter_map(|session| {
-                session
+            .filter_map(|session| match &session.remote_backend {
+                Some(RemoteBackend::Coder { workspace, .. }) => Some(workspace.clone()),
+                None => session
                     .default_command
                     .as_deref()
                     .and_then(coder::parse_coder_ssh)
-                    .map(str::to_owned)
+                    .map(str::to_owned),
             })
             .collect()
     }
@@ -1158,10 +1167,18 @@ impl State {
             .map(|session| coder::ExistingSession {
                 name: session.name.clone(),
                 bound_workspace: session
-                    .default_command
-                    .as_deref()
-                    .and_then(coder::parse_coder_ssh)
-                    .map(str::to_owned),
+                    .remote_backend
+                    .as_ref()
+                    .map(|backend| match backend {
+                        RemoteBackend::Coder { workspace, .. } => workspace.clone(),
+                    })
+                    .or_else(|| {
+                        session
+                            .default_command
+                            .as_deref()
+                            .and_then(coder::parse_coder_ssh)
+                            .map(str::to_owned)
+                    }),
             })
             .collect()
     }
@@ -1371,13 +1388,20 @@ impl State {
             return false;
         };
         let identifier = workspace.identifier();
-        if let Some(bound) = self.sessions.iter().find(|session| {
-            session
-                .default_command
-                .as_deref()
-                .and_then(coder::parse_coder_ssh)
-                == Some(identifier.as_str())
-        }) {
+        if let Some(bound) = self
+            .sessions
+            .iter()
+            .find(|session| match &session.remote_backend {
+                Some(RemoteBackend::Coder { workspace, .. }) => workspace == &identifier,
+                None => {
+                    session
+                        .default_command
+                        .as_deref()
+                        .and_then(coder::parse_coder_ssh)
+                        == Some(identifier.as_str())
+                },
+            })
+        {
             if !bound.is_current_session {
                 let _ = kill_sessions(&[bound.name.as_str()]);
             }

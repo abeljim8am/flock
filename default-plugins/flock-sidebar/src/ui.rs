@@ -36,7 +36,7 @@ use std::collections::BTreeMap;
 use unicode_width::UnicodeWidthStr;
 use zellij_tile::prelude::{
     AgentRunState, FlockSidebarMode, PaletteColor, PaneAgentStatus, PaneId, PaneManifest,
-    SessionInfo, TabInfo,
+    RemoteBackend, RemoteConnectionState, SessionInfo, TabInfo,
 };
 
 use crate::detect::{identify_agent_from_command, AgentState};
@@ -167,11 +167,7 @@ fn session_activity(
     session: &SessionInfo,
     agents: &BTreeMap<PaneId, PaneAgentState>,
 ) -> SessionActivity {
-    if session
-        .default_command
-        .as_deref()
-        .and_then(crate::parse_remote_binding)
-        == Some(crate::RemoteBinding::Coder)
+    if crate::session_remote_binding(session) == Some(crate::RemoteBinding::Coder)
         && !session.agent_states.is_empty()
     {
         return session_activity_from_states(&session.agent_states);
@@ -253,6 +249,13 @@ fn run_state_to_agent_state(state: AgentRunState) -> AgentState {
 /// running (so they publish no `agent_states`): the running command is still
 /// enough to know an agent is present, even without live state.
 fn session_agent_count(session: &SessionInfo) -> usize {
+    if !session.remote_panes.is_empty() {
+        return session
+            .remote_panes
+            .values()
+            .filter(|pane| identify_agent_from_command(&pane.foreground_argv).is_some())
+            .count();
+    }
     session
         .panes
         .panes
@@ -297,6 +300,8 @@ pub(crate) enum Row {
         /// `default_command`) — badged in the row: ☁ codespace/Coder or ⬢
         /// devcontainer.
         binding: Option<crate::RemoteBinding>,
+        connection_state: Option<RemoteConnectionState>,
+        legacy_remote: bool,
     },
     Agent(AgentEntry),
 }
@@ -453,10 +458,13 @@ pub(crate) fn build_rows(
             name: session.name.clone(),
             activity: session_activity(session, agents),
             is_current: session.is_current_session,
-            binding: session
-                .default_command
-                .as_deref()
-                .and_then(crate::parse_remote_binding),
+            binding: crate::session_remote_binding(session),
+            connection_state: matches!(&session.remote_backend, Some(RemoteBackend::Coder { .. }))
+                .then_some(session.remote_connection_state),
+            legacy_remote: matches!(
+                &session.remote_backend,
+                Some(RemoteBackend::Coder { legacy: true, .. })
+            ),
         });
     }
     // Bottom section: the current session's own agents, one row each. Only the
@@ -928,6 +936,8 @@ fn draw_row(
             activity,
             is_current,
             binding,
+            connection_state,
+            legacy_remote,
         } => {
             let (dot, dot_color) = activity_dot(*activity, p);
             let emphasized = cursor || *is_current;
@@ -935,6 +945,7 @@ fn draw_row(
             // Cloud badges get two cells of breathing room before the session
             // name; the devcontainer badge keeps the standard one-cell gap.
             let badge_width = match binding {
+                Some(crate::RemoteBinding::Coder) if *legacy_remote => 4,
                 Some(crate::RemoteBinding::Codespace | crate::RemoteBinding::Coder) => 3,
                 Some(crate::RemoteBinding::Devcontainer) => 2,
                 None => 0,
@@ -961,7 +972,22 @@ fn draw_row(
                     spans.push(Span::new(" ", p.text));
                 },
                 Some(crate::RemoteBinding::Coder) => {
-                    spans.push(Span::new("☁︎  ", p.blue));
+                    let color = match connection_state {
+                        Some(RemoteConnectionState::Connected) => p.blue,
+                        Some(
+                            RemoteConnectionState::Connecting | RemoteConnectionState::Reconnecting,
+                        ) => p.yellow,
+                        Some(RemoteConnectionState::Disconnected) => p.muted,
+                        None => p.blue,
+                    };
+                    spans.push(Span::new(
+                        if *legacy_remote {
+                            "☁︎↑ "
+                        } else {
+                            "☁︎  "
+                        },
+                        color,
+                    ));
                 },
                 None => {},
             }
@@ -1265,6 +1291,8 @@ mod tests {
                 activity: SessionActivity::None,
                 is_current: false,
                 binding: Some(binding),
+                connection_state: None,
+                legacy_remote: false,
             };
             let mut output = String::new();
             draw_row(&mut output, &row, 0, 20, false, 0, &Theme::default());

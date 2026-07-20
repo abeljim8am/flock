@@ -91,17 +91,56 @@ pub fn ssh_argv(identifier: &str) -> Vec<String> {
 }
 
 pub fn gateway_argv(identifier: &str) -> Vec<String> {
-    vec![
-        "sh".into(),
-        "-c".into(),
-        GATEWAY_SCRIPT.into(),
-        GATEWAY_WRAPPER_ARG0.into(),
+    remote_pty_argv(identifier, None, None)
+}
+
+pub fn remote_pty_argv(
+    identifier: &str,
+    pane_id: Option<&str>,
+    executable: Option<&str>,
+) -> Vec<String> {
+    let mut argv = vec![
+        executable.unwrap_or("flock").into(),
+        "remote-agent".into(),
+        "coder-pty".into(),
+        "--workspace".into(),
         identifier.into(),
-    ]
+    ];
+    if let Some(pane_id) = pane_id {
+        argv.extend(["--pane-id".into(), pane_id.into()]);
+    }
+    argv
 }
 
 pub fn parse_gateway(argv: &[String]) -> Option<&str> {
     match argv {
+        [flock, remote_agent, coder_pty, workspace]
+            if is_flock_executable(flock)
+                && remote_agent == "remote-agent"
+                && coder_pty == "coder-pty"
+                && valid_identifier(workspace) =>
+        {
+            Some(workspace)
+        },
+        [flock, remote_agent, coder_pty, workspace_flag, workspace]
+            if is_flock_executable(flock)
+                && remote_agent == "remote-agent"
+                && coder_pty == "coder-pty"
+                && workspace_flag == "--workspace"
+                && valid_identifier(workspace) =>
+        {
+            Some(workspace)
+        },
+        [flock, remote_agent, coder_pty, workspace_flag, workspace, pane_flag, _pane_id]
+            if is_flock_executable(flock)
+                && remote_agent == "remote-agent"
+                && coder_pty == "coder-pty"
+                && workspace_flag == "--workspace"
+                && pane_flag == "--pane-id"
+                && valid_identifier(workspace) =>
+        {
+            Some(workspace)
+        },
         [sh, dash_c, script, arg0, identifier]
             if sh == "sh"
                 && dash_c == "-c"
@@ -113,6 +152,10 @@ pub fn parse_gateway(argv: &[String]) -> Option<&str> {
         },
         _ => None,
     }
+}
+
+fn is_flock_executable(executable: &str) -> bool {
+    executable == "flock" || (Path::new(executable).is_absolute() && !executable.is_empty())
 }
 
 /// Bootstrap the fork into a versioned user directory in the workspace. The
@@ -260,6 +303,7 @@ pub fn layout_doc_for(
     identifier: &str,
     sidebar_args: &[(String, String)],
     _base_layout: Option<&str>,
+    executable: Option<&str>,
 ) -> String {
     let args = sidebar_args
         .iter()
@@ -274,14 +318,23 @@ pub fn layout_doc_for(
             args
         )
     };
-    let command = gateway_argv(identifier)
+    let command = remote_pty_argv(identifier, None, executable)
         .iter()
         .map(|arg| kdl_quote(arg))
         .collect::<Vec<_>>()
         .join(" ");
+    let backend = serde_json::json!({
+        "provider": "coder",
+        "workspace": identifier,
+        "local_session_id": "",
+        "legacy": false,
+    })
+    .to_string();
     format!(
-        "layout {{\n    pane split_direction=\"Vertical\" {{\n        pane size=\"25%\" borderless=true {{\n{}\n        }}\n        pane\n    }}\n}}\ndefault_command {}\nsession_serialization false\n",
-        plugin, command
+        "layout {{\n    pane split_direction=\"Vertical\" {{\n        pane size=\"25%\" borderless=true {{\n{}\n        }}\n        pane\n    }}\n}}\ndefault_command {}\nremote_backend {}\nsession_serialization true\n",
+        plugin,
+        command,
+        kdl_quote(&backend),
     )
 }
 
@@ -1086,7 +1139,7 @@ mod tests {
     #[test]
     fn generated_layout_parses_and_carries_coder_binding() {
         let args = vec![("coder_enabled".into(), "true".into())];
-        let doc = layout_doc_for("alice/api", &args, None);
+        let doc = layout_doc_for("alice/api", &args, None, None);
         let (_, config) = zellij_utils::input::layout::Layout::from_stringified_layout(
             &doc,
             zellij_utils::input::config::Config::default(),
@@ -1096,16 +1149,24 @@ mod tests {
             config.options.default_command.as_deref(),
             Some(gateway_argv("alice/api").as_slice())
         );
-        assert_eq!(config.options.session_serialization, Some(false));
+        assert!(matches!(
+            config.options.remote_backend,
+            Some(zellij_tile::prelude::RemoteBackend::Coder {
+                ref workspace,
+                legacy: false,
+                ..
+            }) if workspace == "alice/api"
+        ));
+        assert_eq!(config.options.session_serialization, Some(true));
         assert!(doc.contains("coder_enabled \"true\""));
     }
 
     #[test]
     fn generated_gateway_layout_intentionally_ignores_remote_content_base() {
         let base = "layout {\n    pane borderless=true\n}";
-        let doc = layout_doc_for("alice/api", &[], Some(base));
+        let doc = layout_doc_for("alice/api", &[], Some(base), None);
         assert!(!doc.starts_with(base));
-        assert!(doc.contains(GATEWAY_WRAPPER_ARG0));
+        assert!(doc.contains("remote-agent"));
         let (_, config) = zellij_utils::input::layout::Layout::from_stringified_layout(
             &doc,
             zellij_utils::input::config::Config::default(),
@@ -1115,7 +1176,7 @@ mod tests {
             config.options.default_command.as_deref(),
             Some(gateway_argv("alice/api").as_slice())
         );
-        assert_eq!(config.options.session_serialization, Some(false));
+        assert_eq!(config.options.session_serialization, Some(true));
     }
 
     #[test]
@@ -1123,7 +1184,13 @@ mod tests {
         let gateway = gateway_argv("alice/api");
         assert_eq!(parse_gateway(&gateway), Some("alice/api"));
         assert_eq!(parse_coder_ssh(&gateway), Some("alice/api"));
-        assert!(GATEWAY_SCRIPT.contains("-- '\"$HOME/.local/share/flock/current/flock\"'"));
+        assert_eq!(gateway[0], "flock");
+        assert_eq!(gateway[1], "remote-agent");
+        assert_eq!(gateway[2], "coder-pty");
+        let debug_gateway =
+            remote_pty_argv("alice/api", None, Some("/workspace/target/debug/flock"));
+        assert_eq!(debug_gateway[0], "/workspace/target/debug/flock");
+        assert_eq!(parse_gateway(&debug_gateway), Some("alice/api"));
         let bootstrap = bootstrap_argv("alice/api");
         assert_eq!(&bootstrap[..3], &["coder", "ssh", "alice/api"]);
         assert_eq!(&bootstrap[3..6], &["--", "sh", "-c"]);

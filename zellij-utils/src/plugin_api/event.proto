@@ -340,6 +340,19 @@ message SessionManifest {
   // runs instead of the default shell), e.g. a flock codespace binding.
   // Empty means unset.
   repeated string default_command = 16;
+  // JSON encoding of the typed RemoteBackend enum. JSON keeps the protobuf
+  // envelope forward-compatible as providers add provider-specific fields.
+  optional string remote_backend = 17;
+  uint32 remote_connection_state = 18;
+  repeated RemotePaneMetadata remote_panes = 19;
+}
+
+message RemotePaneMetadata {
+  PaneId pane_id = 1;
+  string pane_uuid = 2;
+  uint64 replay_cursor = 3;
+  bool close_pending = 4;
+  repeated string foreground_argv = 5;
 }
 
 message PaneAgentStatus {
@@ -572,4 +585,3 @@ message HighlightClickedPayload {
 message InitialKeybindsPayload {
   repeated InputModeKeybinds keybinds = 1;
 }
-

@@ -1177,6 +1177,8 @@ message Options {
   // Command + args every new pane/tab runs instead of the default shell
   // (layout-injected per-session binding). Empty means unset.
   repeated string default_command = 48;
+  // JSON-encoded typed RemoteBackend descriptor for layout-generated sessions.
+  optional string remote_backend = 49;
 }
 
 enum OnForceClose {

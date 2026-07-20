@@ -1,10 +1,12 @@
 mod commands;
+#[cfg(unix)]
+mod remote_agent;
 #[cfg(test)]
 mod tests;
 
 use clap::Parser;
 use zellij_utils::{
-    cli::{CliAction, CliArgs, Command, Sessions},
+    cli::{CliAction, CliArgs, Command, RemoteAgentCommand, Sessions},
     consts::{create_config_and_cache_folders, VERSION},
     data::UnblockCondition,
     envs,
@@ -15,12 +17,44 @@ use zellij_utils::{
 };
 
 fn main() {
-    if let Ok(executable) = std::env::current_exe() {
-        envs::set_executable(executable.to_string_lossy().into_owned());
+    if std::env::var_os(envs::EXECUTABLE_ENV_KEY).is_none() {
+        if let Ok(executable) = std::env::current_exe() {
+            envs::set_executable(executable.to_string_lossy().into_owned());
+        }
     }
+    let opts = CliArgs::parse();
+
+    if let Some(Command::RemoteAgent(command)) = opts.command.clone() {
+        #[cfg(unix)]
+        {
+            let result = match command {
+                RemoteAgentCommand::Serve { socket, foreground } => {
+                    remote_agent::serve(socket, foreground)
+                },
+                RemoteAgentCommand::Connect { socket } => remote_agent::connect(socket),
+                RemoteAgentCommand::CoderPty { workspace, pane_id } => {
+                    remote_agent::coder_pty(&workspace, pane_id.as_deref())
+                },
+                RemoteAgentCommand::CoderClose { workspace, pane_id } => {
+                    remote_agent::coder_close(&workspace, &pane_id)
+                },
+            };
+            if let Err(error) = result {
+                eprintln!("flock remote-agent: {error:#}");
+                std::process::exit(1);
+            }
+            return;
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = command;
+            eprintln!("flock remote-agent is only supported on Linux x86_64");
+            std::process::exit(65);
+        }
+    }
+
     configure_logger();
     create_config_and_cache_folders();
-    let opts = CliArgs::parse();
 
     {
         let config = Config::try_from(&opts).ok();

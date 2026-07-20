@@ -1,6 +1,6 @@
 //! Handles cli and configuration options
 use crate::cli::Command;
-use crate::data::{InputMode, WebSharing};
+use crate::data::{InputMode, RemoteBackend, WebSharing};
 use clap::{ArgEnum, Args};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
@@ -72,6 +72,11 @@ pub struct Options {
     #[clap(skip)]
     #[serde(default)]
     pub default_command: Option<Vec<String>>,
+    /// Typed identity for a provider-backed session. Layout-generated only;
+    /// transport commands are an implementation detail, not session identity.
+    #[clap(skip)]
+    #[serde(default)]
+    pub remote_backend: Option<RemoteBackend>,
     /// Set the default cwd
     #[clap(long, value_parser)]
     pub default_cwd: Option<PathBuf>,
@@ -335,6 +340,7 @@ impl Options {
         let default_command = other
             .default_command
             .or_else(|| self.default_command.clone());
+        let remote_backend = other.remote_backend.or_else(|| self.remote_backend.clone());
         let default_cwd = other.default_cwd.or_else(|| self.default_cwd.clone());
         let default_layout = other.default_layout.or_else(|| self.default_layout.clone());
         let layout_dir = other.layout_dir.or_else(|| self.layout_dir.clone());
@@ -404,6 +410,7 @@ impl Options {
             default_mode,
             default_shell,
             default_command,
+            remote_backend,
             default_cwd,
             default_layout,
             layout_dir,
@@ -478,6 +485,7 @@ impl Options {
         let default_command = other
             .default_command
             .or_else(|| self.default_command.clone());
+        let remote_backend = other.remote_backend.or_else(|| self.remote_backend.clone());
         let default_cwd = other.default_cwd.or_else(|| self.default_cwd.clone());
         let default_layout = other.default_layout.or_else(|| self.default_layout.clone());
         let layout_dir = other.layout_dir.or_else(|| self.layout_dir.clone());
@@ -543,6 +551,7 @@ impl Options {
             default_mode,
             default_shell,
             default_command,
+            remote_backend,
             default_cwd,
             default_layout,
             layout_dir,

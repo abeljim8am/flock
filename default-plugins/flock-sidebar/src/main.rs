@@ -596,12 +596,38 @@ impl State {
         self.sessions
             .iter()
             .find(|session| session.is_current_session)
-            .and_then(|session| session.default_command.as_deref())
-            .and_then(coder::parse_coder_ssh)
-            .map(str::to_owned)
+            .and_then(|session| match &session.remote_backend {
+                Some(RemoteBackend::Coder { workspace, .. }) => Some(workspace.clone()),
+                None => session
+                    .default_command
+                    .as_deref()
+                    .and_then(coder::parse_coder_ssh)
+                    .map(str::to_owned),
+            })
     }
 
     fn maybe_poll_coder_snapshot(&mut self, now: Instant) {
+        // Native remote-agent sessions publish pane state in SessionInfo and
+        // never need remote Flock/sidebar snapshot polling. Keep polling only
+        // for recognized legacy nested-Flock sessions.
+        let is_legacy = self
+            .sessions
+            .iter()
+            .find(|session| session.is_current_session)
+            .is_some_and(|session| {
+                matches!(
+                    &session.remote_backend,
+                    Some(RemoteBackend::Coder { legacy: true, .. })
+                ) || (session.remote_backend.is_none()
+                    && session
+                        .default_command
+                        .as_deref()
+                        .and_then(coder::parse_coder_ssh)
+                        .is_some())
+            });
+        if !is_legacy {
+            return;
+        }
         if self.tracker_only {
             return;
         }
@@ -1452,6 +1478,16 @@ pub(crate) fn parse_remote_binding(argv: &[String]) -> Option<RemoteBinding> {
         return Some(RemoteBinding::Coder);
     }
     None
+}
+
+pub(crate) fn session_remote_binding(session: &SessionInfo) -> Option<RemoteBinding> {
+    match &session.remote_backend {
+        Some(RemoteBackend::Coder { .. }) => Some(RemoteBinding::Coder),
+        None => session
+            .default_command
+            .as_deref()
+            .and_then(parse_remote_binding),
+    }
 }
 
 fn argv_from_terminal_command(command: &str) -> Vec<String> {
