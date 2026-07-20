@@ -520,7 +520,18 @@ pub fn coder_close(workspace: &str, pane_id: &str) -> Result<()> {
     if let Some(parent) = pending_path.parent() {
         fs::create_dir_all(parent)?;
     }
-    fs::write(&pending_path, workspace)?;
+    if !pending_path.exists() {
+        let mut pending = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&pending_path)?;
+        pending.write_all(workspace.as_bytes())?;
+        pending.sync_all()?;
+    }
+    let _worker = match CloseWorkerGuard::acquire(cursor_path.with_extension("close-running"))? {
+        Some(worker) => worker,
+        None => return Ok(()),
+    };
     let mut delay = Duration::from_millis(250);
     loop {
         match send_remote_close(workspace, pane_id) {
@@ -538,6 +549,64 @@ pub fn coder_close(workspace: &str, pane_id: &str) -> Result<()> {
                 delay = (delay * 2).min(Duration::from_secs(10));
             },
         }
+    }
+}
+
+struct CloseWorkerGuard {
+    path: PathBuf,
+}
+
+impl CloseWorkerGuard {
+    fn acquire(path: PathBuf) -> Result<Option<Self>> {
+        for _ in 0..3 {
+            match fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&path)
+            {
+                Ok(mut file) => {
+                    write!(file, "{}", std::process::id())?;
+                    file.sync_all()?;
+                    return Ok(Some(Self { path }));
+                },
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                    let live = fs::read_to_string(&path)
+                        .ok()
+                        .and_then(|pid| pid.trim().parse::<i32>().ok())
+                        .is_some_and(|pid| close_worker_is_live(pid, &path));
+                    if live {
+                        return Ok(None);
+                    }
+                    match fs::remove_file(&path) {
+                        Ok(()) => {},
+                        Err(error) if error.kind() == io::ErrorKind::NotFound => {},
+                        Err(error) => return Err(error.into()),
+                    }
+                },
+                Err(error) => return Err(error.into()),
+            }
+        }
+        Ok(None)
+    }
+}
+
+fn close_worker_is_live(pid: i32, lock_path: &Path) -> bool {
+    if unsafe { libc::kill(pid, 0) } != 0 {
+        return false;
+    }
+    let pane_uuid = lock_path.file_stem().and_then(|stem| stem.to_str());
+    fs::read(format!("/proc/{pid}/cmdline"))
+        .ok()
+        .map(|command| String::from_utf8_lossy(&command).replace('\0', " "))
+        .is_some_and(|command| {
+            command.contains("coder-close")
+                && pane_uuid.is_some_and(|pane_uuid| command.contains(pane_uuid))
+        })
+}
+
+impl Drop for CloseWorkerGuard {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.path);
     }
 }
 

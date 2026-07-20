@@ -287,6 +287,23 @@ pub fn layout_doc_with_binding(
     sidebar_args: &[(String, String)],
     base_layout: Option<&str>,
 ) -> String {
+    layout_doc_with_options(
+        binding_argv,
+        sidebar_args,
+        base_layout,
+        "session_serialization false\n",
+    )
+}
+
+/// Compose the shared remote-session chrome with a provider binding and the
+/// provider-specific session options. Coder uses this too, but keeps
+/// resurrection enabled and records its typed remote backend.
+pub fn layout_doc_with_options(
+    binding_argv: &[String],
+    sidebar_args: &[(String, String)],
+    base_layout: Option<&str>,
+    options: &str,
+) -> String {
     let quoted: Vec<String> = binding_argv.iter().map(|arg| kdl_quote(arg)).collect();
     let layout = match base_layout {
         Some(base) => format!("{}\n", base.trim_end()),
@@ -295,9 +312,10 @@ pub fn layout_doc_with_binding(
             .replace("__SIDEBAR_40__", &sidebar_plugin_block(sidebar_args, 16)),
     };
     format!(
-        "{}default_command {}\nsession_serialization false\n",
+        "{}default_command {}\n{}",
         layout,
-        quoted.join(" ")
+        quoted.join(" "),
+        options,
     )
 }
 

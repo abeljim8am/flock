@@ -58,6 +58,9 @@ fn main() {
 
     configure_logger();
     create_config_and_cache_folders();
+    if let Err(error) = zellij_utils::remote_session_cleanup::recover_pending_coder_closes() {
+        log::warn!("failed to recover pending Coder pane closes: {error}");
+    }
 
     {
         let config = Config::try_from(&opts).ok();

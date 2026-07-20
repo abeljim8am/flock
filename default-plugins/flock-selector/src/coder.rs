@@ -347,27 +347,10 @@ fn valid_identifier(identifier: &str) -> bool {
 pub fn layout_doc_for(
     identifier: &str,
     sidebar_args: &[(String, String)],
-    _base_layout: Option<&str>,
+    base_layout: Option<&str>,
     executable: Option<&str>,
 ) -> String {
-    let args = sidebar_args
-        .iter()
-        .map(|(key, value)| format!("            {} {}", key, kdl_quote(value)))
-        .collect::<Vec<_>>()
-        .join("\n");
-    let plugin = if args.is_empty() {
-        "        plugin location=\"zellij:flock-sidebar\"".to_owned()
-    } else {
-        format!(
-            "        plugin location=\"zellij:flock-sidebar\" {{\n{}\n        }}",
-            args
-        )
-    };
-    let command = remote_pty_argv(identifier, None, executable)
-        .iter()
-        .map(|arg| kdl_quote(arg))
-        .collect::<Vec<_>>()
-        .join(" ");
+    let command = remote_pty_argv(identifier, None, executable);
     let backend = serde_json::json!({
         "provider": "coder",
         "workspace": identifier,
@@ -375,12 +358,11 @@ pub fn layout_doc_for(
         "legacy": false,
     })
     .to_string();
-    format!(
-        "layout {{\n    pane split_direction=\"Vertical\" {{\n        pane size=\"25%\" borderless=true {{\n{}\n        }}\n        pane\n    }}\n}}\ndefault_command {}\nremote_backend {}\nsession_serialization true\nshow_startup_tips false\nshow_release_notes false\n",
-        plugin,
-        command,
-        kdl_quote(&backend),
-    )
+    let options = format!(
+        "remote_backend {}\nsession_serialization true\nshow_startup_tips false\nshow_release_notes false\n",
+        kdl_quote(&backend)
+    );
+    crate::codespaces::layout_doc_with_options(&command, sidebar_args, base_layout, &options)
 }
 
 fn kdl_quote(value: &str) -> String {
@@ -1209,10 +1191,11 @@ mod tests {
     }
 
     #[test]
-    fn generated_gateway_layout_intentionally_ignores_remote_content_base() {
-        let base = "layout {\n    pane borderless=true\n}";
+    fn generated_gateway_layout_preserves_remote_content_base() {
+        let base = "layout {\n    pane borderless=true {\n        plugin location=\"zellij:custom-topbar\"\n    }\n}";
         let doc = layout_doc_for("alice/api", &[], Some(base), None);
-        assert!(!doc.starts_with(base));
+        assert!(doc.starts_with(base));
+        assert!(doc.contains("zellij:custom-topbar"));
         assert!(doc.contains("remote-agent"));
         let (_, config) = zellij_utils::input::layout::Layout::from_stringified_layout(
             &doc,
