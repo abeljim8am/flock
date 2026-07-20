@@ -444,6 +444,7 @@ fn test_client_messages() {
                     "-c".to_owned(),
                     "my-codespace".to_owned(),
                 ]),
+                remote_backend: None,
                 default_cwd: Some(PathBuf::from("default_cwd")),
                 default_layout: Some(PathBuf::from("default_layout")),
                 layout_dir: Some(PathBuf::from("layout_dir")),

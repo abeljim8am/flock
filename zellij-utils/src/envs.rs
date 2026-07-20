@@ -33,9 +33,14 @@ pub fn get_socket_dir() -> Result<String> {
 
 pub const PANE_ID_ENV_KEY: &str = "FLOCK_PANE_ID";
 pub const EXECUTABLE_ENV_KEY: &str = "FLOCK_EXECUTABLE";
+pub const REMOTE_AGENT_BINARY_ENV_KEY: &str = "FLOCK_REMOTE_AGENT_BINARY";
 
 pub fn set_executable(v: String) {
     set_var(EXECUTABLE_ENV_KEY, v);
+}
+
+pub fn set_remote_agent_binary(v: String) {
+    set_var(REMOTE_AGENT_BINARY_ENV_KEY, v);
 }
 
 /// Manage ENVIRONMENT VARIABLES from the configuration and the layout files
@@ -87,5 +92,6 @@ mod tests {
         assert_eq!(SOCKET_DIR_ENV_KEY, "FLOCK_SOCKET_DIR");
         assert_eq!(PANE_ID_ENV_KEY, "FLOCK_PANE_ID");
         assert_eq!(EXECUTABLE_ENV_KEY, "FLOCK_EXECUTABLE");
+        assert_eq!(REMOTE_AGENT_BINARY_ENV_KEY, "FLOCK_REMOTE_AGENT_BINARY");
     }
 }

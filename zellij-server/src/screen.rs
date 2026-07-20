@@ -66,6 +66,166 @@ use zellij_utils::{
     position::Position,
 };
 
+fn coder_backend_from_command(
+    command: Option<&[String]>,
+    local_session_id: &str,
+) -> Option<zellij_utils::data::RemoteBackend> {
+    let command = command?;
+    let (workspace, legacy) = match command {
+        [coder, ssh, workspace] if coder == "coder" && ssh == "ssh" => {
+            Some((workspace.as_str(), true))
+        },
+        [shell, dash_c, _script, arg0, workspace]
+            if shell == "sh" && dash_c == "-c" && arg0 == "flock-coder-gateway" =>
+        {
+            Some((workspace.as_str(), true))
+        },
+        [flock, remote_agent, coder_pty, workspace_flag, workspace, ..]
+            if flock == "flock"
+                && remote_agent == "remote-agent"
+                && coder_pty == "coder-pty"
+                && workspace_flag == "--workspace" =>
+        {
+            Some((workspace.as_str(), false))
+        },
+        _ => None,
+    }?;
+    Some(zellij_utils::data::RemoteBackend::Coder {
+        workspace: workspace.to_owned(),
+        local_session_id: local_session_id.to_owned(),
+        legacy,
+    })
+}
+
+fn normalized_remote_backend(
+    backend: Option<zellij_utils::data::RemoteBackend>,
+    session: &str,
+) -> Option<zellij_utils::data::RemoteBackend> {
+    backend.map(|backend| match backend {
+        zellij_utils::data::RemoteBackend::Coder {
+            workspace,
+            local_session_id,
+            legacy,
+        } => zellij_utils::data::RemoteBackend::Coder {
+            workspace,
+            local_session_id: if local_session_id.is_empty() {
+                session.to_owned()
+            } else {
+                local_session_id
+            },
+            legacy,
+        },
+    })
+}
+
+fn coder_remote_panes(
+    backend: &Option<zellij_utils::data::RemoteBackend>,
+    session: &str,
+    manifest: &PaneManifest,
+) -> BTreeMap<zellij_utils::data::PaneId, zellij_utils::data::RemotePaneMetadata> {
+    let Some(zellij_utils::data::RemoteBackend::Coder {
+        workspace,
+        legacy: false,
+        ..
+    }) = backend
+    else {
+        return BTreeMap::new();
+    };
+    manifest
+        .panes
+        .values()
+        .flatten()
+        .filter(|pane| !pane.is_plugin)
+        .map(|pane| {
+            let id = zellij_utils::data::PaneId::Terminal(pane.id);
+            let pane_uuid = zellij_utils::data::stable_remote_pane_uuid(workspace, session, id);
+            (
+                id,
+                zellij_utils::data::RemotePaneMetadata {
+                    replay_cursor: local_remote_cursor(&pane_uuid),
+                    foreground_argv: local_remote_foreground(&pane_uuid),
+                    pane_uuid,
+                    close_pending: false,
+                },
+            )
+        })
+        .collect()
+}
+
+fn local_remote_cursor(pane_uuid: &str) -> u64 {
+    let root = std::env::var_os("XDG_CACHE_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".cache")));
+    root.and_then(|root| {
+        std::fs::read_to_string(
+            root.join("flock")
+                .join("remote-panes")
+                .join(format!("{pane_uuid}.cursor")),
+        )
+        .ok()
+    })
+    .and_then(|cursor| cursor.trim().parse().ok())
+    .unwrap_or_default()
+}
+
+fn local_remote_foreground(pane_uuid: &str) -> Vec<String> {
+    let root = std::env::var_os("XDG_CACHE_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".cache")));
+    root.and_then(|root| {
+        std::fs::read_to_string(
+            root.join("flock")
+                .join("remote-panes")
+                .join(format!("{pane_uuid}.foreground")),
+        )
+        .ok()
+    })
+    .map(|argv| {
+        argv.split('\0')
+            .filter(|arg| !arg.is_empty())
+            .map(str::to_owned)
+            .collect()
+    })
+    .unwrap_or_default()
+}
+
+fn remote_connection_state(
+    panes: &BTreeMap<zellij_utils::data::PaneId, zellij_utils::data::RemotePaneMetadata>,
+) -> zellij_utils::data::RemoteConnectionState {
+    use zellij_utils::data::RemoteConnectionState::*;
+    let mut state = Disconnected;
+    for pane in panes.values() {
+        let root = std::env::var_os("XDG_CACHE_HOME")
+            .map(PathBuf::from)
+            .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".cache")));
+        let pane_state = root
+            .and_then(|root| {
+                std::fs::read_to_string(
+                    root.join("flock")
+                        .join("remote-panes")
+                        .join(format!("{}.connection", pane.pane_uuid)),
+                )
+                .ok()
+            })
+            .map(|value| match value.trim() {
+                "connected" => Connected,
+                "connecting" => Connecting,
+                "reconnecting" => Reconnecting,
+                _ => Disconnected,
+            })
+            .unwrap_or(Disconnected);
+        state = match (state, pane_state) {
+            (_, Reconnecting) => Reconnecting,
+            (Reconnecting, _) => Reconnecting,
+            (_, Connecting) => Connecting,
+            (Connecting, _) => Connecting,
+            (_, Connected) => Connected,
+            (current, _) => current,
+        };
+    }
+    state
+}
+
 use crate::background_jobs::BackgroundJob;
 use crate::os_input_output::ResizeCache;
 use crate::pane_groups::PaneGroups;
@@ -1493,6 +1653,7 @@ pub(crate) struct Screen {
     /// layout-injected flock codespace binding). Surfaced on `SessionInfo` so
     /// plugins can recognize bound sessions. `None` for ordinary sessions.
     session_default_command: Option<Vec<String>>,
+    session_remote_backend: Option<zellij_utils::data::RemoteBackend>,
     /// The latest per-pane agent status published by this session's
     /// flock-sidebar plugin (via `PluginCommand::PublishAgentState`). Stored
     /// here and copied onto every `SessionInfo` we generate, so it rides the
@@ -1659,6 +1820,7 @@ impl Screen {
             host_theme_light_styling: None,
             workspace_root: PathBuf::new(),
             session_default_command: None,
+            session_remote_backend: None,
             published_agent_states: BTreeMap::new(),
             published_flock_sidebar_state: None,
         }
@@ -3482,6 +3644,17 @@ impl Screen {
                 .map(|d| Duration::from_secs(d.as_secs()))
                 .unwrap_or_default()
         };
+        let remote_backend = normalized_remote_backend(
+            self.session_remote_backend.clone().or_else(|| {
+                coder_backend_from_command(
+                    self.session_default_command.as_deref(),
+                    &self.session_name,
+                )
+            }),
+            &self.session_name,
+        );
+        let remote_panes = coder_remote_panes(&remote_backend, &self.session_name, &pane_manifest);
+        let remote_connection_state = remote_connection_state(&remote_panes);
         let session_info = SessionInfo {
             name: self.session_name.clone(),
             tabs: tab_infos,
@@ -3506,6 +3679,9 @@ impl Screen {
             creation_time,
             workspace_root: self.workspace_root.clone(),
             default_command: self.session_default_command.clone(),
+            remote_backend: remote_backend.clone(),
+            remote_connection_state,
+            remote_panes,
             agent_states: self.published_agent_states.clone(),
             flock_sidebar_state: self.published_flock_sidebar_state,
         };
@@ -5746,6 +5922,7 @@ pub(crate) fn screen_thread_main(
     }
 
     let session_default_command = config.options.default_command.clone();
+    let session_remote_backend = config.options.remote_backend.clone();
     let config_options = config.options;
     let arrow_fonts = !config_options.simplified_ui.unwrap_or_default();
     let draw_pane_frames = config_options.pane_frames.unwrap_or(true);
@@ -5857,6 +6034,7 @@ pub(crate) fn screen_thread_main(
             std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."))
         });
     screen.session_default_command = session_default_command;
+    screen.session_remote_backend = session_remote_backend;
 
     let mut pending_tab_ids: HashSet<usize> = HashSet::new();
     let mut pending_tab_switches: HashSet<(usize, ClientId)> = HashSet::new(); // usize is the
@@ -8783,6 +8961,18 @@ pub(crate) fn screen_thread_main(
                         .map(|d| Duration::from_secs(d.as_secs()))
                         .unwrap_or_default()
                 };
+                let remote_backend = normalized_remote_backend(
+                    screen.session_remote_backend.clone().or_else(|| {
+                        coder_backend_from_command(
+                            screen.session_default_command.as_deref(),
+                            &screen.session_name,
+                        )
+                    }),
+                    &screen.session_name,
+                );
+                let remote_panes =
+                    coder_remote_panes(&remote_backend, &screen.session_name, &pane_manifest);
+                let remote_connection_state = remote_connection_state(&remote_panes);
                 let session_info = SessionInfo {
                     name: screen.session_name.clone(),
                     tabs: tab_infos,
@@ -8807,6 +8997,9 @@ pub(crate) fn screen_thread_main(
                     creation_time,
                     workspace_root: screen.workspace_root.clone(),
                     default_command: screen.session_default_command.clone(),
+                    remote_backend: remote_backend.clone(),
+                    remote_connection_state,
+                    remote_panes,
                     agent_states: screen.published_agent_states.clone(),
                     flock_sidebar_state: screen.published_flock_sidebar_state,
                 };

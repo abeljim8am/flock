@@ -183,7 +183,7 @@ fn handle_command_exit(mut child: Child) -> Result<Option<i32>> {
 
 fn handle_openpty(
     open_pty_res: OpenptyResult,
-    cmd: RunCommand,
+    mut cmd: RunCommand,
     quit_cb: Box<dyn Fn(PaneId, Option<i32>, RunCommand) + Send>,
     terminal_id: u32,
 ) -> Result<(RawFd, RawFd)> {
@@ -197,6 +197,8 @@ fn handle_openpty(
     // primary side of pty and child fd
     let pid_primary = open_pty_res.master;
     let pid_secondary = open_pty_res.slave;
+
+    forward_coder_cwd(&mut cmd);
 
     if !command_exists(&cmd) {
         return Err(ZellijError::CommandNotFound {
@@ -247,6 +249,26 @@ fn handle_openpty(
     });
 
     Ok((pid_primary, child_id as RawFd))
+}
+
+/// A provider-backed shell interprets pane cwd in the workspace, not on the
+/// laptop. Carry it as a bridge argument and prevent Command from trying to
+/// chdir into a path that may not exist locally.
+fn forward_coder_cwd(cmd: &mut RunCommand) {
+    let is_flock = cmd.command == std::path::Path::new("flock") || cmd.command.is_absolute();
+    let is_coder_pty = matches!(
+        cmd.args.as_slice(),
+        [remote_agent, coder_pty, workspace_flag, _, ..]
+            if remote_agent == "remote-agent"
+                && coder_pty == "coder-pty"
+                && workspace_flag == "--workspace"
+    );
+    if is_flock && is_coder_pty {
+        if let Some(cwd) = cmd.cwd.take() {
+            cmd.args.push("--cwd".into());
+            cmd.args.push(cwd.to_string_lossy().into_owned());
+        }
+    }
 }
 
 /// Spawns a new terminal from the parent terminal with [`termios`](termios::Termios)
@@ -460,6 +482,29 @@ mod tests {
     use nix::fcntl::{fcntl, FcntlArg, OFlag};
     use nix::sys::termios;
     use std::io::Read;
+
+    #[test]
+    fn coder_bridge_forwards_remote_cwd_as_an_argument() {
+        let mut command = RunCommand {
+            command: "/tmp/custom-flock".into(),
+            args: vec![
+                "remote-agent".into(),
+                "coder-pty".into(),
+                "--workspace".into(),
+                "alice/api".into(),
+            ],
+            cwd: Some("/workspace/api".into()),
+            ..Default::default()
+        };
+
+        forward_coder_cwd(&mut command);
+
+        assert_eq!(command.cwd, None);
+        assert_eq!(
+            &command.args[4..],
+            &["--cwd".to_owned(), "/workspace/api".to_owned()]
+        );
+    }
 
     /// Verify that `try_write_to_fd` writes as many bytes as the kernel will
     /// accept in one pass and returns a partial count (not an error) when the

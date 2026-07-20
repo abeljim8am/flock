@@ -26,10 +26,11 @@ pub use super::generated_api::api::{
         PaneRenderReportPayload as ProtobufPaneRenderReportPayload,
         PaneScrollbackResponse as ProtobufPaneScrollbackResponse, PaneType as ProtobufPaneType,
         PluginConfigurationChangedPayload as ProtobufPluginConfigurationChangedPayload,
-        PluginInfo as ProtobufPluginInfo, ResurrectableSession as ProtobufResurrectableSession,
-        SelectedText as ProtobufSelectedText, SessionManifest as ProtobufSessionManifest,
-        SyntaxError as ProtobufSyntaxError, TabInfo as ProtobufTabInfo,
-        TabMetadata as ProtobufTabMetadata, UserActionPayload as ProtobufUserActionPayload,
+        PluginInfo as ProtobufPluginInfo, RemotePaneMetadata as ProtobufRemotePaneMetadata,
+        ResurrectableSession as ProtobufResurrectableSession, SelectedText as ProtobufSelectedText,
+        SessionManifest as ProtobufSessionManifest, SyntaxError as ProtobufSyntaxError,
+        TabInfo as ProtobufTabInfo, TabMetadata as ProtobufTabMetadata,
+        UserActionPayload as ProtobufUserActionPayload,
         WebServerStatusPayload as ProtobufWebServerStatusPayload, WebSharing as ProtobufWebSharing,
         *,
     },
@@ -43,8 +44,8 @@ use crate::data::{
     FlockSidebarMode, FlockSidebarState, HostTerminalThemeMode, InputMode, KeyWithModifier,
     LayoutInfo, LayoutMetadata, ModeInfo, Mouse, PaneAgentStatus, PaneContents, PaneId, PaneInfo,
     PaneManifest, PaneMetadata, PaneScrollbackResponse, PermissionStatus, PluginCapabilities,
-    PluginInfo, SelectedText, SessionInfo, Style, TabInfo, TabMetadata, WebServerStatus,
-    WebSharing,
+    PluginInfo, RemoteBackend, RemoteConnectionState, RemotePaneMetadata, SelectedText,
+    SessionInfo, Style, TabInfo, TabMetadata, WebServerStatus, WebSharing,
 };
 
 use crate::errors::prelude::*;
@@ -1217,6 +1218,28 @@ impl TryFrom<SessionInfo> for ProtobufSessionManifest {
             creation_time: session_info.creation_time.as_secs(),
             workspace_root: session_info.workspace_root.display().to_string(),
             default_command: session_info.default_command.unwrap_or_default(),
+            remote_backend: session_info
+                .remote_backend
+                .and_then(|backend| serde_json::to_string(&backend).ok()),
+            remote_connection_state: match session_info.remote_connection_state {
+                RemoteConnectionState::Disconnected => 0,
+                RemoteConnectionState::Connecting => 1,
+                RemoteConnectionState::Connected => 2,
+                RemoteConnectionState::Reconnecting => 3,
+            },
+            remote_panes: session_info
+                .remote_panes
+                .into_iter()
+                .filter_map(|(pane_id, metadata)| {
+                    Some(ProtobufRemotePaneMetadata {
+                        pane_id: Some(pane_id.try_into().ok()?),
+                        pane_uuid: metadata.pane_uuid,
+                        replay_cursor: metadata.replay_cursor,
+                        close_pending: metadata.close_pending,
+                        foreground_argv: metadata.foreground_argv,
+                    })
+                })
+                .collect(),
             agent_states: session_info
                 .agent_states
                 .into_iter()
@@ -1342,6 +1365,31 @@ impl TryFrom<ProtobufSessionManifest> for SessionInfo {
                 );
             }
         }
+        let remote_backend = protobuf_session_manifest
+            .remote_backend
+            .as_deref()
+            .and_then(|backend| serde_json::from_str::<RemoteBackend>(backend).ok());
+        let remote_connection_state = match protobuf_session_manifest.remote_connection_state {
+            1 => RemoteConnectionState::Connecting,
+            2 => RemoteConnectionState::Connected,
+            3 => RemoteConnectionState::Reconnecting,
+            _ => RemoteConnectionState::Disconnected,
+        };
+        let remote_panes = protobuf_session_manifest
+            .remote_panes
+            .into_iter()
+            .filter_map(|metadata| {
+                Some((
+                    metadata.pane_id?.try_into().ok()?,
+                    RemotePaneMetadata {
+                        pane_uuid: metadata.pane_uuid,
+                        replay_cursor: metadata.replay_cursor,
+                        close_pending: metadata.close_pending,
+                        foreground_argv: metadata.foreground_argv,
+                    },
+                ))
+            })
+            .collect();
         Ok(SessionInfo {
             name: protobuf_session_manifest.name,
             tabs: protobuf_session_manifest
@@ -1369,6 +1417,9 @@ impl TryFrom<ProtobufSessionManifest> for SessionInfo {
             } else {
                 Some(protobuf_session_manifest.default_command)
             },
+            remote_backend,
+            remote_connection_state,
+            remote_panes,
             agent_states,
             flock_sidebar_state: protobuf_session_manifest.flock_sidebar_state.map(|state| {
                 FlockSidebarState {
@@ -2852,6 +2903,9 @@ fn serialize_session_update_event_with_non_default_values() {
             "-c".to_owned(),
             "my-codespace".to_owned(),
         ]),
+        remote_backend: None,
+        remote_connection_state: Default::default(),
+        remote_panes: Default::default(),
         agent_states: {
             let mut agent_states = BTreeMap::new();
             agent_states.insert(
@@ -2904,6 +2958,9 @@ fn serialize_session_update_event_with_non_default_values() {
         creation_time: Duration::from_secs(200),
         workspace_root: PathBuf::from("/home/aviram/session-2"),
         default_command: None,
+        remote_backend: None,
+        remote_connection_state: Default::default(),
+        remote_panes: Default::default(),
         agent_states: Default::default(),
         flock_sidebar_state: None,
     };

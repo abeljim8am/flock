@@ -207,6 +207,7 @@ pub(crate) struct Pty {
     pane_activity_flags: HashMap<u32, std::sync::Arc<std::sync::atomic::AtomicBool>>,
     terminal_cmds: HashMap<u32, Vec<String>>,
     terminal_foreground_cmds: HashMap<u32, Vec<String>>,
+    is_shutting_down: bool,
 }
 
 pub(crate) fn pty_thread_main(mut pty: Pty, layout: Box<Layout>) -> Result<()> {
@@ -923,6 +924,7 @@ impl Pty {
             pane_activity_flags: HashMap::new(),
             terminal_cmds: HashMap::new(),
             terminal_foreground_cmds: HashMap::new(),
+            is_shutting_down: false,
         }
     }
     pub fn get_default_terminal(
@@ -975,18 +977,7 @@ impl Pty {
                 .get(&client_id)
                 .and_then(|pane| match pane {
                     PaneId::Plugin(plugin_id) => self.plugin_cwds.get(plugin_id).cloned(),
-                    PaneId::Terminal(id) => {
-                        // Try to get CWD from OS, fall back to cached value
-                        self.id_to_child_pid
-                            .get(id)
-                            .and_then(|&pid| {
-                                self.bus
-                                    .os_input
-                                    .as_ref()
-                                    .and_then(|input| input.get_cwd(pid))
-                            })
-                            .or_else(|| self.terminal_cwds.get(id).cloned())
-                    },
+                    PaneId::Terminal(id) => self.cwd_for_terminal(*id),
                 })
         };
     }
@@ -997,18 +988,7 @@ impl Pty {
         };
         if cwd.is_none() {
             *cwd = match pane_id {
-                PaneId::Terminal(terminal_pane_id) => {
-                    // Try to get CWD from OS, fall back to cached value
-                    self.id_to_child_pid
-                        .get(terminal_pane_id)
-                        .and_then(|&pid| {
-                            self.bus
-                                .os_input
-                                .as_ref()
-                                .and_then(|input| input.get_cwd(pid))
-                        })
-                        .or_else(|| self.terminal_cwds.get(terminal_pane_id).cloned())
-                },
+                PaneId::Terminal(terminal_pane_id) => self.cwd_for_terminal(*terminal_pane_id),
                 PaneId::Plugin(plugin_id) => self.plugin_cwds.get(plugin_id).cloned(),
             };
         };
@@ -1797,6 +1777,11 @@ impl Pty {
         let err_context = || format!("failed to close for pane {id:?}");
         match id {
             PaneId::Terminal(id) => {
+                if !self.is_shutting_down {
+                    if let Some(workspace) = self.coder_workspace_for_pane(id) {
+                        self.request_remote_pane_close(id, &workspace);
+                    }
+                }
                 if let Some(handle) = self.task_handles.remove(&id) {
                     handle.abort();
                 }
@@ -1829,6 +1814,103 @@ impl Pty {
             ),
         }
         Ok(())
+    }
+
+    fn coder_workspace_for_pane(&self, id: u32) -> Option<String> {
+        let from_argv = |argv: &[String]| -> Option<String> {
+            argv.windows(3).find_map(|window| match window {
+                [coder_pty, workspace_flag, workspace]
+                    if coder_pty == "coder-pty" && workspace_flag == "--workspace" =>
+                {
+                    Some(workspace.clone())
+                },
+                [coder, ssh, workspace] if coder.ends_with("coder") && ssh == "ssh" => {
+                    Some(workspace.clone())
+                },
+                _ => None,
+            })
+        };
+        self.id_to_child_pid
+            .get(&id)
+            .and_then(|pid| std::fs::read(format!("/proc/{pid}/cmdline")).ok())
+            .map(|bytes| {
+                bytes
+                    .split(|byte| *byte == 0)
+                    .filter(|arg| !arg.is_empty())
+                    .map(|arg| String::from_utf8_lossy(arg).into_owned())
+                    .collect::<Vec<_>>()
+            })
+            .as_deref()
+            .and_then(from_argv)
+            .or_else(|| self.terminal_cmds.get(&id).and_then(|argv| from_argv(argv)))
+            .or_else(|| {
+                self.terminal_foreground_cmds
+                    .get(&id)
+                    .and_then(|argv| from_argv(argv))
+            })
+    }
+
+    fn remote_cwd_for_pane(&self, id: u32) -> Option<PathBuf> {
+        let workspace = self.coder_workspace_for_pane(id)?;
+        let session = zellij_utils::envs::get_session_name().ok()?;
+        let pane_uuid = zellij_utils::data::stable_remote_pane_uuid(
+            &workspace,
+            &session,
+            zellij_utils::data::PaneId::Terminal(id),
+        );
+        let root = std::env::var_os("XDG_CACHE_HOME")
+            .map(PathBuf::from)
+            .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".cache")))?;
+        std::fs::read_to_string(
+            root.join("flock")
+                .join("remote-panes")
+                .join(format!("{pane_uuid}.cwd")),
+        )
+        .ok()
+        .filter(|cwd| !cwd.is_empty())
+        .map(PathBuf::from)
+    }
+
+    fn cwd_for_terminal(&self, id: u32) -> Option<PathBuf> {
+        if let Some(remote_cwd) = self.remote_cwd_for_pane(id) {
+            return Some(remote_cwd);
+        }
+        if self.coder_workspace_for_pane(id).is_some() {
+            return self.terminal_cwds.get(&id).cloned();
+        }
+        self.id_to_child_pid
+            .get(&id)
+            .and_then(|&pid| {
+                self.bus
+                    .os_input
+                    .as_ref()
+                    .and_then(|input| input.get_cwd(pid))
+            })
+            .or_else(|| self.terminal_cwds.get(&id).cloned())
+    }
+
+    fn request_remote_pane_close(&self, id: u32, workspace: &str) {
+        let session = zellij_utils::envs::get_session_name().unwrap_or_else(|_| "flock".into());
+        let pane_uuid = zellij_utils::data::stable_remote_pane_uuid(
+            workspace,
+            &session,
+            zellij_utils::data::PaneId::Terminal(id),
+        );
+        if let Ok(executable) = std::env::current_exe() {
+            let _ = std::process::Command::new(executable)
+                .args([
+                    "remote-agent",
+                    "coder-close",
+                    "--workspace",
+                    workspace,
+                    "--pane-id",
+                    &pane_uuid,
+                ])
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn();
+        }
     }
     pub fn close_tab(&mut self, ids: Vec<PaneId>) -> Result<()> {
         for id in ids {
@@ -1966,7 +2048,12 @@ impl Pty {
 
         for terminal_id in terminal_ids {
             let process_id = self.id_to_child_pid.get(&terminal_id);
-            let cwd = process_id.and_then(|pid| pids_to_cwds.get(pid));
+            let remote_cwd = self.remote_cwd_for_pane(terminal_id);
+            let cwd = if self.coder_workspace_for_pane(terminal_id).is_some() {
+                remote_cwd.as_ref()
+            } else {
+                process_id.and_then(|pid| pids_to_cwds.get(pid))
+            };
             let cmd_sysinfo = process_id.and_then(|pid| pids_to_cmds.get(pid));
             let cmd_ps = process_id.and_then(|pid| ppids_to_cmds.get(&format!("{}", pid)));
             if let Some(cmd) = cmd_ps {
@@ -2006,18 +2093,7 @@ impl Pty {
                 .get(&client_id)
                 .and_then(|pane| match pane {
                     PaneId::Plugin(plugin_id) => self.plugin_cwds.get(plugin_id).cloned(),
-                    PaneId::Terminal(id) => {
-                        // Try to get CWD from OS, fall back to cached value
-                        self.id_to_child_pid
-                            .get(id)
-                            .and_then(|&pid| {
-                                self.bus
-                                    .os_input
-                                    .as_ref()
-                                    .and_then(|input| input.get_cwd(pid))
-                            })
-                            .or_else(|| self.terminal_cwds.get(id).cloned())
-                    },
+                    PaneId::Terminal(id) => self.cwd_for_terminal(*id),
                 })
         };
 
@@ -2054,6 +2130,12 @@ impl Pty {
         Ok(())
     }
     fn capture_initial_cwd(&mut self, terminal_id: u32, child_pid: u32) {
+        if self.coder_workspace_for_pane(terminal_id).is_some() {
+            if let Some(cwd) = self.remote_cwd_for_pane(terminal_id) {
+                self.terminal_cwds.insert(terminal_id, cwd);
+            }
+            return;
+        }
         if let Some(os_input) = self.bus.os_input.as_ref() {
             if let Some(cwd) = os_input.get_cwd(child_pid) {
                 self.terminal_cwds.insert(terminal_id, cwd);
@@ -2095,7 +2177,12 @@ impl Pty {
 
         for terminal_id in &active_terminal_ids {
             let process_id = self.id_to_child_pid.get(terminal_id);
-            let cwd = process_id.and_then(|pid| pids_to_cwds.get(pid));
+            let remote_cwd = self.remote_cwd_for_pane(*terminal_id);
+            let cwd = if self.coder_workspace_for_pane(*terminal_id).is_some() {
+                remote_cwd.as_ref()
+            } else {
+                process_id.and_then(|pid| pids_to_cwds.get(pid))
+            };
 
             if let Some(cwd) = cwd {
                 if self.terminal_cwds.get(terminal_id) != Some(cwd) {
@@ -2385,6 +2472,7 @@ impl Pty {
 
 impl Drop for Pty {
     fn drop(&mut self) {
+        self.is_shutting_down = true;
         let child_ids: Vec<u32> = self.id_to_child_pid.keys().copied().collect();
         for id in child_ids {
             self.close_pane(PaneId::Terminal(id))

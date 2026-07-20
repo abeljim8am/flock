@@ -1926,6 +1926,59 @@ pub struct FlockSidebarState {
     pub updated_at_millis: u64,
 }
 
+/// A provider binding is session identity, not a shell command. Keeping this
+/// typed prevents plugins from having to reverse-engineer transport argv.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(tag = "provider", rename_all = "snake_case")]
+pub enum RemoteBackend {
+    Coder {
+        workspace: String,
+        local_session_id: String,
+        #[serde(default)]
+        legacy: bool,
+    },
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RemoteConnectionState {
+    Connecting,
+    Connected,
+    Reconnecting,
+    #[default]
+    Disconnected,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub struct RemotePaneMetadata {
+    pub pane_uuid: String,
+    pub replay_cursor: u64,
+    #[serde(default)]
+    pub close_pending: bool,
+    #[serde(default)]
+    pub foreground_argv: Vec<String>,
+}
+
+pub fn stable_remote_pane_uuid(workspace: &str, session: &str, pane_id: PaneId) -> String {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    let mut high = DefaultHasher::new();
+    (workspace, session, pane_id).hash(&mut high);
+    let high = high.finish();
+    let mut low = DefaultHasher::new();
+    (high, pane_id, session, workspace).hash(&mut low);
+    let value = ((high as u128) << 64) | low.finish() as u128;
+    let hex = format!("{value:032x}");
+    format!(
+        "{}-{}-4{}-a{}-{}",
+        &hex[0..8],
+        &hex[8..12],
+        &hex[13..16],
+        &hex[17..20],
+        &hex[20..32]
+    )
+}
+
 #[derive(Debug, Default, Clone, PartialEq, Eq, Deserialize, Serialize)]
 pub struct SessionInfo {
     pub name: String,
@@ -1952,6 +2005,14 @@ pub struct SessionInfo {
     /// sessions (selector: switch-vs-create; sidebar: listing/badging).
     #[serde(default)]
     pub default_command: Option<Vec<String>>,
+    /// Typed remote identity and live transport state. New integrations should
+    /// use these fields; `default_command` remains for legacy providers.
+    #[serde(default)]
+    pub remote_backend: Option<RemoteBackend>,
+    #[serde(default)]
+    pub remote_connection_state: RemoteConnectionState,
+    #[serde(default)]
+    pub remote_panes: BTreeMap<PaneId, RemotePaneMetadata>,
     /// Per-pane agent status published by this session's flock-sidebar plugin
     /// (via `PublishAgentState`). Carried on `SessionInfo` so it rides the
     /// existing cross-session metadata transport: another session's sidebar

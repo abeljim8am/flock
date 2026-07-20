@@ -596,12 +596,38 @@ impl State {
         self.sessions
             .iter()
             .find(|session| session.is_current_session)
-            .and_then(|session| session.default_command.as_deref())
-            .and_then(coder::parse_coder_ssh)
-            .map(str::to_owned)
+            .and_then(|session| match &session.remote_backend {
+                Some(RemoteBackend::Coder { workspace, .. }) => Some(workspace.clone()),
+                None => session
+                    .default_command
+                    .as_deref()
+                    .and_then(coder::parse_coder_ssh)
+                    .map(str::to_owned),
+            })
     }
 
     fn maybe_poll_coder_snapshot(&mut self, now: Instant) {
+        // Native remote-agent sessions publish pane state in SessionInfo and
+        // never need remote Flock/sidebar snapshot polling. Keep polling only
+        // for recognized legacy nested-Flock sessions.
+        let is_legacy = self
+            .sessions
+            .iter()
+            .find(|session| session.is_current_session)
+            .is_some_and(|session| {
+                matches!(
+                    &session.remote_backend,
+                    Some(RemoteBackend::Coder { legacy: true, .. })
+                ) || (session.remote_backend.is_none()
+                    && session
+                        .default_command
+                        .as_deref()
+                        .and_then(coder::parse_coder_ssh)
+                        .is_some())
+            });
+        if !is_legacy {
+            return;
+        }
         if self.tracker_only {
             return;
         }
@@ -824,11 +850,8 @@ impl State {
             .filter(|session| {
                 !self.sessionizer.is_configured()
                     || self.sessionizer.contains_workspace(&session.workspace_root)
-                    || session
-                        .default_command
-                        .as_deref()
-                        .and_then(|command| self.parse_enabled_remote_binding(command))
-                        .is_some()
+                    || session_remote_binding(session)
+                        .is_some_and(|binding| self.remote_binding_enabled(binding))
             })
             .cloned()
             .map(|mut session| {
@@ -1279,17 +1302,14 @@ impl State {
     }
 
     fn parse_enabled_remote_binding(&self, argv: &[String]) -> Option<RemoteBinding> {
-        match parse_remote_binding(argv) {
-            Some(RemoteBinding::Codespace) if self.sessionizer.codespaces_enabled() => {
-                Some(RemoteBinding::Codespace)
-            },
-            Some(RemoteBinding::Devcontainer) if self.sessionizer.devcontainers_enabled() => {
-                Some(RemoteBinding::Devcontainer)
-            },
-            Some(RemoteBinding::Coder) if self.sessionizer.coder_enabled() => {
-                Some(RemoteBinding::Coder)
-            },
-            _ => None,
+        parse_remote_binding(argv).filter(|binding| self.remote_binding_enabled(*binding))
+    }
+
+    fn remote_binding_enabled(&self, binding: RemoteBinding) -> bool {
+        match binding {
+            RemoteBinding::Codespace => self.sessionizer.codespaces_enabled(),
+            RemoteBinding::Devcontainer => self.sessionizer.devcontainers_enabled(),
+            RemoteBinding::Coder => self.sessionizer.coder_enabled(),
         }
     }
 
@@ -1298,11 +1318,8 @@ impl State {
     fn current_session_is_bound(&self) -> bool {
         self.sessions.iter().any(|session| {
             session.is_current_session
-                && session
-                    .default_command
-                    .as_deref()
-                    .and_then(|command| self.parse_enabled_remote_binding(command))
-                    .is_some()
+                && session_remote_binding(session)
+                    .is_some_and(|binding| self.remote_binding_enabled(binding))
         })
     }
 
@@ -1454,6 +1471,16 @@ pub(crate) fn parse_remote_binding(argv: &[String]) -> Option<RemoteBinding> {
     None
 }
 
+pub(crate) fn session_remote_binding(session: &SessionInfo) -> Option<RemoteBinding> {
+    match &session.remote_backend {
+        Some(RemoteBackend::Coder { .. }) => Some(RemoteBinding::Coder),
+        None => session
+            .default_command
+            .as_deref()
+            .and_then(parse_remote_binding),
+    }
+}
+
 fn argv_from_terminal_command(command: &str) -> Vec<String> {
     command.split_whitespace().map(String::from).collect()
 }
@@ -1593,6 +1620,37 @@ mod tests {
         state.apply_command_changed(
             pane_id,
             &argv(&["coder", "ssh", "alice/api"]),
+            true,
+            Instant::now(),
+        );
+        assert!(state.agents.get(&pane_id).unwrap().remote);
+    }
+
+    #[test]
+    fn typed_coder_binding_keeps_session_visible_and_marks_its_panes_remote() {
+        let mut state = state_with_provider("coder_enabled");
+        let mut session = SessionInfo::new("wooli-test".into());
+        session.is_current_session = true;
+        session.remote_backend = Some(RemoteBackend::Coder {
+            workspace: "abeljim/wooli-test".into(),
+            local_session_id: "wooli-test".into(),
+            legacy: false,
+        });
+        state.sessions = vec![session];
+
+        assert_eq!(state.visible_sessions().len(), 1);
+        assert!(state.current_session_is_bound());
+
+        let pane_id = PaneId::Terminal(3);
+        state.apply_command_changed(
+            pane_id,
+            &argv(&[
+                "/tmp/flock",
+                "remote-agent",
+                "coder-pty",
+                "--workspace",
+                "abeljim/wooli-test",
+            ]),
             true,
             Instant::now(),
         );
