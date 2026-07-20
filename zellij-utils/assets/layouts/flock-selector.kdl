@@ -7,7 +7,13 @@
 // cwd). The values below are placeholders — a real config (e.g. the nix module)
 // overrides them by shipping its own copy of this layout, or the user edits it.
 layout {
-    pane
+    // Keep the cold-selector session alive until the floating picker is ready.
+    // An interactive default shell can exit during startup (eg. from shell
+    // initialization), which otherwise tears down the whole session before the
+    // WASM plugin finishes loading.
+    pane command="tail" {
+        args "-f" "/dev/null"
+    }
     floating_panes {
         pane {
             plugin location="zellij:flock-selector" {
