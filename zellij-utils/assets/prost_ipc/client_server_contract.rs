@@ -1953,6 +1953,7 @@ pub struct Options {
     /// (layout-injected per-session binding). Empty means unset.
     #[prost(string, repeated, tag="48")]
     pub default_command: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+    /// JSON-encoded typed RemoteBackend descriptor for layout-generated sessions.
     #[prost(string, optional, tag="49")]
     pub remote_backend: ::core::option::Option<::prost::alloc::string::String>,
 }

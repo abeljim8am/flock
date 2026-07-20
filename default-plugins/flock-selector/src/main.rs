@@ -138,6 +138,9 @@ struct State {
     /// therefore launch the binary under test instead of a separately installed
     /// `flock` from PATH.
     flock_executable: Option<String>,
+    /// Optional Linux x86_64 debug binary streamed to the workspace during
+    /// bootstrap. Release runs leave this unset and use verified downloads.
+    remote_agent_binary: Option<String>,
     /// Projects whose folder carries a `.devcontainer` marker, per scan scope
     /// (see [`devcontainers::SCAN_CONTEXT_KEY`]), so the Enter-time prompt
     /// check is a set lookup.
@@ -284,9 +287,13 @@ register_plugin!(State);
 impl ZellijPlugin for State {
     fn load(&mut self, configuration: BTreeMap<String, String>) {
         self.config = SelectorConfig::from_args(&configuration);
-        self.flock_executable = get_session_environment_variables()
+        let mut environment = get_session_environment_variables();
+        self.flock_executable = environment
             .remove("FLOCK_EXECUTABLE")
             .filter(|executable| !executable.trim().is_empty());
+        self.remote_agent_binary = environment
+            .remove("FLOCK_REMOTE_AGENT_BINARY")
+            .filter(|binary| !binary.trim().is_empty());
         // When launched as the cold-shell entry point, the layout passes a fixed
         // `session_name` so the picker's throwaway session always carries the
         // same stable name (which the sidebar hides) rather than a random one. A
@@ -1367,7 +1374,7 @@ impl State {
                 });
                 self.coder_create_notice =
                     Some(format!("Preparing persistent session in {}…", identifier));
-                let argv = coder::bootstrap_argv(&identifier);
+                let argv = coder::bootstrap_argv(&identifier, self.remote_agent_binary.as_deref());
                 let refs: Vec<&str> = argv.iter().map(String::as_str).collect();
                 run_command(&refs, coder::bootstrap_context(&identifier));
                 return;

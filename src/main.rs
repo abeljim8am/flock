@@ -18,8 +18,15 @@ use zellij_utils::{
 
 fn main() {
     if std::env::var_os(envs::EXECUTABLE_ENV_KEY).is_none() {
-        if let Ok(executable) = std::env::current_exe() {
-            envs::set_executable(executable.to_string_lossy().into_owned());
+        if let Ok(current_executable) = std::env::current_exe() {
+            let current_executable = current_executable.to_string_lossy().into_owned();
+            envs::set_executable(current_executable);
+        }
+    }
+    #[cfg(all(debug_assertions, target_os = "linux", target_arch = "x86_64"))]
+    if std::env::var_os(envs::REMOTE_AGENT_BINARY_ENV_KEY).is_none() {
+        if let Ok(executable) = std::env::var(envs::EXECUTABLE_ENV_KEY) {
+            envs::set_remote_agent_binary(executable);
         }
     }
     let opts = CliArgs::parse();

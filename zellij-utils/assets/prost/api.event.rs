@@ -410,6 +410,8 @@ pub struct SessionManifest {
     /// Empty means unset.
     #[prost(string, repeated, tag="16")]
     pub default_command: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+    /// JSON encoding of the typed RemoteBackend enum. JSON keeps the protobuf
+    /// envelope forward-compatible as providers add provider-specific fields.
     #[prost(string, optional, tag="17")]
     pub remote_backend: ::core::option::Option<::prost::alloc::string::String>,
     #[prost(uint32, tag="18")]

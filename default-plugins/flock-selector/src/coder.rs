@@ -161,7 +161,10 @@ fn is_flock_executable(executable: &str) -> bool {
 /// Bootstrap the fork into a versioned user directory in the workspace. The
 /// static musl build is intentionally Linux/x86_64-only for v1. Installation is
 /// atomic and checksum verified; repeated calls are cheap.
-pub fn bootstrap_argv(identifier: &str) -> Vec<String> {
+pub fn bootstrap_argv(identifier: &str, debug_binary: Option<&str>) -> Vec<String> {
+    if let Some(debug_binary) = debug_binary {
+        return debug_bootstrap_argv(identifier, debug_binary);
+    }
     let script = format!(
         r#"set -eu
 [ "$(uname -s)" = Linux ] && [ "$(uname -m)" = x86_64 ] || {{ echo "flock: persistent Coder sessions currently require Linux x86_64" >&2; exit 65; }}
@@ -198,6 +201,46 @@ ln -sfn "$dest/flock" "$HOME/.local/bin/flock""#,
         "sh".into(),
         "-c".into(),
         quote_coder_remote_arg(&script),
+    ]
+}
+
+/// Stream an explicitly selected local Linux x86_64 binary over `coder ssh`.
+/// The binary path and workspace are positional shell arguments, never
+/// interpolated into either script. This keeps spaces and shell metacharacters
+/// inert while allowing the remote `cat` to receive the executable on stdin.
+fn debug_bootstrap_argv(identifier: &str, debug_binary: &str) -> Vec<String> {
+    let remote_script = format!(
+        r#"set -eu
+[ "$(uname -s)" = Linux ] && [ "$(uname -m)" = x86_64 ] || {{ echo "flock: debug remote agent requires Linux x86_64" >&2; exit 65; }}
+root="$HOME/.local/share/flock"
+dest="$root/{tag}-debug"
+tmp="$dest/.flock.$$"
+mkdir -p "$dest" "$HOME/.local/bin"
+trap "rm -f \"$tmp\"" EXIT HUP INT TERM
+cat > "$tmp"
+chmod 0755 "$tmp"
+"$tmp" --version >/dev/null
+mv -f "$tmp" "$dest/flock"
+ln -sfn "$dest" "$root/current"
+ln -sfn "$dest/flock" "$HOME/.local/bin/flock""#,
+        tag = RELEASE_TAG,
+    );
+    let local_script = format!(
+        r#"set -eu
+binary="$1"
+workspace="$2"
+[ -f "$binary" ] || {{ echo "flock: debug remote agent binary not found: $binary" >&2; exit 66; }}
+remote={}
+coder ssh "$workspace" -- sh -c "$remote" < "$binary""#,
+        quote_coder_remote_arg(&remote_script),
+    );
+    vec![
+        "sh".into(),
+        "-c".into(),
+        local_script,
+        "flock-debug-bootstrap".into(),
+        debug_binary.into(),
+        identifier.into(),
     ]
 }
 
@@ -1191,7 +1234,7 @@ mod tests {
             remote_pty_argv("alice/api", None, Some("/workspace/target/debug/flock"));
         assert_eq!(debug_gateway[0], "/workspace/target/debug/flock");
         assert_eq!(parse_gateway(&debug_gateway), Some("alice/api"));
-        let bootstrap = bootstrap_argv("alice/api");
+        let bootstrap = bootstrap_argv("alice/api", None);
         assert_eq!(&bootstrap[..3], &["coder", "ssh", "alice/api"]);
         assert_eq!(&bootstrap[3..6], &["--", "sh", "-c"]);
         assert!(bootstrap
@@ -1204,6 +1247,19 @@ mod tests {
         assert!(bootstrap.last().unwrap().ends_with('\''));
         assert_eq!(bootstrap.last().unwrap().matches('\'').count(), 2);
         assert_eq!(quote_coder_remote_arg("printf %s"), "'printf %s'");
+
+        let debug = bootstrap_argv(
+            "alice/api",
+            Some("/workspace/target/debug/flock with spaces"),
+        );
+        assert_eq!(&debug[..2], &["sh", "-c"]);
+        assert_eq!(debug[3], "flock-debug-bootstrap");
+        assert_eq!(debug[4], "/workspace/target/debug/flock with spaces");
+        assert_eq!(debug[5], "alice/api");
+        assert!(debug[2].contains("coder ssh \"$workspace\""));
+        assert!(debug[2].contains("< \"$binary\""));
+        assert!(!debug[2].contains("/workspace/target/debug"));
+        assert!(!debug[2].contains("alice/api"));
     }
 
     #[test]

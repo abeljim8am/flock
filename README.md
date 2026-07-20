@@ -81,8 +81,10 @@ Provider requirements:
 Debug builds pass their exact `FLOCK_EXECUTABLE` path into generated local Coder
 bridge panes, so `cargo run -- ...` tests the binary you just built instead of a
 different `flock` on `PATH`. Set `FLOCK_EXECUTABLE=/absolute/path/to/flock` to
-override it explicitly. The workspace agent remains the matching,
-checksum-verified Linux x86_64 release installed during bootstrap.
+override it explicitly. On a Linux x86_64 laptop, debug builds also stream that
+binary to the workspace as the remote agent. On other platforms, point
+`FLOCK_REMOTE_AGENT_BINARY` at a cross-compiled Linux x86_64 Flock binary.
+Release builds continue installing the matching checksum-verified release.
 
 Agent hook integrations live in
 [`default-plugins/flock-sidebar/assets`](default-plugins/flock-sidebar/assets).
