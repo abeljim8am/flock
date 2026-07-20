@@ -7,6 +7,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
 ## [Unreleased]
 * feat: allow tabs to have different sizes if clients aren't focused on the same one (https://github.com/zellij-org/zellij/pull/5133)
 
+## [26.1.1] - 2026-07-20
+* fix(coder): preserve PTY input and the startup working directory in remote sessions
+
 ## [26.1.0] - 2026-07-19
 * feat(coder): keep remote processes alive with a reconnecting remote PTY backend and bounded output replay
 * fix(coder): harden reconnects, working-directory handling, pane activation, Fish bootstrap shells, and macOS portability
