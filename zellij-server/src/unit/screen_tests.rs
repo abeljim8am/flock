@@ -1,4 +1,4 @@
-use super::{screen_thread_main, CopyOptions, Screen, ScreenInstruction};
+use super::{coder_remote_panes, screen_thread_main, CopyOptions, Screen, ScreenInstruction};
 use crate::panes::PaneId;
 use crate::{
     channels::SenderWithContext, os_input_output::ServerOsApi, route::route_action,
@@ -29,6 +29,38 @@ use crate::pty_writer::PtyWriteInstruction;
 use std::collections::HashSet;
 use std::env::set_var;
 use std::sync::{Arc, Mutex};
+
+#[test]
+fn restored_coder_pane_keeps_its_saved_remote_uuid() {
+    use std::collections::HashMap;
+    use zellij_utils::data::{PaneInfo, PaneManifest, RemoteBackend};
+
+    let saved_uuid = "9cf53ab7-4dd0-4cd1-a577-e2bc59f90549";
+    let manifest = PaneManifest {
+        panes: HashMap::from_iter([(
+            0,
+            vec![PaneInfo {
+                id: 91,
+                terminal_command: Some(format!(
+                    "flock remote-agent coder-pty --workspace alice/api --pane-id {saved_uuid}"
+                )),
+                ..Default::default()
+            }],
+        )]),
+    };
+    let backend = Some(RemoteBackend::Coder {
+        workspace: "alice/api".into(),
+        local_session_id: "coder-api".into(),
+        legacy: false,
+    });
+    let panes = coder_remote_panes(&backend, "coder-api", &manifest);
+    assert_eq!(
+        panes
+            .get(&zellij_utils::data::PaneId::Terminal(91))
+            .map(|pane| pane.pane_uuid.as_str()),
+        Some(saved_uuid)
+    );
+}
 
 use crate::{
     plugins::PluginInstruction,

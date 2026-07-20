@@ -88,6 +88,25 @@ binary to the workspace as the remote agent. This opt-in build requires Zig,
 `FLOCK_REMOTE_AGENT_BINARY` at a cross-compiled Linux x86_64 Flock binary.
 Release builds continue installing the matching checksum-verified release.
 
+### Coder session lifecycle
+
+Coder shells are intentionally owned by the workspace's remote PTY daemon, so
+the local host session can be suspended without terminating remote work:
+
+- Detaching leaves the live host session and its remote shells running.
+- Killing a session (including `kill-all-sessions`) synchronously saves its
+  host layout, then disconnects locally. Reopening the same deterministic
+  session name restores its tabs and reconnects to the same remote PTYs.
+- Deleting a resumable session is final: Flock durably queues closure of every
+  saved remote PTY before removing the host resurrection metadata. Interrupted
+  closes are retried the next time Flock starts.
+- Stopping or restarting the Coder workspace terminates the workspace daemon,
+  so its remote shells are cleaned up immediately.
+
+While a killed host session is intentionally suspended, its remote shells and
+jobs remain alive and may continue producing bounded replay output until the
+session is reopened, deleted, or the Coder workspace stops.
+
 Agent hook integrations live in
 [`default-plugins/flock-sidebar/assets`](default-plugins/flock-sidebar/assets).
 They improve accuracy, but are optional because Flock can detect state from pane

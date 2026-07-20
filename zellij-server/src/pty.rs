@@ -1852,12 +1852,7 @@ impl Pty {
 
     fn remote_cwd_for_pane(&self, id: u32) -> Option<PathBuf> {
         let workspace = self.coder_workspace_for_pane(id)?;
-        let session = zellij_utils::envs::get_session_name().ok()?;
-        let pane_uuid = zellij_utils::data::stable_remote_pane_uuid(
-            &workspace,
-            &session,
-            zellij_utils::data::PaneId::Terminal(id),
-        );
+        let pane_uuid = self.remote_uuid_for_pane(id, &workspace)?;
         let root = std::env::var_os("XDG_CACHE_HOME")
             .map(PathBuf::from)
             .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".cache")))?;
@@ -1890,27 +1885,25 @@ impl Pty {
     }
 
     fn request_remote_pane_close(&self, id: u32, workspace: &str) {
-        let session = zellij_utils::envs::get_session_name().unwrap_or_else(|_| "flock".into());
-        let pane_uuid = zellij_utils::data::stable_remote_pane_uuid(
+        if let Some(pane_uuid) = self.remote_uuid_for_pane(id, workspace) {
+            let _ = zellij_utils::remote_session_cleanup::queue_coder_close(workspace, &pane_uuid);
+        }
+    }
+
+    fn remote_uuid_for_pane(&self, id: u32, workspace: &str) -> Option<String> {
+        if let Some(saved_uuid) = self.terminal_cmds.get(&id).and_then(|command| {
+            command
+                .windows(2)
+                .find_map(|pair| (pair[0] == "--pane-id").then(|| pair[1].clone()))
+        }) {
+            return Some(saved_uuid);
+        }
+        let session = zellij_utils::envs::get_session_name().ok()?;
+        Some(zellij_utils::data::stable_remote_pane_uuid(
             workspace,
             &session,
             zellij_utils::data::PaneId::Terminal(id),
-        );
-        if let Ok(executable) = std::env::current_exe() {
-            let _ = std::process::Command::new(executable)
-                .args([
-                    "remote-agent",
-                    "coder-close",
-                    "--workspace",
-                    workspace,
-                    "--pane-id",
-                    &pane_uuid,
-                ])
-                .stdin(std::process::Stdio::null())
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .spawn();
-        }
+        ))
     }
     pub fn close_tab(&mut self, ids: Vec<PaneId>) -> Result<()> {
         for id in ids {
@@ -2049,14 +2042,35 @@ impl Pty {
         for terminal_id in terminal_ids {
             let process_id = self.id_to_child_pid.get(&terminal_id);
             let remote_cwd = self.remote_cwd_for_pane(terminal_id);
-            let cwd = if self.coder_workspace_for_pane(terminal_id).is_some() {
+            let coder_workspace = self.coder_workspace_for_pane(terminal_id);
+            let cwd = if coder_workspace.is_some() {
                 remote_cwd.as_ref()
             } else {
                 process_id.and_then(|pid| pids_to_cwds.get(pid))
             };
             let cmd_sysinfo = process_id.and_then(|pid| pids_to_cmds.get(pid));
             let cmd_ps = process_id.and_then(|pid| ppids_to_cmds.get(&format!("{}", pid)));
-            if let Some(cmd) = cmd_ps {
+            if let Some(workspace) = coder_workspace.as_deref() {
+                if let Some(mut command) = self.terminal_cmds.get(&terminal_id).cloned() {
+                    // A serialized Coder pane must name its remote UUID
+                    // explicitly. Local terminal allocation is usually stable,
+                    // but the saved UUID is the durable identity and must win if
+                    // allocation order changes during resurrection.
+                    if !command.iter().any(|argument| argument == "--pane-id") {
+                        let session = zellij_utils::envs::get_session_name()
+                            .unwrap_or_else(|_| "flock".into());
+                        command.extend([
+                            "--pane-id".into(),
+                            zellij_utils::data::stable_remote_pane_uuid(
+                                workspace,
+                                &session,
+                                PaneId::Terminal(terminal_id).into(),
+                            ),
+                        ]);
+                    }
+                    terminal_ids_to_commands.insert(terminal_id, command);
+                }
+            } else if let Some(cmd) = cmd_ps {
                 terminal_ids_to_commands.insert(terminal_id, cmd.clone());
             } else if let Some(cmd) = cmd_sysinfo {
                 terminal_ids_to_commands.insert(terminal_id, cmd.clone());

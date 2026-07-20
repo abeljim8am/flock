@@ -472,7 +472,7 @@ impl ZellijPlugin for State {
                             let layout = LayoutInfo::Stringified(coder::layout_doc_for(
                                 &pending.identifier,
                                 &self.config.sidebar_args,
-                                None,
+                                self.remote_layout_base.as_deref(),
                                 self.flock_executable.as_deref(),
                             ));
                             switch_session_with_layout(Some(&pending.session_name), layout, None);
@@ -1666,11 +1666,11 @@ impl State {
     /// that folder's real session. No-op for keybind launches, where the
     /// current session is the user's working session.
     fn discard_throwaway_session(&self, current_session_name: Option<&str>) {
-        if self.config.session_name.is_none() {
-            return;
-        }
-        if let Some(name) = current_session_name {
-            let _ = kill_sessions(&[name]);
+        let names =
+            throwaway_session_names(self.config.session_name.as_deref(), current_session_name);
+        if !names.is_empty() {
+            let names = names.iter().map(String::as_str).collect::<Vec<_>>();
+            let _ = kill_sessions(&names);
         }
     }
 
@@ -1687,5 +1687,39 @@ impl State {
                 hidden: self.is_selector_session(s),
             })
             .collect()
+    }
+}
+
+fn throwaway_session_names(configured: Option<&str>, observed: Option<&str>) -> Vec<String> {
+    let Some(configured) = configured else {
+        return Vec::new();
+    };
+    let mut names = Vec::with_capacity(2);
+    for name in [configured, SELECTOR_SESSION_NAME]
+        .into_iter()
+        .chain(observed)
+    {
+        if !name.is_empty() && !names.iter().any(|existing| existing == name) {
+            names.push(name.to_owned());
+        }
+    }
+    names
+}
+
+#[cfg(test)]
+mod throwaway_cleanup_tests {
+    use super::throwaway_session_names;
+
+    #[test]
+    fn cleanup_covers_configured_canonical_and_stale_alias_once() {
+        assert_eq!(
+            throwaway_session_names(Some("custom-selector"), Some("random-before-rename")),
+            ["custom-selector", "flock-selector", "random-before-rename"]
+        );
+        assert_eq!(
+            throwaway_session_names(Some("flock-selector"), Some("flock-selector")),
+            ["flock-selector"]
+        );
+        assert!(throwaway_session_names(None, Some("working-session")).is_empty());
     }
 }

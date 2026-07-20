@@ -138,7 +138,21 @@ fn coder_remote_panes(
         .filter(|pane| !pane.is_plugin)
         .map(|pane| {
             let id = zellij_utils::data::PaneId::Terminal(pane.id);
-            let pane_uuid = zellij_utils::data::stable_remote_pane_uuid(workspace, session, id);
+            let pane_uuid = pane
+                .terminal_command
+                .as_deref()
+                .and_then(|command| {
+                    let mut words = command.split_whitespace();
+                    while let Some(word) = words.next() {
+                        if word == "--pane-id" {
+                            return words.next().map(str::to_owned);
+                        }
+                    }
+                    None
+                })
+                .unwrap_or_else(|| {
+                    zellij_utils::data::stable_remote_pane_uuid(workspace, session, id)
+                });
             (
                 id,
                 zellij_utils::data::RemotePaneMetadata {

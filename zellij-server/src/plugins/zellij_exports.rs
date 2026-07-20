@@ -2938,6 +2938,13 @@ fn switch_session(
 }
 
 fn delete_dead_session(session_name: String) -> Result<()> {
+    zellij_utils::remote_session_cleanup::queue_saved_coder_pane_closes(&session_name)
+        .with_context(|| {
+            format!(
+                "Failed to queue remote pane cleanup for {:?}",
+                &session_name
+            )
+        })?;
     std::fs::remove_dir_all(&*ZELLIJ_SESSION_INFO_CACHE_DIR.join(&session_name))
         .with_context(|| format!("Failed to delete dead session: {:?}", &session_name))
 }
@@ -3343,14 +3350,11 @@ fn kill_sessions(session_names: Vec<String>) {
     }
 }
 
-// Wedge timeout: only guards against a peer that neither shuts down nor
-// crashes. Normal kill latency is tens of milliseconds (peer's route loop
-// reads the message, server sends Exit back), so 500 ms is several times the
-// expected worst case while still feeling instant to the user. Applied per
-// session -- kills are issued concurrently, so the whole batch is still
-// bounded by a single budget of wall time while one wedged peer cannot mark
-// the kills that succeeded as failed.
-const KILL_WEDGE_TIMEOUT: Duration = Duration::from_millis(500);
+// A Coder-backed peer synchronously flushes its resurrection layout before it
+// acknowledges shutdown. Keep a bounded timeout for wedged peers, but allow
+// enough time for durable metadata and layout writes on a busy filesystem.
+// Kills are concurrent, so a batch still consumes one wall-clock budget.
+const KILL_WEDGE_TIMEOUT: Duration = Duration::from_secs(5);
 
 fn kill_sessions_and_reply(env: &PluginEnv, session_names: Vec<String>) {
     use tokio::task::JoinSet;
@@ -3401,14 +3405,13 @@ fn kill_sessions_and_reply(env: &PluginEnv, session_names: Vec<String>) {
 }
 
 fn delete_dead_session_and_reply(env: &PluginEnv, session_name: String) {
-    let response =
-        match std::fs::remove_dir_all(&*ZELLIJ_SESSION_INFO_CACHE_DIR.join(&session_name)) {
-            Ok(()) => DeleteDeadSessionResponse::Ok,
-            Err(e) => DeleteDeadSessionResponse::Err(format!(
-                "Failed to delete dead session {}: {}",
-                session_name, e
-            )),
-        };
+    let response = match delete_dead_session(session_name.clone()) {
+        Ok(()) => DeleteDeadSessionResponse::Ok,
+        Err(e) => DeleteDeadSessionResponse::Err(format!(
+            "Failed to delete dead session {}: {}",
+            session_name, e
+        )),
+    };
     let protobuf_response = ProtobufDeleteDeadSessionResponse::from(response);
     wasi_write_object(env, &protobuf_response.encode_to_vec())
         .with_context(|| "failed to write delete_dead_session response".to_string())

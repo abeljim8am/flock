@@ -346,6 +346,10 @@ pub fn kill_session(name: &str) {
             process::exit(1);
         },
     };
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while path.exists() && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
 }
 
 pub fn delete_session(name: &str, force: bool) {
@@ -371,6 +375,17 @@ pub fn delete_session(name: &str, force: bool) {
                     .ok();
             }
         });
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while path.exists() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+    if let Err(error) = crate::remote_session_cleanup::queue_saved_coder_pane_closes(name) {
+        eprintln!(
+            "Failed to queue remote pane cleanup for {:?}: {}",
+            name, error
+        );
+        process::exit(1);
     }
     if let Err(e) = std::fs::remove_dir_all(session_info_folder_for_session(name)) {
         if e.kind() == std::io::ErrorKind::NotFound {

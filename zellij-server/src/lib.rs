@@ -49,7 +49,8 @@ use crate::{
     screen::{screen_thread_main, ScreenInstruction},
     thread_bus::{Bus, ThreadSenders},
 };
-use route::{route_thread_main, NotificationEnd};
+use route::{route_thread_main, wait_for_action_completion, NotificationEnd};
+use tokio::sync::oneshot;
 use zellij_utils::{
     channels::{self, ChannelWithContext, SenderWithContext},
     consts::{
@@ -395,6 +396,33 @@ pub(crate) struct SessionMetaData {
 }
 
 impl SessionMetaData {
+    fn flush_coder_resurrection_state(&self) {
+        if !matches!(
+            self.session_remote_backend.as_ref(),
+            Some(RemoteBackend::Coder { legacy: false, .. })
+        ) {
+            return;
+        }
+        let (completion_tx, completion_rx) = oneshot::channel();
+        if self
+            .senders
+            .send_to_screen(ScreenInstruction::SaveSession(
+                0,
+                Some(NotificationEnd::new(completion_tx)),
+            ))
+            .is_ok()
+        {
+            // SaveSession bypasses the periodic serializer's dirty guard. Wait
+            // for the PTY thread to write both metadata and layout before the
+            // server tears its worker threads down.
+            let _ = wait_for_action_completion(
+                completion_rx,
+                "save_coder_session_before_shutdown",
+                true,
+            );
+        }
+    }
+
     pub fn get_client_keybinds_and_mode(
         &self,
         client_id: &ClientId,
@@ -1442,6 +1470,9 @@ pub fn start_server(mut os_input: Box<dyn ServerOsApi>, socket_path: PathBuf) {
                 remove_client!(client_id, os_input, session_state, session_data);
             },
             ServerInstruction::KillSession => {
+                if let Some(session_data) = session_data.read().unwrap().as_ref() {
+                    session_data.flush_coder_resurrection_state();
+                }
                 let client_ids = session_state.read().unwrap().client_ids();
                 for client_id in client_ids {
                     let _ = os_input.send_to_client(
