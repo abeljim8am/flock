@@ -7,6 +7,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
 ## [Unreleased]
 * feat: allow tabs to have different sizes if clients aren't focused on the same one (https://github.com/zellij-org/zellij/pull/5133)
 
+## [26.2.0] - 2026-07-20
+* feat(coder): honor configured remote session chrome and preserve Coder pane identities across detach, kill, and reopen
+* feat(coder): durably close remote PTYs when sessions are explicitly deleted
+* fix(selector): reliably clean up throwaway selector sessions after synchronous and asynchronous opens
+
 ## [26.1.1] - 2026-07-20
 * fix(coder): preserve PTY input and the startup working directory in remote sessions
 
