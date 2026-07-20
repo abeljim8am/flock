@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, VecDeque};
 use std::fs::{self, File};
 use std::io::{self, Read, Write};
+use std::net::Shutdown;
 use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
@@ -225,14 +226,71 @@ pub fn connect(socket: Option<PathBuf>) -> Result<()> {
     if !daemon_is_live(&socket) {
         serve(Some(socket.clone()), false)?;
     }
-    let stream = UnixStream::connect(&socket)
+    let mut stream = UnixStream::connect(&socket)
         .with_context(|| format!("connect to remote-agent at {}", socket.display()))?;
-    let mut reader = stream.try_clone()?;
-    let mut writer = stream;
-    let input = thread::spawn(move || io::copy(&mut io::stdin().lock(), &mut writer));
-    io::copy(&mut reader, &mut io::stdout().lock())?;
-    let _ = input.join();
-    Ok(())
+    proxy_stdio(&mut stream)
+}
+
+/// Proxy SSH stdio and the daemon socket from one thread. In particular, do
+/// not read SSH stdin from a helper thread: Coder command sessions can leave
+/// that reader asleep while stdout is waiting for the protocol handshake.
+fn proxy_stdio(stream: &mut UnixStream) -> Result<()> {
+    let mut stdin_open = true;
+    let mut buffer = vec![0; 64 * 1024];
+    loop {
+        let mut descriptors = [
+            libc::pollfd {
+                fd: libc::STDIN_FILENO,
+                events: if stdin_open { libc::POLLIN } else { 0 },
+                revents: 0,
+            },
+            libc::pollfd {
+                fd: stream.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            },
+        ];
+        let ready = unsafe { libc::poll(descriptors.as_mut_ptr(), descriptors.len() as _, -1) };
+        if ready < 0 {
+            let error = io::Error::last_os_error();
+            if error.kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(error).context("poll remote-agent bridge");
+        }
+
+        let socket_events = descriptors[1].revents;
+        if socket_events & (libc::POLLIN | libc::POLLHUP | libc::POLLERR) != 0 {
+            match stream.read(&mut buffer) {
+                Ok(0) => return Ok(()),
+                Ok(count) => {
+                    let mut stdout = io::stdout().lock();
+                    stdout.write_all(&buffer[..count])?;
+                    stdout.flush()?;
+                },
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => {},
+                Err(error) => return Err(error).context("read remote-agent daemon output"),
+            }
+        }
+
+        let stdin_events = descriptors[0].revents;
+        if stdin_open && stdin_events & (libc::POLLIN | libc::POLLHUP | libc::POLLERR) != 0 {
+            let count =
+                unsafe { libc::read(libc::STDIN_FILENO, buffer.as_mut_ptr().cast(), buffer.len()) };
+            if count == 0 {
+                stdin_open = false;
+                stream.shutdown(Shutdown::Write)?;
+            } else if count < 0 {
+                let error = io::Error::last_os_error();
+                if error.kind() != io::ErrorKind::Interrupted {
+                    return Err(error).context("read remote-agent SSH input");
+                }
+            } else {
+                stream.write_all(&buffer[..count as usize])?;
+                stream.flush()?;
+            }
+        }
+    }
 }
 
 /// Present one remote pane as an ordinary local PTY process. The Flock server
@@ -431,6 +489,60 @@ fn run_coder_transport(
             },
         )?;
     }
+    // Do not forward queued keystrokes until the daemon confirms that this
+    // pane exists. Otherwise an eager Input can overtake the unknown-pane
+    // response to AttachPane, producing duplicate CreatePane requests and
+    // permanently discarding the first keystrokes.
+    let mut create_sent = !attach_first;
+    let mut last_cursor = cursor;
+    loop {
+        match read_frame::<_, ServerMessage>(&mut child_stdout)? {
+            ServerMessage::Attached {
+                pane_id: attached, ..
+            } if attached == pane_id => break,
+            ServerMessage::PaneCreated {
+                pane_id: created, ..
+            } if created == pane_id => break,
+            ServerMessage::Output {
+                pane_id: output_pane,
+                sequence,
+                data,
+            } if output_pane == pane_id => {
+                io::stdout().lock().write_all(&data)?;
+                io::stdout().lock().flush()?;
+                last_cursor = sequence;
+                write_frame(
+                    &mut *child_stdin.lock().unwrap(),
+                    &ClientMessage::Acknowledge { pane_id, sequence },
+                )?;
+                persist_cursor(cursor_path, sequence)?;
+            },
+            ServerMessage::ReplayTruncated {
+                first_available, ..
+            } => {
+                write!(io::stdout().lock(), "\x1b[!p\x1b[2J\x1b[H\r\n[flock: remote output before sequence {first_available} was truncated]\r\n")?;
+            },
+            ServerMessage::Error { message }
+                if attach_first && !create_sent && message.contains("unknown pane") =>
+            {
+                write_frame(
+                    &mut *child_stdin.lock().unwrap(),
+                    &ClientMessage::CreatePane {
+                        pane_id: Some(pane_id),
+                        cols,
+                        rows,
+                        env: minimal_terminal_env(),
+                    },
+                )?;
+                create_sent = true;
+            },
+            ServerMessage::Error { message } => bail!("{message}"),
+            ServerMessage::Exited { status, .. } => {
+                return Ok(TransportEnd::Exited(status));
+            },
+            _ => {},
+        }
+    }
     persist_connection(cursor_path, "connected")?;
 
     let writer = child_stdin.clone();
@@ -484,7 +596,6 @@ fn run_coder_transport(
         }
     });
 
-    let mut last_cursor = cursor;
     loop {
         match read_frame::<_, ServerMessage>(&mut child_stdout) {
             Ok(ServerMessage::Output {
@@ -512,19 +623,6 @@ fn run_coder_transport(
             },
             Ok(ServerMessage::ForegroundProcess { argv, .. }) => {
                 persist_foreground(cursor_path, &argv)?;
-            },
-            Ok(ServerMessage::Error { message })
-                if attach_first && message.contains("unknown pane") =>
-            {
-                write_frame(
-                    &mut *child_stdin.lock().unwrap(),
-                    &ClientMessage::CreatePane {
-                        pane_id: Some(pane_id),
-                        cols,
-                        rows,
-                        env: minimal_terminal_env(),
-                    },
-                )?;
             },
             Ok(ServerMessage::Error { message }) => bail!("{message}"),
             Ok(_) => {},
