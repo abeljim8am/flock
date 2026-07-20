@@ -23,12 +23,6 @@ fn main() {
             envs::set_executable(current_executable);
         }
     }
-    #[cfg(all(debug_assertions, target_os = "linux", target_arch = "x86_64"))]
-    if std::env::var_os(envs::REMOTE_AGENT_BINARY_ENV_KEY).is_none() {
-        if let Ok(executable) = std::env::var(envs::EXECUTABLE_ENV_KEY) {
-            envs::set_remote_agent_binary(executable);
-        }
-    }
     let opts = CliArgs::parse();
 
     if let Some(Command::RemoteAgent(command)) = opts.command.clone() {

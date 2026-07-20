@@ -231,6 +231,7 @@ binary="$1"
 workspace="$2"
 [ -f "$binary" ] || {{ echo "flock: debug remote agent binary not found: $binary" >&2; exit 66; }}
 remote={}
+remote="'"$remote"'"
 coder ssh "$workspace" -- sh -c "$remote" < "$binary""#,
         quote_coder_remote_arg(&remote_script),
     );
@@ -1257,6 +1258,7 @@ mod tests {
         assert_eq!(debug[4], "/workspace/target/debug/flock with spaces");
         assert_eq!(debug[5], "alice/api");
         assert!(debug[2].contains("coder ssh \"$workspace\""));
+        assert!(debug[2].contains("remote=\"'\"$remote\"'\""));
         assert!(debug[2].contains("< \"$binary\""));
         assert!(!debug[2].contains("/workspace/target/debug"));
         assert!(!debug[2].contains("alice/api"));

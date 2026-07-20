@@ -4,6 +4,9 @@
 use crate::{build, clippy, format, metadata, test};
 use crate::{flags, WorkspaceMember};
 use anyhow::Context;
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
+use std::{fs, path::Path, path::PathBuf};
 use xshell::{cmd, Shell};
 
 /// Perform a default build.
@@ -119,6 +122,8 @@ pub fn run(sh: &Shell, mut flags: flags::Run) -> anyhow::Result<()> {
         "dev-opt"
     };
 
+    configure_debug_remote_agent(sh)?;
+
     if let Some(ref data_dir) = flags.data_dir {
         let data_dir = sh.current_dir().join(data_dir);
         let features = if flags.no_web {
@@ -191,6 +196,96 @@ pub fn run(sh: &Shell, mut flags: flags::Run) -> anyhow::Result<()> {
         })
         .with_context(|| err_context(&flags))
     }
+}
+
+/// Coder workspaces cannot execute a native Nix/debug binary whose interpreter
+/// and shared libraries live in the laptop's `/nix/store`. Build a static musl
+/// binary and pass it to the debug Flock process explicitly. Users on other
+/// host platforms can provide their own cross-compiled binary through the same
+/// environment variable.
+fn configure_debug_remote_agent(sh: &Shell) -> anyhow::Result<()> {
+    const REMOTE_BINARY_ENV: &str = "FLOCK_REMOTE_AGENT_BINARY";
+    if std::env::var_os(REMOTE_BINARY_ENV).is_some()
+        || !cfg!(all(target_os = "linux", target_arch = "x86_64"))
+    {
+        return Ok(());
+    }
+
+    let cargo = crate::cargo()?;
+    let target_dir = std::env::var_os("CARGO_TARGET_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| crate::project_root().join("target"))
+        .join("remote-agent-debug");
+    let linker = if let Ok(linker) = which::which("x86_64-linux-musl-gcc") {
+        linker
+    } else if let Ok(linker) = which::which("musl-gcc") {
+        linker
+    } else if let Ok(zig) = which::which("zig") {
+        let zig = zig.to_string_lossy();
+        if zig.contains('\'') {
+            anyhow::bail!("the zig path cannot contain a single quote: {zig}");
+        }
+        fs::create_dir_all(&target_dir)
+            .context("failed to create the Coder remote agent target directory")?;
+        let wrapper = target_dir.join("zig-musl-cc");
+        fs::write(
+            &wrapper,
+            format!(
+                "#!/usr/bin/env bash\nargs=()\nfor arg in \"$@\"; do\n  case \"$arg\" in\n    --target=x86_64-unknown-linux-musl) ;;\n    */self-contained/*crt*.o) ;;\n    *) args+=(\"$arg\") ;;\n  esac\ndone\nexec '{zig}' cc -target x86_64-linux-musl \"${{args[@]}}\"\n"
+            ),
+        )
+        .context("failed to write the zig musl compiler wrapper")?;
+        make_executable(&wrapper)?;
+        wrapper
+    } else {
+        anyhow::bail!(
+            "debug Coder support needs musl-gcc or zig to build a portable remote agent; install one or set {REMOTE_BINARY_ENV} to a Linux x86_64 binary"
+        );
+    };
+    crate::status(">> Building static Coder remote agent");
+    println!("\n>> Building static Coder remote agent");
+    cmd!(
+        sh,
+        "{cargo} build -p flock --target x86_64-unknown-linux-musl --no-default-features --features vendored_curl"
+    )
+    .env("CARGO_TARGET_DIR", &target_dir)
+    .env("CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER", &linker)
+    .env("CC_x86_64_unknown_linux_musl", &linker)
+    .env("CC_x86_64_UNKNOWN_LINUX_MUSL", &linker)
+    .env("CURL_NO_PKG_CONFIG", "1")
+    .env("LIBZ_SYS_STATIC", "1")
+    .env("ZIG_GLOBAL_CACHE_DIR", target_dir.join("zig-global-cache"))
+    .env("ZIG_LOCAL_CACHE_DIR", target_dir.join("zig-local-cache"))
+    // Nix's native compiler flags contain glibc include/library paths. Those
+    // must not leak into the musl build performed by zig or musl-gcc.
+    .env("NIX_CFLAGS_COMPILE", "")
+    .env("NIX_LDFLAGS", "")
+    .run()
+    .context("failed to build static Coder remote agent")?;
+
+    let remote_binary = target_dir
+        .join("x86_64-unknown-linux-musl")
+        .join("debug")
+        .join("flock");
+    if !remote_binary.is_file() {
+        anyhow::bail!(
+            "static Coder remote agent was not produced at {}",
+            remote_binary.display()
+        );
+    }
+    std::env::set_var(REMOTE_BINARY_ENV, remote_binary);
+    Ok(())
+}
+
+#[cfg(unix)]
+fn make_executable(path: &Path) -> anyhow::Result<()> {
+    fs::set_permissions(path, fs::Permissions::from_mode(0o755))
+        .context("failed to make the zig musl compiler wrapper executable")
+}
+
+#[cfg(not(unix))]
+fn make_executable(_path: &Path) -> anyhow::Result<()> {
+    Ok(())
 }
 
 /// Bundle all distributable content to `target/dist`.
