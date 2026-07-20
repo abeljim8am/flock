@@ -110,6 +110,9 @@ fn persist_pending(path: &Path, workspace: &str) -> io::Result<()> {
     file.write_all(workspace.as_bytes())?;
     file.sync_all()?;
     fs::rename(&temporary, path)?;
+    // Opening a directory for fsync is supported on Unix, where Coder remote
+    // sessions run, but Windows rejects directory handles opened as files.
+    #[cfg(unix)]
     File::open(parent)?.sync_all()?;
     Ok(())
 }
