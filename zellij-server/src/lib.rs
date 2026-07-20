@@ -56,8 +56,8 @@ use zellij_utils::{
         DEFAULT_SCROLL_BUFFER_SIZE, SCROLL_BUFFER_SIZE, ZELLIJ_SEEN_RELEASE_NOTES_CACHE_FILE,
     },
     data::{
-        ConnectToSession, InputMode, KeyWithModifier, LayoutInfo, LayoutWithError, Style,
-        WebSharing,
+        ConnectToSession, InputMode, KeyWithModifier, LayoutInfo, LayoutWithError, RemoteBackend,
+        Style, WebSharing,
     },
     errors::{prelude::*, ContextType, ErrorInstruction, FatalError, ServerContext},
     home::{default_layout_dir, get_default_data_dir},
@@ -352,6 +352,24 @@ fn session_default_terminal_action(
     })
 }
 
+fn host_cwd_for_remote_backend(
+    remote_backend: Option<&RemoteBackend>,
+    cwd: Option<PathBuf>,
+) -> Option<PathBuf> {
+    if matches!(
+        remote_backend,
+        Some(RemoteBackend::Coder { legacy: false, .. })
+    ) {
+        // Host paths have no meaning inside a Coder workspace. Leaving the
+        // initial cwd unset gives the remote shell the same startup directory
+        // as a normal Coder SSH session. Explicit/inherited remote pane paths
+        // are attached later by the PTY layer and remain unaffected.
+        None
+    } else {
+        cwd
+    }
+}
+
 pub(crate) struct SessionMetaData {
     pub senders: ThreadSenders,
     pub default_shell: Option<TerminalAction>,
@@ -361,6 +379,7 @@ pub(crate) struct SessionMetaData {
     // `default_shell` so a config reload, which re-derives `default_shell`
     // from the on-disk config, cannot clobber the creation-time binding.
     session_default_command: Option<Vec<String>>,
+    session_remote_backend: Option<RemoteBackend>,
     pub current_input_modes: HashMap<ClientId, InputMode>,
     pub session_configuration: SessionConfiguration,
     pub web_sharing: WebSharing, // this is a special attribute explicitly set on session
@@ -410,6 +429,10 @@ impl SessionMetaData {
                 new_plugin_config = Some(new_config.plugins.clone());
             }
 
+            let default_cwd = host_cwd_for_remote_backend(
+                self.session_remote_backend.as_ref(),
+                new_config.options.default_cwd.clone(),
+            );
             self.default_shell = if self.session_default_command.is_some() {
                 // The session was created with an injected default_command
                 // (e.g. a codespace binding); the reloaded disk config knows
@@ -418,13 +441,13 @@ impl SessionMetaData {
                 session_default_terminal_action(
                     self.session_default_command.as_deref(),
                     new_config.options.default_shell.as_ref(),
-                    new_config.options.default_cwd.clone(),
+                    default_cwd,
                 )
             } else {
                 session_default_terminal_action(
                     new_config.options.default_command.as_deref(),
                     new_config.options.default_shell.as_ref(),
-                    new_config.options.default_cwd.clone(),
+                    default_cwd,
                 )
             };
             let host_theme_dark = new_config
@@ -1033,14 +1056,21 @@ pub fn start_server(mut os_input: Box<dyn ServerOsApi>, socket_path: PathBuf) {
                     is_web_client,
                 );
 
+                let default_cwd = host_cwd_for_remote_backend(
+                    runtime_config_options.remote_backend.as_ref(),
+                    config.options.default_cwd.clone(),
+                );
                 let default_shell = session_default_terminal_action(
                     runtime_config_options.default_command.as_deref(),
                     runtime_config_options.default_shell.as_ref(),
-                    config.options.default_cwd.clone(),
+                    default_cwd,
                 );
-                let cwd = cli_assets
-                    .cwd
-                    .or_else(|| runtime_config_options.default_cwd);
+                let cwd = host_cwd_for_remote_backend(
+                    runtime_config_options.remote_backend.as_ref(),
+                    cli_assets
+                        .cwd
+                        .or_else(|| runtime_config_options.default_cwd),
+                );
 
                 let spawn_tabs = |tab_layout,
                                   floating_panes_layout,
@@ -1949,6 +1979,7 @@ fn init_session(
     let enforce_https_for_localhost = config_options.enforce_https_for_localhost.unwrap_or(false);
 
     let session_default_command = config_options.default_command.clone();
+    let session_remote_backend = config.options.remote_backend.clone();
     let default_shell = session_default_terminal_action(
         config_options.default_command.as_deref(),
         config_options.default_shell.as_ref(),
@@ -2155,6 +2186,7 @@ fn init_session(
         },
         default_shell,
         session_default_command,
+        session_remote_backend,
         session_configuration: Default::default(),
         current_input_modes: HashMap::new(),
         screen_thread: Some(screen_thread),
@@ -2394,4 +2426,36 @@ fn get_available_layouts(config_options: &Options) -> (Vec<LayoutInfo>, Vec<Layo
         .as_ref()
         .map(|l| format!("{}", l.display()));
     Layout::list_available_layouts(layout_dir, &default_layout_name)
+}
+
+#[cfg(test)]
+mod coder_remote_cwd_tests {
+    use super::*;
+
+    fn coder_backend(legacy: bool) -> RemoteBackend {
+        RemoteBackend::Coder {
+            workspace: "alice/api".into(),
+            local_session_id: "api".into(),
+            legacy,
+        }
+    }
+
+    #[test]
+    fn persistent_coder_backend_drops_host_startup_cwd() {
+        let backend = coder_backend(false);
+        assert_eq!(
+            host_cwd_for_remote_backend(Some(&backend), Some(PathBuf::from("/"))),
+            None
+        );
+    }
+
+    #[test]
+    fn local_and_legacy_backends_keep_host_startup_cwd() {
+        let cwd = Some(PathBuf::from("/projects/api"));
+        assert_eq!(host_cwd_for_remote_backend(None, cwd.clone()), cwd);
+        assert_eq!(
+            host_cwd_for_remote_backend(Some(&coder_backend(true)), cwd.clone()),
+            cwd
+        );
+    }
 }

@@ -5,6 +5,8 @@
 //! a detached per-user daemon; `serve` owns PTYs and their replay buffers.
 
 use anyhow::{anyhow, bail, Context, Result};
+use nix::errno::Errno;
+use nix::sys::termios::{self, SetArg, Termios};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, VecDeque};
 use std::fs::{self, File};
@@ -14,7 +16,7 @@ use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
-use std::process::{ChildStdin, Command, Stdio};
+use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc, Condvar, Mutex};
 use std::thread;
@@ -202,7 +204,7 @@ impl PaneState {
     }
 }
 
-type TransportWriter = Arc<Mutex<ChildStdin>>;
+type TransportWriter = Arc<Mutex<Box<dyn Write + Send>>>;
 
 struct InputRouter {
     pane_id: Uuid,
@@ -266,6 +268,32 @@ impl InputRouter {
 struct ActiveInputWriter {
     router: Arc<InputRouter>,
     writer: TransportWriter,
+}
+
+struct RawTerminalGuard {
+    fd: i32,
+    original: Termios,
+}
+
+impl RawTerminalGuard {
+    fn enter(fd: i32) -> Result<Option<Self>> {
+        let original = match termios::tcgetattr(fd) {
+            Ok(original) => original,
+            Err(error) if error == Errno::ENOTTY => return Ok(None),
+            Err(error) => return Err(error).context("read local terminal settings"),
+        };
+        let mut raw = original.clone();
+        termios::cfmakeraw(&mut raw);
+        termios::tcsetattr(fd, SetArg::TCSANOW, &raw)
+            .context("put local Coder bridge terminal in raw mode")?;
+        Ok(Some(Self { fd, original }))
+    }
+}
+
+impl Drop for RawTerminalGuard {
+    fn drop(&mut self) {
+        let _ = termios::tcsetattr(self.fd, SetArg::TCSANOW, &self.original);
+    }
 }
 
 impl Drop for ActiveInputWriter {
@@ -408,6 +436,10 @@ fn proxy_stdio(stream: &mut UnixStream) -> Result<()> {
 /// owned by the workspace daemon. Transport failure only ends this SSH child;
 /// the bridge reconnects and attaches to the same UUID.
 pub fn coder_pty(workspace: &str, pane_id: Option<&str>, cwd: Option<PathBuf>) -> Result<()> {
+    // Like ssh, the local bridge must bypass its own PTY line discipline. The
+    // workspace shell already owns a PTY and is solely responsible for echo,
+    // completion and control-key handling.
+    let _raw_terminal = RawTerminalGuard::enter(libc::STDIN_FILENO)?;
     let requested_id = pane_id
         .map(Uuid::parse_str)
         .transpose()
@@ -565,7 +597,9 @@ fn run_coder_transport(
         .stderr(Stdio::inherit())
         .spawn()
         .context("start coder ssh remote-agent transport")?;
-    let child_stdin = Arc::new(Mutex::new(child.stdin.take().context("open coder stdin")?));
+    let child_stdin: TransportWriter = Arc::new(Mutex::new(Box::new(
+        child.stdin.take().context("open coder stdin")?,
+    )));
     let mut child_stdout = child.stdout.take().context("open coder stdout")?;
     write_frame(
         &mut *child_stdin.lock().unwrap(),
@@ -1159,7 +1193,20 @@ pub fn read_frame<R: Read, T: for<'de> Deserialize<'de>>(reader: &mut R) -> Resu
 #[cfg(test)]
 mod tests {
     use super::*;
+    use nix::sys::termios::{InputFlags, LocalFlags, OutputFlags};
     use std::fs::OpenOptions;
+
+    struct BrokenWriter;
+
+    impl Write for BrokenWriter {
+        fn write(&mut self, _buffer: &[u8]) -> io::Result<usize> {
+            Err(io::Error::from(io::ErrorKind::BrokenPipe))
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
 
     #[test]
     fn frames_round_trip_and_reject_malformed_lengths() {
@@ -1246,20 +1293,16 @@ mod tests {
     fn input_router_retries_a_chunk_on_the_replacement_transport() {
         let pane_id = Uuid::new_v4();
         let router = Arc::new(InputRouter::new(pane_id));
-        let mut stale = Command::new("sh")
-            .args(["-c", "exit 0"])
-            .stdin(Stdio::piped())
-            .spawn()
-            .unwrap();
-        let stale_stdin = Arc::new(Mutex::new(stale.stdin.take().unwrap()));
-        stale.wait().unwrap();
-        let _stale = router.activate(stale_stdin);
+        let stale: TransportWriter = Arc::new(Mutex::new(Box::new(BrokenWriter)));
+        let _stale = router.activate(stale);
 
         let forwarding_router = router.clone();
         let forwarding = thread::spawn(move || forwarding_router.forward(b"kept".to_vec()));
         let deadline = Instant::now() + Duration::from_secs(3);
         while router.writer.lock().unwrap().is_some() && Instant::now() < deadline {
-            thread::yield_now();
+            // Avoid continuously reacquiring the router mutex and starving the
+            // forwarding thread on heavily loaded CI runners.
+            thread::sleep(Duration::from_millis(10));
         }
         assert!(router.writer.lock().unwrap().is_none());
 
@@ -1268,7 +1311,8 @@ mod tests {
             .stdout(Stdio::piped())
             .spawn()
             .unwrap();
-        let replacement_stdin = Arc::new(Mutex::new(replacement.stdin.take().unwrap()));
+        let replacement_stdin: TransportWriter =
+            Arc::new(Mutex::new(Box::new(replacement.stdin.take().unwrap())));
         let active = router.activate(replacement_stdin.clone());
         forwarding.join().unwrap();
         drop(active);
@@ -1392,5 +1436,48 @@ mod tests {
         assert!(allowed_env("LANG"));
         assert!(!allowed_env("ZELLIJ_CONFIG_DIR"));
         assert!(!allowed_env("HOME"));
+    }
+
+    #[test]
+    fn coder_bridge_uses_raw_terminal_mode_and_restores_it() {
+        let mut master_fd = -1;
+        let mut slave_fd = -1;
+        assert_eq!(
+            unsafe {
+                libc::openpty(
+                    &mut master_fd,
+                    &mut slave_fd,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                )
+            },
+            0
+        );
+        let original = termios::tcgetattr(slave_fd).unwrap();
+        let guard = RawTerminalGuard::enter(slave_fd).unwrap().unwrap();
+        let raw = termios::tcgetattr(slave_fd).unwrap();
+        assert!(!raw.local_flags.intersects(
+            LocalFlags::ICANON | LocalFlags::ECHO | LocalFlags::ISIG | LocalFlags::IEXTEN
+        ));
+        assert!(!raw
+            .input_flags
+            .intersects(InputFlags::ICRNL | InputFlags::IXON));
+        assert!(!raw.output_flags.contains(OutputFlags::OPOST));
+        drop(guard);
+        let restored = termios::tcgetattr(slave_fd).unwrap();
+        assert_eq!(restored.input_flags, original.input_flags);
+        assert_eq!(restored.output_flags, original.output_flags);
+        assert_eq!(restored.control_flags, original.control_flags);
+        // macOS may add PENDIN while applying otherwise identical settings.
+        assert_eq!(
+            restored.local_flags - LocalFlags::PENDIN,
+            original.local_flags - LocalFlags::PENDIN
+        );
+        assert_eq!(restored.control_chars, original.control_chars);
+        unsafe {
+            libc::close(master_fd);
+            libc::close(slave_fd);
+        }
     }
 }
