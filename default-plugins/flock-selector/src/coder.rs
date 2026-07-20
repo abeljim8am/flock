@@ -121,23 +121,24 @@ pub fn parse_gateway(argv: &[String]) -> Option<&str> {
 pub fn bootstrap_argv(identifier: &str) -> Vec<String> {
     let script = format!(
         r#"set -eu
-[ "$(uname -s)" = Linux ] && [ "$(uname -m)" = x86_64 ] || {{ echo 'flock: persistent Coder sessions currently require Linux x86_64' >&2; exit 65; }}
+[ "$(uname -s)" = Linux ] && [ "$(uname -m)" = x86_64 ] || {{ echo "flock: persistent Coder sessions currently require Linux x86_64" >&2; exit 65; }}
 root="$HOME/.local/share/flock"
 dest="$root/{tag}"
 [ -x "$dest/flock" ] && {{ mkdir -p "$root" "$HOME/.local/bin"; ln -sfn "$dest" "$root/current"; ln -sfn "$dest/flock" "$HOME/.local/bin/flock"; exit 0; }}
 tmp="$root/.bootstrap.$$"
 mkdir -p "$tmp" "$dest"
-trap 'rm -rf "$tmp"' EXIT HUP INT TERM
+trap "rm -rf \"$tmp\"" EXIT HUP INT TERM
 base="{base}/{tag}"
 archive="$tmp/flock.tar.gz"
 checksum="$tmp/flock.sha256sum"
-fetch() {{ if command -v curl >/dev/null 2>&1; then curl -fsSL "$1" -o "$2"; elif command -v wget >/dev/null 2>&1; then wget -qO "$2" "$1"; elif command -v python3 >/dev/null 2>&1; then python3 -c 'import sys,urllib.request; urllib.request.urlretrieve(sys.argv[1],sys.argv[2])' "$1" "$2"; else echo 'flock: curl, wget, or python3 is required to install remote Zellij' >&2; exit 69; fi; }}
+fetch() {{ if command -v curl >/dev/null 2>&1; then curl -fsSL "$1" -o "$2"; elif command -v wget >/dev/null 2>&1; then wget -qO "$2" "$1"; elif command -v python3 >/dev/null 2>&1; then python3 -c "import sys,urllib.request; urllib.request.urlretrieve(sys.argv[1],sys.argv[2])" "$1" "$2"; else echo "flock: curl, wget, or python3 is required to install remote Zellij" >&2; exit 69; fi; }}
 fetch "$base/flock-x86_64-unknown-linux-musl.tar.gz" "$archive"
 fetch "$base/flock-x86_64-unknown-linux-musl.sha256sum" "$checksum"
 tar -xzf "$archive" -C "$tmp"
-expected="$(awk '{{print $1; exit}}' "$checksum")"
-actual="$(sha256sum "$tmp/flock" | awk '{{print $1}}')"
-[ -n "$expected" ] && [ "$expected" = "$actual" ] || {{ echo 'flock: remote Zellij checksum verification failed' >&2; exit 74; }}
+IFS=" " read -r expected _ < "$checksum"
+actual="$(sha256sum "$tmp/flock")"
+actual="${{actual%% *}}"
+[ -n "$expected" ] && [ "$expected" = "$actual" ] || {{ echo "flock: remote Zellij checksum verification failed" >&2; exit 74; }}
 install -m 0755 "$tmp/flock" "$dest/flock.new"
 mv -f "$dest/flock.new" "$dest/flock"
 mkdir -p "$HOME/.local/bin"
@@ -152,15 +153,23 @@ ln -sfn "$dest/flock" "$HOME/.local/bin/flock""#,
         identifier.into(),
         "--".into(),
         "sh".into(),
-        "-lc".into(),
+        "-c".into(),
         quote_coder_remote_arg(&script),
     ]
 }
 
 /// `coder ssh` joins command arguments into a command line for the workspace's
-/// login shell. Keep a script as one `sh -lc` argument across that extra parse.
+/// configured shell before invoking `sh`. A single-quoted argument is understood
+/// by both POSIX shells and Fish, but there is no shared way to escape a single
+/// quote inside it. Keep the generated bootstrap script free of single quotes
+/// and fail loudly if a future edit violates that transport invariant. Use a
+/// non-login `sh`: login-shell logout hooks can overwrite a successful exit code.
 fn quote_coder_remote_arg(value: &str) -> String {
-    format!("'{}'", value.replace('\'', "'\"'\"'"))
+    assert!(
+        !value.contains('\''),
+        "Coder remote scripts must not contain single quotes"
+    );
+    format!("'{value}'")
 }
 
 pub fn bootstrap_context(identifier: &str) -> BTreeMap<String, String> {
@@ -1117,6 +1126,7 @@ mod tests {
         assert!(GATEWAY_SCRIPT.contains("-- '\"$HOME/.local/share/flock/current/flock\"'"));
         let bootstrap = bootstrap_argv("alice/api");
         assert_eq!(&bootstrap[..3], &["coder", "ssh", "alice/api"]);
+        assert_eq!(&bootstrap[3..6], &["--", "sh", "-c"]);
         assert!(bootstrap
             .last()
             .unwrap()
@@ -1125,9 +1135,13 @@ mod tests {
         assert!(!bootstrap.last().unwrap().contains("alice/api"));
         assert!(bootstrap.last().unwrap().starts_with("'set -eu"));
         assert!(bootstrap.last().unwrap().ends_with('\''));
-        assert_eq!(
-            quote_coder_remote_arg("printf '%s'"),
-            r#"'printf '"'"'%s'"'"''"#
-        );
+        assert_eq!(bootstrap.last().unwrap().matches('\'').count(), 2);
+        assert_eq!(quote_coder_remote_arg("printf %s"), "'printf %s'");
+    }
+
+    #[test]
+    #[should_panic(expected = "Coder remote scripts must not contain single quotes")]
+    fn coder_remote_arg_rejects_fish_incompatible_single_quotes() {
+        quote_coder_remote_arg("printf '%s'");
     }
 }
