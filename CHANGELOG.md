@@ -7,6 +7,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
 ## [Unreleased]
 * feat: allow tabs to have different sizes if clients aren't focused on the same one (https://github.com/zellij-org/zellij/pull/5133)
 
+## [26.1.0] - 2026-07-19
+* feat(coder): keep remote processes alive with a reconnecting remote PTY backend and bounded output replay
+* fix(coder): harden reconnects, working-directory handling, pane activation, Fish bootstrap shells, and macOS portability
+* fix(selector): keep cold-start Coder sessions alive while the remote workspace connects
+* build: support uploading portable debug remote-agent binaries and configure a reproducible Rust development environment
+* ci: publish release assets with explicit repository context
+
 ## [0.44.3] - 2026-05-13
 * fix(windows): bump windows-sys to 0.59 to align manifest with code, fixing source builds via `cargo install`/`cargo binstall` (https://github.com/zellij-org/zellij/pull/5139)
 * fix: deadlock with --blocking panes (https://github.com/zellij-org/zellij/pull/5152)

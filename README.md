@@ -33,7 +33,7 @@ unless a Flock feature says otherwise.
 
 Download the archive, ZIP, or Windows installer for your platform from the
 [latest Flock release](https://github.com/abeljim8am/flock/releases/latest).
-Release `v26.0.0` is the first Flock release.
+The current release is `v26.1.0`; `v26.0.0` was the first Flock release.
 
 To build from source:
 
