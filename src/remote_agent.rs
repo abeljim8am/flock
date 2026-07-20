@@ -1292,7 +1292,9 @@ mod tests {
         let forwarding = thread::spawn(move || forwarding_router.forward(b"kept".to_vec()));
         let deadline = Instant::now() + Duration::from_secs(3);
         while router.writer.lock().unwrap().is_some() && Instant::now() < deadline {
-            thread::yield_now();
+            // Avoid continuously reacquiring the router mutex and starving the
+            // forwarding thread on heavily loaded CI runners.
+            thread::sleep(Duration::from_millis(10));
         }
         assert!(router.writer.lock().unwrap().is_none());
 
@@ -1437,8 +1439,8 @@ mod tests {
                     &mut master_fd,
                     &mut slave_fd,
                     std::ptr::null_mut(),
-                    std::ptr::null(),
-                    std::ptr::null(),
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
                 )
             },
             0
