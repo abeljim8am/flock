@@ -1038,7 +1038,7 @@ fn spawn_pane_with_shell(
             if libc::setsid() < 0 {
                 return Err(io::Error::last_os_error());
             }
-            if libc::ioctl(libc::STDIN_FILENO, libc::TIOCSCTTY as libc::c_ulong, 0) < 0 {
+            if libc::ioctl(libc::STDIN_FILENO, libc::TIOCSCTTY.into(), 0) < 0 {
                 return Err(io::Error::last_os_error());
             }
             Ok(())
