@@ -33,9 +33,11 @@ fn main() {
                     remote_agent::serve(socket, foreground)
                 },
                 RemoteAgentCommand::Connect { socket } => remote_agent::connect(socket),
-                RemoteAgentCommand::CoderPty { workspace, pane_id } => {
-                    remote_agent::coder_pty(&workspace, pane_id.as_deref())
-                },
+                RemoteAgentCommand::CoderPty {
+                    workspace,
+                    pane_id,
+                    cwd,
+                } => remote_agent::coder_pty(&workspace, pane_id.as_deref(), cwd),
                 RemoteAgentCommand::CoderClose { workspace, pane_id } => {
                     remote_agent::coder_close(&workspace, &pane_id)
                 },

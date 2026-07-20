@@ -14,9 +14,9 @@ use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{ChildStdin, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{mpsc, Arc, Mutex};
+use std::sync::{mpsc, Arc, Condvar, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 use uuid::Uuid;
@@ -44,6 +44,8 @@ pub enum ClientMessage {
         cols: u16,
         rows: u16,
         env: HashMap<String, String>,
+        #[serde(default)]
+        cwd: Option<String>,
     },
     AttachPane {
         pane_id: Uuid,
@@ -100,6 +102,8 @@ pub enum ServerMessage {
     ForegroundProcess {
         pane_id: Uuid,
         argv: Vec<String>,
+        #[serde(default)]
+        cwd: Option<String>,
     },
     Exited {
         pane_id: Uuid,
@@ -136,14 +140,12 @@ impl PaneState {
     }
 
     fn record_output(&self, data: Vec<u8>) {
-        let sequence = {
-            let mut next = self.next_sequence.lock().unwrap();
-            let current = *next;
-            *next += 1;
-            current
-        };
+        let mut next = self.next_sequence.lock().unwrap();
+        let sequence = *next;
+        *next += 1;
         let mut history = self.history.lock().unwrap();
         let mut bytes = self.history_bytes.lock().unwrap();
+        let mut subscribers = self.subscribers.lock().unwrap();
         *bytes += data.len();
         history.push_back(OutputChunk {
             sequence,
@@ -154,13 +156,121 @@ impl PaneState {
                 *bytes -= removed.data.len();
             }
         }
-        drop(bytes);
-        drop(history);
-        self.publish(ServerMessage::Output {
+        let message = ServerMessage::Output {
             pane_id: self.id,
             sequence,
             data,
-        });
+        };
+        subscribers.retain(|subscriber| subscriber.send(message.clone()).is_ok());
+    }
+
+    /// Send a coherent history snapshot before making a client live. Holding
+    /// the sequence lock prevents new output from being recorded between the
+    /// replay watermark and subscriber registration.
+    fn subscribe_with_replay(
+        &self,
+        after_sequence: u64,
+        tx: &mpsc::Sender<ServerMessage>,
+    ) -> Result<()> {
+        let next_sequence = self.next_sequence.lock().unwrap();
+        let history = self.history.lock().unwrap();
+        let mut subscribers = self.subscribers.lock().unwrap();
+        if let Some(first) = history.front().map(|chunk| chunk.sequence) {
+            if after_sequence.saturating_add(1) < first {
+                tx.send(ServerMessage::ReplayTruncated {
+                    pane_id: self.id,
+                    first_available: first,
+                })?;
+            }
+        }
+        for chunk in history
+            .iter()
+            .filter(|chunk| chunk.sequence > after_sequence)
+        {
+            tx.send(ServerMessage::Output {
+                pane_id: self.id,
+                sequence: chunk.sequence,
+                data: chunk.data.clone(),
+            })?;
+        }
+        tx.send(ServerMessage::Attached {
+            pane_id: self.id,
+            next_sequence: *next_sequence,
+        })?;
+        subscribers.push(tx.clone());
+        Ok(())
+    }
+}
+
+type TransportWriter = Arc<Mutex<ChildStdin>>;
+
+struct InputRouter {
+    pane_id: Uuid,
+    writer: Mutex<Option<TransportWriter>>,
+    writer_ready: Condvar,
+}
+
+impl InputRouter {
+    fn new(pane_id: Uuid) -> Self {
+        Self {
+            pane_id,
+            writer: Mutex::new(None),
+            writer_ready: Condvar::new(),
+        }
+    }
+
+    fn activate(self: &Arc<Self>, writer: TransportWriter) -> ActiveInputWriter {
+        *self.writer.lock().unwrap() = Some(writer.clone());
+        self.writer_ready.notify_all();
+        ActiveInputWriter {
+            router: self.clone(),
+            writer,
+        }
+    }
+
+    fn forward(&self, data: Vec<u8>) {
+        loop {
+            let writer = {
+                let mut writer = self.writer.lock().unwrap();
+                while writer.is_none() {
+                    writer = self.writer_ready.wait(writer).unwrap();
+                }
+                writer.as_ref().unwrap().clone()
+            };
+            if write_frame(
+                &mut *writer.lock().unwrap(),
+                &ClientMessage::Input {
+                    pane_id: self.pane_id,
+                    data: data.clone(),
+                },
+            )
+            .is_ok()
+            {
+                return;
+            }
+            self.clear_if_current(&writer);
+        }
+    }
+
+    fn clear_if_current(&self, writer: &TransportWriter) {
+        let mut current = self.writer.lock().unwrap();
+        if current
+            .as_ref()
+            .is_some_and(|current| Arc::ptr_eq(current, writer))
+        {
+            *current = None;
+        }
+    }
+}
+
+struct ActiveInputWriter {
+    router: Arc<InputRouter>,
+    writer: TransportWriter,
+}
+
+impl Drop for ActiveInputWriter {
+    fn drop(&mut self) {
+        self.router.clear_if_current(&self.writer);
     }
 }
 
@@ -297,7 +407,7 @@ fn proxy_stdio(stream: &mut UnixStream) -> Result<()> {
 /// can render it using its normal terminal path while the actual shell remains
 /// owned by the workspace daemon. Transport failure only ends this SSH child;
 /// the bridge reconnects and attaches to the same UUID.
-pub fn coder_pty(workspace: &str, pane_id: Option<&str>) -> Result<()> {
+pub fn coder_pty(workspace: &str, pane_id: Option<&str>, cwd: Option<PathBuf>) -> Result<()> {
     let requested_id = pane_id
         .map(Uuid::parse_str)
         .transpose()
@@ -317,17 +427,18 @@ pub fn coder_pty(workspace: &str, pane_id: Option<&str>) -> Result<()> {
             ))?
         },
     };
-    let (input_tx, input_rx) = mpsc::channel::<Vec<u8>>();
+    let input_router = Arc::new(InputRouter::new(pane_id));
+    let stdin_router = input_router.clone();
     thread::spawn(move || {
         let mut stdin = io::stdin().lock();
         let mut buffer = [0; 8192];
         while let Ok(count) = stdin.read(&mut buffer) {
-            if count == 0 || input_tx.send(buffer[..count].to_vec()).is_err() {
+            if count == 0 {
                 break;
             }
+            stdin_router.forward(buffer[..count].to_vec());
         }
     });
-    let input_rx = Arc::new(Mutex::new(input_rx));
     // Stable IDs always attach first. An unknown-pane response creates it,
     // making resurrection idempotent without duplicating shells.
     let mut created = true;
@@ -346,7 +457,8 @@ pub fn coder_pty(workspace: &str, pane_id: Option<&str>) -> Result<()> {
             created,
             cursor,
             &cursor_path,
-            input_rx.clone(),
+            cwd.as_deref(),
+            input_router.clone(),
         ) {
             Ok(TransportEnd::Exited(status)) => {
                 persist_connection(&cursor_path, "disconnected")?;
@@ -384,6 +496,7 @@ pub fn coder_close(workspace: &str, pane_id: &str) -> Result<()> {
                 let _ = fs::remove_file(&pending_path);
                 let _ = fs::remove_file(&cursor_path);
                 let _ = fs::remove_file(cursor_path.with_extension("foreground"));
+                let _ = fs::remove_file(cursor_path.with_extension("cwd"));
                 let _ = fs::remove_file(cursor_path.with_extension("connection"));
                 return Ok(());
             },
@@ -441,7 +554,8 @@ fn run_coder_transport(
     attach_first: bool,
     cursor: u64,
     cursor_path: &Path,
-    input_rx: Arc<Mutex<mpsc::Receiver<Vec<u8>>>>,
+    cwd: Option<&Path>,
+    input_router: Arc<InputRouter>,
 ) -> Result<TransportEnd> {
     let remote = r#"exec "$HOME/.local/share/flock/current/flock" remote-agent connect"#;
     let mut child = Command::new("coder")
@@ -486,6 +600,7 @@ fn run_coder_transport(
                 cols,
                 rows,
                 env: minimal_terminal_env(),
+                cwd: cwd.map(|cwd| cwd.to_string_lossy().into_owned()),
             },
         )?;
     }
@@ -532,6 +647,7 @@ fn run_coder_transport(
                         cols,
                         rows,
                         env: minimal_terminal_env(),
+                        cwd: cwd.map(|cwd| cwd.to_string_lossy().into_owned()),
                     },
                 )?;
                 create_sent = true;
@@ -544,20 +660,12 @@ fn run_coder_transport(
         }
     }
     persist_connection(cursor_path, "connected")?;
+    write_frame(
+        &mut *child_stdin.lock().unwrap(),
+        &ClientMessage::ForegroundProcess { pane_id },
+    )?;
 
-    let writer = child_stdin.clone();
-    thread::spawn(move || {
-        while let Ok(data) = input_rx.lock().unwrap().recv() {
-            if write_frame(
-                &mut *writer.lock().unwrap(),
-                &ClientMessage::Input { pane_id, data },
-            )
-            .is_err()
-            {
-                break;
-            }
-        }
-    });
+    let _active_input_writer = input_router.activate(child_stdin.clone());
 
     let resize_writer = child_stdin.clone();
     let resize_active = Arc::new(AtomicBool::new(true));
@@ -621,8 +729,11 @@ fn run_coder_transport(
                 resize_active.store(false, Ordering::Relaxed);
                 return Ok(TransportEnd::Exited(status));
             },
-            Ok(ServerMessage::ForegroundProcess { argv, .. }) => {
+            Ok(ServerMessage::ForegroundProcess { argv, cwd, .. }) => {
                 persist_foreground(cursor_path, &argv)?;
+                if let Some(cwd) = cwd {
+                    persist_cwd(cursor_path, &cwd)?;
+                }
             },
             Ok(ServerMessage::Error { message }) => bail!("{message}"),
             Ok(_) => {},
@@ -662,6 +773,16 @@ fn persist_foreground(cursor_path: &Path, argv: &[String]) -> Result<()> {
     fs::create_dir_all(parent)?;
     let temporary = path.with_extension(format!("foreground.{}", std::process::id()));
     fs::write(&temporary, argv.join("\0"))?;
+    fs::rename(temporary, path)?;
+    Ok(())
+}
+
+fn persist_cwd(cursor_path: &Path, cwd: &str) -> Result<()> {
+    let path = cursor_path.with_extension("cwd");
+    let parent = path.parent().context("remote cwd parent")?;
+    fs::create_dir_all(parent)?;
+    let temporary = path.with_extension(format!("cwd.{}", std::process::id()));
+    fs::write(&temporary, cwd.as_bytes())?;
     fs::rename(temporary, path)?;
     Ok(())
 }
@@ -768,17 +889,20 @@ fn handle_client(stream: UnixStream, panes: Panes) -> Result<()> {
                 cols,
                 rows,
                 env,
+                cwd,
             } => {
                 let id = pane_id.unwrap_or_else(Uuid::new_v4);
-                if panes.lock().unwrap().contains_key(&id) {
+                let mut panes = panes.lock().unwrap();
+                if panes.contains_key(&id) {
                     tx.send(ServerMessage::Error {
                         message: format!("pane {id} already exists"),
                     })?;
                     continue;
                 }
-                let pane = spawn_pane(id, cols, rows, env)?;
+                let pane = spawn_pane(id, cols, rows, env, cwd.as_deref().map(Path::new))?;
                 pane.subscribers.lock().unwrap().push(tx.clone());
-                panes.lock().unwrap().insert(id, pane.clone());
+                panes.insert(id, pane.clone());
+                drop(panes);
                 tx.send(ServerMessage::PaneCreated {
                     pane_id: id,
                     pid: pane.pid as u32,
@@ -795,31 +919,7 @@ fn handle_client(stream: UnixStream, panes: Panes) -> Result<()> {
                     })?;
                     continue;
                 };
-                pane.subscribers.lock().unwrap().push(tx.clone());
-                let history = pane.history.lock().unwrap().clone();
-                if let Some(first) = history.front().map(|chunk| chunk.sequence) {
-                    if after_sequence.saturating_add(1) < first {
-                        tx.send(ServerMessage::ReplayTruncated {
-                            pane_id,
-                            first_available: first,
-                        })?;
-                    }
-                }
-                for chunk in history
-                    .iter()
-                    .filter(|chunk| chunk.sequence > after_sequence)
-                {
-                    tx.send(ServerMessage::Output {
-                        pane_id,
-                        sequence: chunk.sequence,
-                        data: chunk.data.clone(),
-                    })?;
-                }
-                let next_sequence = *pane.next_sequence.lock().unwrap();
-                tx.send(ServerMessage::Attached {
-                    pane_id,
-                    next_sequence,
-                })?;
+                pane.subscribe_with_replay(after_sequence, &tx)?;
                 let exit_status = *pane.exit_status.lock().unwrap();
                 if let Some(status) = exit_status {
                     tx.send(ServerMessage::Exited { pane_id, status })?;
@@ -842,10 +942,8 @@ fn handle_client(stream: UnixStream, panes: Panes) -> Result<()> {
             ClientMessage::Acknowledge { .. } => {},
             ClientMessage::ForegroundProcess { pane_id } => {
                 with_pane(&panes, pane_id, &tx, |pane| {
-                    tx.send(ServerMessage::ForegroundProcess {
-                        pane_id,
-                        argv: foreground_argv(pane.master.lock().unwrap().as_raw_fd()),
-                    })?;
+                    let (argv, cwd) = foreground_process(pane.master.lock().unwrap().as_raw_fd());
+                    tx.send(ServerMessage::ForegroundProcess { pane_id, argv, cwd })?;
                     Ok(())
                 })?
             },
@@ -883,6 +981,18 @@ fn spawn_pane(
     cols: u16,
     rows: u16,
     env: HashMap<String, String>,
+    cwd: Option<&Path>,
+) -> Result<Arc<PaneState>> {
+    spawn_pane_with_shell(id, cols, rows, env, cwd, None)
+}
+
+fn spawn_pane_with_shell(
+    id: Uuid,
+    cols: u16,
+    rows: u16,
+    env: HashMap<String, String>,
+    cwd: Option<&Path>,
+    shell_override: Option<&Path>,
 ) -> Result<Arc<PaneState>> {
     let mut master_fd = -1;
     let mut slave_fd = -1;
@@ -904,38 +1014,41 @@ fn spawn_pane(
     {
         return Err(io::Error::last_os_error()).context("open PTY");
     }
-    let pid = unsafe { libc::fork() };
-    if pid < 0 {
-        unsafe {
-            libc::close(master_fd);
-            libc::close(slave_fd);
-        }
-        return Err(io::Error::last_os_error()).context("fork PTY shell");
-    }
-    if pid == 0 {
-        unsafe {
-            libc::close(master_fd);
-            libc::setsid();
-            libc::ioctl(slave_fd, libc::TIOCSCTTY, 0);
-            libc::dup2(slave_fd, libc::STDIN_FILENO);
-            libc::dup2(slave_fd, libc::STDOUT_FILENO);
-            libc::dup2(slave_fd, libc::STDERR_FILENO);
-            if slave_fd > libc::STDERR_FILENO {
-                libc::close(slave_fd);
-            }
-        }
-        for (key, value) in env.into_iter().filter(|(key, _)| allowed_env(key)) {
-            std::env::set_var(key, value);
-        }
-        let shell = std::env::var_os("SHELL").unwrap_or_else(|| "/bin/sh".into());
-        let error = Command::new(&shell).arg("-l").exec();
-        eprintln!("flock remote-agent: failed to exec {:?}: {error}", shell);
-        unsafe { libc::_exit(127) }
-    }
-    unsafe {
-        libc::close(slave_fd);
-    }
     let master = unsafe { File::from_raw_fd(master_fd) };
+    let slave = unsafe { File::from_raw_fd(slave_fd) };
+    let shell = shell_override
+        .map(Path::to_path_buf)
+        .or_else(|| std::env::var_os("SHELL").map(PathBuf::from))
+        .unwrap_or_else(|| PathBuf::from("/bin/sh"));
+    let mut command = Command::new(&shell);
+    command.arg("-l");
+    command.envs(env.into_iter().filter(|(key, _)| allowed_env(key)));
+    if let Some(cwd) = cwd.filter(|cwd| cwd.is_dir()) {
+        command.current_dir(cwd);
+    }
+    command
+        .stdin(Stdio::from(slave.try_clone()?))
+        .stdout(Stdio::from(slave.try_clone()?))
+        .stderr(Stdio::from(slave));
+    unsafe {
+        command.pre_exec(move || {
+            if libc::close(master_fd) < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            if libc::setsid() < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            if libc::ioctl(libc::STDIN_FILENO, libc::TIOCSCTTY, 0) < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let child = command
+        .spawn()
+        .with_context(|| format!("spawn PTY shell {:?}", shell))?;
+    let pid = child.id() as libc::pid_t;
+    drop(child);
     Ok(Arc::new(PaneState {
         id,
         pid,
@@ -1000,12 +1113,12 @@ fn set_winsize(fd: i32, cols: u16, rows: u16) -> Result<()> {
     Ok(())
 }
 
-fn foreground_argv(fd: i32) -> Vec<String> {
+fn foreground_process(fd: i32) -> (Vec<String>, Option<String>) {
     let pgrp = unsafe { libc::tcgetpgrp(fd) };
     if pgrp <= 0 {
-        return Vec::new();
+        return (Vec::new(), None);
     }
-    fs::read(format!("/proc/{pgrp}/cmdline"))
+    let argv = fs::read(format!("/proc/{pgrp}/cmdline"))
         .map(|bytes| {
             bytes
                 .split(|byte| *byte == 0)
@@ -1013,7 +1126,11 @@ fn foreground_argv(fd: i32) -> Vec<String> {
                 .map(|part| String::from_utf8_lossy(part).into_owned())
                 .collect()
         })
-        .unwrap_or_default()
+        .unwrap_or_default();
+    let cwd = fs::read_link(format!("/proc/{pgrp}/cwd"))
+        .ok()
+        .map(|cwd| cwd.to_string_lossy().into_owned());
+    (argv, cwd)
 }
 
 pub fn write_frame<W: Write, T: Serialize>(writer: &mut W, message: &T) -> Result<()> {
@@ -1085,6 +1202,89 @@ mod tests {
     }
 
     #[test]
+    fn replay_is_delivered_once_before_live_output() {
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open("/dev/null")
+            .unwrap();
+        let pane = PaneState {
+            id: Uuid::new_v4(),
+            pid: 1,
+            master: Mutex::new(file),
+            history: Mutex::new(VecDeque::new()),
+            history_bytes: Mutex::new(0),
+            next_sequence: Mutex::new(1),
+            subscribers: Mutex::new(Vec::new()),
+            exit_status: Mutex::new(None),
+        };
+        pane.record_output(b"replay".to_vec());
+        let (tx, rx) = mpsc::channel();
+        pane.subscribe_with_replay(0, &tx).unwrap();
+        pane.record_output(b"live".to_vec());
+
+        let messages: Vec<_> = rx.try_iter().collect();
+        assert!(matches!(
+            &messages[0],
+            ServerMessage::Output { sequence: 1, data, .. } if data == b"replay"
+        ));
+        assert!(matches!(
+            messages[1],
+            ServerMessage::Attached {
+                next_sequence: 2,
+                ..
+            }
+        ));
+        assert!(matches!(
+            &messages[2],
+            ServerMessage::Output { sequence: 2, data, .. } if data == b"live"
+        ));
+        assert_eq!(messages.len(), 3);
+    }
+
+    #[test]
+    fn input_router_retries_a_chunk_on_the_replacement_transport() {
+        let pane_id = Uuid::new_v4();
+        let router = Arc::new(InputRouter::new(pane_id));
+        let mut stale = Command::new("sh")
+            .args(["-c", "exit 0"])
+            .stdin(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let stale_stdin = Arc::new(Mutex::new(stale.stdin.take().unwrap()));
+        stale.wait().unwrap();
+        let _stale = router.activate(stale_stdin);
+
+        let forwarding_router = router.clone();
+        let forwarding = thread::spawn(move || forwarding_router.forward(b"kept".to_vec()));
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while router.writer.lock().unwrap().is_some() && Instant::now() < deadline {
+            thread::yield_now();
+        }
+        assert!(router.writer.lock().unwrap().is_none());
+
+        let mut replacement = Command::new("cat")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let replacement_stdin = Arc::new(Mutex::new(replacement.stdin.take().unwrap()));
+        let active = router.activate(replacement_stdin.clone());
+        forwarding.join().unwrap();
+        drop(active);
+        drop(replacement_stdin);
+        let output = replacement.wait_with_output().unwrap().stdout;
+        let message = read_frame::<_, ClientMessage>(&mut output.as_slice()).unwrap();
+        assert_eq!(
+            message,
+            ClientMessage::Input {
+                pane_id,
+                data: b"kept".to_vec(),
+            }
+        );
+    }
+
+    #[test]
     fn incompatible_protocol_is_rejected() {
         let error = ensure_protocol_version(PROTOCOL_VERSION + 1).unwrap_err();
         assert!(error.to_string().contains("incompatible protocol version"));
@@ -1095,8 +1295,8 @@ mod tests {
     fn pty_survives_detached_output_and_panes_are_isolated() {
         let first_id = Uuid::new_v4();
         let second_id = Uuid::new_v4();
-        let first = spawn_pane(first_id, 80, 24, HashMap::new()).unwrap();
-        let second = spawn_pane(second_id, 100, 30, HashMap::new()).unwrap();
+        let first = spawn_pane(first_id, 80, 24, HashMap::new(), None).unwrap();
+        let second = spawn_pane(second_id, 100, 30, HashMap::new(), None).unwrap();
         let first_pid = first.pid;
         start_pane_threads(first.clone());
         start_pane_threads(second.clone());
@@ -1147,6 +1347,43 @@ mod tests {
             libc::kill(-second.pid, libc::SIGKILL);
         }
         panic!("PTY shells did not produce isolated output before timeout");
+    }
+
+    #[test]
+    fn pty_shell_starts_in_requested_remote_cwd() {
+        let cwd = std::env::temp_dir().join(format!("flock-remote-cwd-{}", Uuid::new_v4()));
+        fs::create_dir(&cwd).unwrap();
+        let pane = spawn_pane_with_shell(
+            Uuid::new_v4(),
+            80,
+            24,
+            HashMap::new(),
+            Some(&cwd),
+            Some(Path::new("/bin/sh")),
+        )
+        .unwrap();
+        start_pane_threads(pane.clone());
+        pane.master.lock().unwrap().write_all(b"pwd\n").unwrap();
+        let expected = cwd.to_string_lossy().into_owned();
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while Instant::now() < deadline {
+            let output = pane
+                .history
+                .lock()
+                .unwrap()
+                .iter()
+                .flat_map(|chunk| chunk.data.clone())
+                .collect::<Vec<_>>();
+            if String::from_utf8_lossy(&output).contains(&expected) {
+                unsafe { libc::kill(-pane.pid, libc::SIGHUP) };
+                let _ = fs::remove_dir(&cwd);
+                return;
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+        unsafe { libc::kill(-pane.pid, libc::SIGKILL) };
+        let _ = fs::remove_dir(&cwd);
+        panic!("PTY shell did not start in {}", cwd.display());
     }
 
     #[test]

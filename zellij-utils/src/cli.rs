@@ -161,6 +161,8 @@ pub enum RemoteAgentCommand {
         workspace: String,
         #[clap(long, value_parser)]
         pane_id: Option<String>,
+        #[clap(long, value_parser)]
+        cwd: Option<PathBuf>,
     },
     /// Close a Coder-owned remote PTY after an explicit local pane close.
     #[clap(name = "coder-close", hide = true)]

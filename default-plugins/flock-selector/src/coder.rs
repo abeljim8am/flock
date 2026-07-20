@@ -114,32 +114,12 @@ pub fn remote_pty_argv(
 
 pub fn parse_gateway(argv: &[String]) -> Option<&str> {
     match argv {
-        [flock, remote_agent, coder_pty, workspace]
+        [flock, remote_agent, coder_pty, args @ ..]
             if is_flock_executable(flock)
                 && remote_agent == "remote-agent"
-                && coder_pty == "coder-pty"
-                && valid_identifier(workspace) =>
+                && coder_pty == "coder-pty" =>
         {
-            Some(workspace)
-        },
-        [flock, remote_agent, coder_pty, workspace_flag, workspace]
-            if is_flock_executable(flock)
-                && remote_agent == "remote-agent"
-                && coder_pty == "coder-pty"
-                && workspace_flag == "--workspace"
-                && valid_identifier(workspace) =>
-        {
-            Some(workspace)
-        },
-        [flock, remote_agent, coder_pty, workspace_flag, workspace, pane_flag, _pane_id]
-            if is_flock_executable(flock)
-                && remote_agent == "remote-agent"
-                && coder_pty == "coder-pty"
-                && workspace_flag == "--workspace"
-                && pane_flag == "--pane-id"
-                && valid_identifier(workspace) =>
-        {
-            Some(workspace)
+            parse_remote_pty_args(args)
         },
         [sh, dash_c, script, arg0, identifier]
             if sh == "sh"
@@ -152,6 +132,27 @@ pub fn parse_gateway(argv: &[String]) -> Option<&str> {
         },
         _ => None,
     }
+}
+
+fn parse_remote_pty_args(args: &[String]) -> Option<&str> {
+    if let [workspace] = args {
+        return valid_identifier(workspace).then_some(workspace);
+    }
+    let mut chunks = args.chunks_exact(2);
+    let mut workspace = None;
+    for chunk in &mut chunks {
+        match chunk {
+            [flag, value] if flag == "--workspace" && workspace.is_none() => {
+                workspace = Some(value.as_str());
+            },
+            [flag, _] if flag == "--pane-id" || flag == "--cwd" => {},
+            _ => return None,
+        }
+    }
+    if !chunks.remainder().is_empty() {
+        return None;
+    }
+    workspace.filter(|workspace| valid_identifier(workspace))
 }
 
 fn is_flock_executable(executable: &str) -> bool {
@@ -1237,6 +1238,9 @@ mod tests {
             remote_pty_argv("alice/api", None, Some("/workspace/target/debug/flock"));
         assert_eq!(debug_gateway[0], "/workspace/target/debug/flock");
         assert_eq!(parse_gateway(&debug_gateway), Some("alice/api"));
+        let mut gateway_with_cwd = debug_gateway.clone();
+        gateway_with_cwd.extend(["--cwd".into(), "/workspace/api".into()]);
+        assert_eq!(parse_gateway(&gateway_with_cwd), Some("alice/api"));
         let bootstrap = bootstrap_argv("alice/api", None);
         assert_eq!(&bootstrap[..3], &["coder", "ssh", "alice/api"]);
         assert_eq!(&bootstrap[3..6], &["--", "sh", "-c"]);

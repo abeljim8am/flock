@@ -205,9 +205,16 @@ pub fn run(sh: &Shell, mut flags: flags::Run) -> anyhow::Result<()> {
 /// environment variable.
 fn configure_debug_remote_agent(sh: &Shell) -> anyhow::Result<()> {
     const REMOTE_BINARY_ENV: &str = "FLOCK_REMOTE_AGENT_BINARY";
+    const BUILD_REMOTE_AGENT_ENV: &str = "FLOCK_BUILD_REMOTE_AGENT";
     if std::env::var_os(REMOTE_BINARY_ENV).is_some()
         || !cfg!(all(target_os = "linux", target_arch = "x86_64"))
     {
+        return Ok(());
+    }
+    let requested = std::env::var(BUILD_REMOTE_AGENT_ENV)
+        .ok()
+        .is_some_and(|value| matches!(value.trim(), "1" | "true" | "yes" | "on"));
+    if !requested {
         return Ok(());
     }
 
@@ -239,7 +246,7 @@ fn configure_debug_remote_agent(sh: &Shell) -> anyhow::Result<()> {
         wrapper
     } else {
         anyhow::bail!(
-            "debug Coder support needs musl-gcc or zig to build a portable remote agent; install one or set {REMOTE_BINARY_ENV} to a Linux x86_64 binary"
+            "{BUILD_REMOTE_AGENT_ENV}=1 needs musl-gcc or zig to build a portable remote agent; install one or set {REMOTE_BINARY_ENV} to a Linux x86_64 binary"
         );
     };
     crate::status(">> Building static Coder remote agent");
