@@ -996,7 +996,7 @@ fn spawn_pane_with_shell(
 ) -> Result<Arc<PaneState>> {
     let mut master_fd = -1;
     let mut slave_fd = -1;
-    let winsize = libc::winsize {
+    let mut winsize = libc::winsize {
         ws_row: rows,
         ws_col: cols,
         ws_xpixel: 0,
@@ -1007,8 +1007,8 @@ fn spawn_pane_with_shell(
             &mut master_fd,
             &mut slave_fd,
             std::ptr::null_mut(),
-            std::ptr::null(),
-            &winsize,
+            std::ptr::null_mut(),
+            &mut winsize,
         )
     } < 0
     {
@@ -1038,7 +1038,7 @@ fn spawn_pane_with_shell(
             if libc::setsid() < 0 {
                 return Err(io::Error::last_os_error());
             }
-            if libc::ioctl(libc::STDIN_FILENO, libc::TIOCSCTTY, 0) < 0 {
+            if libc::ioctl(libc::STDIN_FILENO, libc::TIOCSCTTY as libc::c_ulong, 0) < 0 {
                 return Err(io::Error::last_os_error());
             }
             Ok(())
