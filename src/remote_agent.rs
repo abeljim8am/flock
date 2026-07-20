@@ -5,6 +5,8 @@
 //! a detached per-user daemon; `serve` owns PTYs and their replay buffers.
 
 use anyhow::{anyhow, bail, Context, Result};
+use nix::errno::Errno;
+use nix::sys::termios::{self, SetArg, Termios};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, VecDeque};
 use std::fs::{self, File};
@@ -268,6 +270,32 @@ struct ActiveInputWriter {
     writer: TransportWriter,
 }
 
+struct RawTerminalGuard {
+    fd: i32,
+    original: Termios,
+}
+
+impl RawTerminalGuard {
+    fn enter(fd: i32) -> Result<Option<Self>> {
+        let original = match termios::tcgetattr(fd) {
+            Ok(original) => original,
+            Err(error) if error == Errno::ENOTTY => return Ok(None),
+            Err(error) => return Err(error).context("read local terminal settings"),
+        };
+        let mut raw = original.clone();
+        termios::cfmakeraw(&mut raw);
+        termios::tcsetattr(fd, SetArg::TCSANOW, &raw)
+            .context("put local Coder bridge terminal in raw mode")?;
+        Ok(Some(Self { fd, original }))
+    }
+}
+
+impl Drop for RawTerminalGuard {
+    fn drop(&mut self) {
+        let _ = termios::tcsetattr(self.fd, SetArg::TCSANOW, &self.original);
+    }
+}
+
 impl Drop for ActiveInputWriter {
     fn drop(&mut self) {
         self.router.clear_if_current(&self.writer);
@@ -408,6 +436,10 @@ fn proxy_stdio(stream: &mut UnixStream) -> Result<()> {
 /// owned by the workspace daemon. Transport failure only ends this SSH child;
 /// the bridge reconnects and attaches to the same UUID.
 pub fn coder_pty(workspace: &str, pane_id: Option<&str>, cwd: Option<PathBuf>) -> Result<()> {
+    // Like ssh, the local bridge must bypass its own PTY line discipline. The
+    // workspace shell already owns a PTY and is solely responsible for echo,
+    // completion and control-key handling.
+    let _raw_terminal = RawTerminalGuard::enter(libc::STDIN_FILENO)?;
     let requested_id = pane_id
         .map(Uuid::parse_str)
         .transpose()
@@ -1159,6 +1191,7 @@ pub fn read_frame<R: Read, T: for<'de> Deserialize<'de>>(reader: &mut R) -> Resu
 #[cfg(test)]
 mod tests {
     use super::*;
+    use nix::sys::termios::{InputFlags, LocalFlags, OutputFlags};
     use std::fs::OpenOptions;
 
     #[test]
@@ -1392,5 +1425,39 @@ mod tests {
         assert!(allowed_env("LANG"));
         assert!(!allowed_env("ZELLIJ_CONFIG_DIR"));
         assert!(!allowed_env("HOME"));
+    }
+
+    #[test]
+    fn coder_bridge_uses_raw_terminal_mode_and_restores_it() {
+        let mut master_fd = -1;
+        let mut slave_fd = -1;
+        assert_eq!(
+            unsafe {
+                libc::openpty(
+                    &mut master_fd,
+                    &mut slave_fd,
+                    std::ptr::null_mut(),
+                    std::ptr::null(),
+                    std::ptr::null(),
+                )
+            },
+            0
+        );
+        let original = termios::tcgetattr(slave_fd).unwrap();
+        let guard = RawTerminalGuard::enter(slave_fd).unwrap().unwrap();
+        let raw = termios::tcgetattr(slave_fd).unwrap();
+        assert!(!raw.local_flags.intersects(
+            LocalFlags::ICANON | LocalFlags::ECHO | LocalFlags::ISIG | LocalFlags::IEXTEN
+        ));
+        assert!(!raw
+            .input_flags
+            .intersects(InputFlags::ICRNL | InputFlags::IXON));
+        assert!(!raw.output_flags.contains(OutputFlags::OPOST));
+        drop(guard);
+        assert_eq!(termios::tcgetattr(slave_fd).unwrap(), original);
+        unsafe {
+            libc::close(master_fd);
+            libc::close(slave_fd);
+        }
     }
 }
