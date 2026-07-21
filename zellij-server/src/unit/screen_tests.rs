@@ -51,7 +51,6 @@ fn restored_coder_pane_keeps_its_saved_remote_uuid() {
     let backend = Some(RemoteBackend::Coder {
         workspace: "alice/api".into(),
         local_session_id: "coder-api".into(),
-        legacy: false,
     });
     let panes = coder_remote_panes(&backend, "coder-api", &manifest);
     assert_eq!(

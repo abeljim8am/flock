@@ -71,29 +71,20 @@ fn coder_backend_from_command(
     local_session_id: &str,
 ) -> Option<zellij_utils::data::RemoteBackend> {
     let command = command?;
-    let (workspace, legacy) = match command {
-        [coder, ssh, workspace] if coder == "coder" && ssh == "ssh" => {
-            Some((workspace.as_str(), true))
-        },
-        [shell, dash_c, _script, arg0, workspace]
-            if shell == "sh" && dash_c == "-c" && arg0 == "flock-coder-gateway" =>
-        {
-            Some((workspace.as_str(), true))
-        },
+    let workspace = match command {
         [flock, remote_agent, coder_pty, workspace_flag, workspace, ..]
             if flock == "flock"
                 && remote_agent == "remote-agent"
                 && coder_pty == "coder-pty"
                 && workspace_flag == "--workspace" =>
         {
-            Some((workspace.as_str(), false))
+            Some(workspace.as_str())
         },
         _ => None,
     }?;
     Some(zellij_utils::data::RemoteBackend::Coder {
         workspace: workspace.to_owned(),
         local_session_id: local_session_id.to_owned(),
-        legacy,
     })
 }
 
@@ -105,7 +96,6 @@ fn normalized_remote_backend(
         zellij_utils::data::RemoteBackend::Coder {
             workspace,
             local_session_id,
-            legacy,
         } => zellij_utils::data::RemoteBackend::Coder {
             workspace,
             local_session_id: if local_session_id.is_empty() {
@@ -113,7 +103,6 @@ fn normalized_remote_backend(
             } else {
                 local_session_id
             },
-            legacy,
         },
     })
 }
@@ -123,12 +112,7 @@ fn coder_remote_panes(
     session: &str,
     manifest: &PaneManifest,
 ) -> BTreeMap<zellij_utils::data::PaneId, zellij_utils::data::RemotePaneMetadata> {
-    let Some(zellij_utils::data::RemoteBackend::Coder {
-        workspace,
-        legacy: false,
-        ..
-    }) = backend
-    else {
+    let Some(zellij_utils::data::RemoteBackend::Coder { workspace, .. }) = backend else {
         return BTreeMap::new();
     };
     manifest

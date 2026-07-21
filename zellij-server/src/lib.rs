@@ -357,10 +357,7 @@ fn host_cwd_for_remote_backend(
     remote_backend: Option<&RemoteBackend>,
     cwd: Option<PathBuf>,
 ) -> Option<PathBuf> {
-    if matches!(
-        remote_backend,
-        Some(RemoteBackend::Coder { legacy: false, .. })
-    ) {
+    if matches!(remote_backend, Some(RemoteBackend::Coder { .. })) {
         // Host paths have no meaning inside a Coder workspace. Leaving the
         // initial cwd unset gives the remote shell the same startup directory
         // as a normal Coder SSH session. Explicit/inherited remote pane paths
@@ -399,7 +396,7 @@ impl SessionMetaData {
     fn flush_coder_resurrection_state(&self) {
         if !matches!(
             self.session_remote_backend.as_ref(),
-            Some(RemoteBackend::Coder { legacy: false, .. })
+            Some(RemoteBackend::Coder { .. })
         ) {
             return;
         }
@@ -2463,17 +2460,16 @@ fn get_available_layouts(config_options: &Options) -> (Vec<LayoutInfo>, Vec<Layo
 mod coder_remote_cwd_tests {
     use super::*;
 
-    fn coder_backend(legacy: bool) -> RemoteBackend {
+    fn coder_backend() -> RemoteBackend {
         RemoteBackend::Coder {
             workspace: "alice/api".into(),
             local_session_id: "api".into(),
-            legacy,
         }
     }
 
     #[test]
     fn persistent_coder_backend_drops_host_startup_cwd() {
-        let backend = coder_backend(false);
+        let backend = coder_backend();
         assert_eq!(
             host_cwd_for_remote_backend(Some(&backend), Some(PathBuf::from("/"))),
             None
@@ -2481,12 +2477,8 @@ mod coder_remote_cwd_tests {
     }
 
     #[test]
-    fn local_and_legacy_backends_keep_host_startup_cwd() {
+    fn local_backend_keeps_host_startup_cwd() {
         let cwd = Some(PathBuf::from("/projects/api"));
         assert_eq!(host_cwd_for_remote_backend(None, cwd.clone()), cwd);
-        assert_eq!(
-            host_cwd_for_remote_backend(Some(&coder_backend(true)), cwd.clone()),
-            cwd
-        );
     }
 }
