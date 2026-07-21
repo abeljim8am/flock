@@ -606,12 +606,12 @@ impl State {
             })
     }
 
-    fn maybe_poll_coder_snapshot(&mut self, now: Instant) {
-        // Native remote-agent sessions publish pane state in SessionInfo and
-        // never need remote Flock/sidebar snapshot polling. Keep polling only
-        // for recognized legacy nested-Flock sessions.
-        let is_legacy = self
-            .sessions
+    /// Whether the current session is a *legacy* nested-Flock Coder session
+    /// (a `coder ssh` gateway pane into a remote Flock). Only those need the
+    /// remote snapshot channel; native remote-agent sessions track their panes
+    /// locally in `agents` like any other session.
+    fn current_coder_session_is_legacy(&self) -> bool {
+        self.sessions
             .iter()
             .find(|session| session.is_current_session)
             .is_some_and(|session| {
@@ -624,8 +624,14 @@ impl State {
                         .as_deref()
                         .and_then(coder::parse_coder_ssh)
                         .is_some())
-            });
-        if !is_legacy {
+            })
+    }
+
+    fn maybe_poll_coder_snapshot(&mut self, now: Instant) {
+        // Native remote-agent sessions publish pane state in SessionInfo and
+        // never need remote Flock/sidebar snapshot polling. Keep polling only
+        // for recognized legacy nested-Flock sessions.
+        if !self.current_coder_session_is_legacy() {
             return;
         }
         if self.tracker_only {
@@ -1074,8 +1080,20 @@ impl State {
     /// Only agent panes are published; the diff guard means a republish with no
     /// change does not re-serialize the session metadata to disk.
     fn publish_state_if_changed(&mut self) {
+        let states = self.build_publish_states();
+        if states != self.last_published {
+            self.last_published = states.clone();
+            publish_agent_state(states);
+        }
+    }
+
+    /// The per-pane agent statuses this session should publish. Legacy
+    /// nested-Flock Coder sessions republish the remote tracker's snapshot
+    /// (their local panes are just the gateway); every other session — native
+    /// remote-agent Coder sessions included — publishes its live tracked panes.
+    fn build_publish_states(&self) -> BTreeMap<PaneId, PaneAgentStatus> {
         let mut states = BTreeMap::new();
-        if self.current_coder_workspace().is_some() {
+        if self.current_coder_session_is_legacy() {
             if let Some(snapshot) = &self.coder_snapshot {
                 let stale = self.coder_snapshot_stale(Instant::now());
                 for (index, pane) in snapshot.panes.iter().enumerate() {
@@ -1096,10 +1114,7 @@ impl State {
                 states.insert(*pane_id, self.status_to_publish(pane_id, st));
             }
         }
-        if states != self.last_published {
-            self.last_published = states.clone();
-            publish_agent_state(states);
-        }
+        states
     }
 
     /// Publish this session's sidebar presentation state when it changes, so
@@ -1655,6 +1670,80 @@ mod tests {
             Instant::now(),
         );
         assert!(state.agents.get(&pane_id).unwrap().remote);
+    }
+
+    #[test]
+    fn native_coder_session_publishes_hook_reported_agent_state() {
+        let mut state = state_with_provider("coder_enabled");
+        let mut session = SessionInfo::new("wooli-test".into());
+        session.is_current_session = true;
+        session.remote_backend = Some(RemoteBackend::Coder {
+            workspace: "abeljim/wooli-test".into(),
+            local_session_id: "wooli-test".into(),
+            legacy: false,
+        });
+        state.sessions = vec![session];
+
+        let pane_id = PaneId::Terminal(3);
+        state.agents.entry(pane_id).or_default().set_hook_authority(
+            "claude".into(),
+            AgentState::Working,
+            Instant::now(),
+        );
+
+        assert!(!state.current_coder_session_is_legacy());
+        let published = state.build_publish_states();
+        let status = published.get(&pane_id).expect("coder pane published");
+        assert_eq!(status.state, AgentRunState::Working);
+        assert_eq!(status.label, "claude");
+    }
+
+    #[test]
+    fn legacy_coder_session_publishes_snapshot_not_local_agents() {
+        let mut state = state_with_provider("coder_enabled");
+        let mut session = SessionInfo::new("api".into());
+        session.is_current_session = true;
+        session.remote_backend = Some(RemoteBackend::Coder {
+            workspace: "alice/api".into(),
+            local_session_id: "api".into(),
+            legacy: true,
+        });
+        state.sessions = vec![session];
+        // The local gateway pane may be hook-tracked, but a legacy session's
+        // published picture must come from the remote tracker's snapshot.
+        state
+            .agents
+            .entry(PaneId::Terminal(1))
+            .or_default()
+            .set_hook_authority("claude".into(), AgentState::Working, Instant::now());
+
+        assert!(state.current_coder_session_is_legacy());
+        assert!(state.build_publish_states().is_empty());
+
+        state.coder_snapshot = Some(coder::Snapshot {
+            version: 1,
+            generated_at_millis: 42,
+            session: coder::REMOTE_SESSION_NAME.into(),
+            panes: vec![coder::SnapshotPane {
+                pane_id: PaneId::Terminal(7),
+                label: "codex".into(),
+                status: PaneAgentStatus {
+                    state: AgentRunState::Blocked,
+                    label: "codex".into(),
+                    seen: false,
+                },
+                focused: false,
+            }],
+        });
+        state.last_coder_snapshot_received = Some(Instant::now());
+
+        let published = state.build_publish_states();
+        assert_eq!(published.len(), 1);
+        let status = published
+            .get(&PaneId::Plugin(u32::MAX))
+            .expect("snapshot pane");
+        assert_eq!(status.state, AgentRunState::Blocked);
+        assert!(!published.contains_key(&PaneId::Terminal(1)));
     }
 
     #[test]
