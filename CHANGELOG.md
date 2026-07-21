@@ -6,6 +6,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
 
 ## [Unreleased]
 
+## [26.5.0] - 2026-07-21
+* refactor(remote)!: generalize the coder transport into a provider-generic remote engine (unified `remote-pty`/`remote-close` driven by a `RemoteTransport` enum; provider-tagged JSON close-pending files; no backwards compatibility)
+* feat(devcontainer)!: migrate devcontainer sessions onto the remote-agent engine (persistent daemon-owned PTYs, UUID-based serialization/resurrection, self-healing `up` on reconnect, report-state agent channel replacing docker exec-polling)
+* feat(ssh): saved SSH hosts tab with persistent remote-agent sessions (in-picker add/edit/delete wizard, arch-detecting bootstrap over ssh, serialized sessions with replay, resurrection, and cross-session agent state)
+* feat(remote): arch-detecting bootstrap installs x86_64 or aarch64 musl builds (shared `remote_bootstrap` module; Coder arm64 workspaces now start; remote-agent guard accepts Linux aarch64)
+
 ## [26.4.0] - 2026-07-21
 * refactor(coder)!: remove the legacy `coder ssh` gateway (nested remote Flock, snapshot polling, tracker-only sidebar, flock-coder-remote layout); native remote-agent sessions are the only Coder integration
 * fix(coder): publish native Coder session agent state to the cross-session bus so other sessions' sidebars stay live
