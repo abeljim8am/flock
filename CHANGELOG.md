@@ -5,8 +5,10 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
 
 ## [Unreleased]
-* feat(coder): carry authoritative agent state through persistent remote PTY connections
 * feat: allow tabs to have different sizes if clients aren't focused on the same one (https://github.com/zellij-org/zellij/pull/5133)
+
+## [26.3.0] - 2026-07-20
+* feat(coder): carry authoritative agent state through persistent remote PTY connections
 
 ## [26.2.0] - 2026-07-20
 * feat(coder): honor configured remote session chrome and preserve Coder pane identities across detach, kill, and reopen

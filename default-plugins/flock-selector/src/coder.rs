@@ -15,7 +15,7 @@ pub const CREATE_CONTEXT_KEY: &str = "flock_coder_create";
 pub const BOOTSTRAP_CONTEXT_KEY: &str = "flock_coder_bootstrap";
 
 pub const GATEWAY_WRAPPER_ARG0: &str = "flock-coder-gateway";
-pub const RELEASE_TAG: &str = "v26.2.0";
+pub const RELEASE_TAG: &str = "v26.3.0";
 pub const RELEASE_BASE_URL: &str = "https://github.com/abeljim8am/flock/releases/download";
 
 /// The host-side gateway is deliberately an exact argv shape. Both Flock
