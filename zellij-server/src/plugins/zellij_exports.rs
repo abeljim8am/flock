@@ -2938,7 +2938,7 @@ fn switch_session(
 }
 
 fn delete_dead_session(session_name: String) -> Result<()> {
-    zellij_utils::remote_session_cleanup::queue_saved_coder_pane_closes(&session_name)
+    zellij_utils::remote_session_cleanup::queue_saved_remote_pane_closes(&session_name)
         .with_context(|| {
             format!(
                 "Failed to queue remote pane cleanup for {:?}",

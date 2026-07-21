@@ -118,6 +118,91 @@ pub struct RemoteAgentStateEvent {
     pub agent: String,
 }
 
+/// Provider-specific carrier for the framed remote-agent protocol. Everything
+/// past process spawn (framing, replay, cursor persistence) is shared; only
+/// how we reach the remote daemon differs per provider.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RemoteTransport {
+    Coder {
+        workspace: String,
+    },
+    Ssh {
+        destination: String,
+        ssh_args: Vec<String>,
+    },
+}
+
+impl RemoteTransport {
+    /// The provider-scoped identity string fed to `stable_remote_pane_uuid`.
+    pub fn identity(&self) -> &str {
+        match self {
+            Self::Coder { workspace } => workspace,
+            Self::Ssh { destination, .. } => destination,
+        }
+    }
+
+    fn label(&self) -> &'static str {
+        match self {
+            Self::Coder { .. } => "Coder",
+            Self::Ssh { .. } => "SSH",
+        }
+    }
+
+    fn connect_command(&self) -> Command {
+        // Both transports hand the trailing words to the remote login shell as
+        // one space-joined string, so the script must ride inside single
+        // quotes to survive that second parse.
+        let remote = r#"exec "$HOME/.local/share/flock/current/flock" remote-agent connect"#;
+        match self {
+            Self::Coder { workspace } => {
+                let mut command = Command::new("coder");
+                command.args(["ssh", workspace, "--", "sh", "-c", &format!("'{remote}'")]);
+                command
+            },
+            Self::Ssh {
+                destination,
+                ssh_args,
+            } => {
+                // BatchMode forbids password/host-key prompts: a prompt reads
+                // /dev/tty while the bridge holds it raw and is already
+                // draining stdin, so it could never be answered anyway.
+                let mut command = Command::new("ssh");
+                command.args([
+                    "-o",
+                    "BatchMode=yes",
+                    "-o",
+                    "StrictHostKeyChecking=accept-new",
+                    "-o",
+                    "ServerAliveInterval=15",
+                    "-o",
+                    "ServerAliveCountMax=4",
+                ]);
+                command.args(ssh_args);
+                command.arg("--");
+                command.arg(destination);
+                command.args(["sh", "-c", &format!("'{remote}'")]);
+                command
+            },
+        }
+    }
+
+    fn close_spec(&self) -> zellij_utils::remote_session_cleanup::RemoteCloseTransport {
+        use zellij_utils::remote_session_cleanup::RemoteCloseTransport;
+        match self {
+            Self::Coder { workspace } => RemoteCloseTransport::Coder {
+                workspace: workspace.clone(),
+            },
+            Self::Ssh {
+                destination,
+                ssh_args,
+            } => RemoteCloseTransport::Ssh {
+                destination: destination.clone(),
+                extra_args: ssh_args.clone(),
+            },
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ServerMessage {
@@ -494,11 +579,15 @@ fn proxy_stdio(stream: &mut UnixStream) -> Result<()> {
 
 /// Present one remote pane as an ordinary local PTY process. The Flock server
 /// can render it using its normal terminal path while the actual shell remains
-/// owned by the workspace daemon. Transport failure only ends this SSH child;
-/// the bridge reconnects and attaches to the same UUID.
-pub fn coder_pty(workspace: &str, pane_id: Option<&str>, cwd: Option<PathBuf>) -> Result<()> {
+/// owned by the remote daemon. Transport failure only ends the transport
+/// child; the bridge reconnects and attaches to the same UUID.
+pub fn remote_pty(
+    transport: RemoteTransport,
+    pane_id: Option<&str>,
+    cwd: Option<PathBuf>,
+) -> Result<()> {
     // Like ssh, the local bridge must bypass its own PTY line discipline. The
-    // workspace shell already owns a PTY and is solely responsible for echo,
+    // remote shell already owns a PTY and is solely responsible for echo,
     // completion and control-key handling.
     let _raw_terminal = RawTerminalGuard::enter(libc::STDIN_FILENO)?;
     let requested_id = pane_id
@@ -514,7 +603,7 @@ pub fn coder_pty(workspace: &str, pane_id: Option<&str>, cwd: Option<PathBuf>) -
                 .and_then(|id| id.parse().ok())
                 .unwrap_or(0);
             Uuid::parse_str(&zellij_utils::data::stable_remote_pane_uuid(
-                workspace,
+                transport.identity(),
                 &session,
                 zellij_utils::data::PaneId::Terminal(local_pane),
             ))?
@@ -545,8 +634,8 @@ pub fn coder_pty(workspace: &str, pane_id: Option<&str>, cwd: Option<PathBuf>) -
     let mut delay = Duration::from_millis(250);
 
     loop {
-        match run_coder_transport(
-            workspace,
+        match run_remote_transport(
+            &transport,
             pane_id,
             created,
             cursor,
@@ -566,7 +655,8 @@ pub fn coder_pty(workspace: &str, pane_id: Option<&str>, cwd: Option<PathBuf>) -
             Err(error) => {
                 writeln!(
                     io::stderr(),
-                    "\r\nflock: Coder connection lost ({error}); reconnecting…"
+                    "\r\nflock: {} connection lost ({error}); reconnecting…",
+                    transport.label(),
                 )?;
             },
         }
@@ -633,7 +723,7 @@ fn validate_agent_label(agent: &str) -> Result<()> {
     Ok(())
 }
 
-pub fn coder_close(workspace: &str, pane_id: &str) -> Result<()> {
+pub fn remote_close(transport: RemoteTransport, pane_id: &str) -> Result<()> {
     let pane_id = Uuid::parse_str(pane_id).context("invalid pane UUID")?;
     let cursor_path = local_cursor_path(pane_id)?;
     let pending_path = cursor_path.with_extension("close-pending");
@@ -645,7 +735,7 @@ pub fn coder_close(workspace: &str, pane_id: &str) -> Result<()> {
             .write(true)
             .create_new(true)
             .open(&pending_path)?;
-        pending.write_all(workspace.as_bytes())?;
+        pending.write_all(serde_json::to_string(&transport.close_spec())?.as_bytes())?;
         pending.sync_all()?;
     }
     let _worker = match CloseWorkerGuard::acquire(cursor_path.with_extension("close-running"))? {
@@ -654,7 +744,7 @@ pub fn coder_close(workspace: &str, pane_id: &str) -> Result<()> {
     };
     let mut delay = Duration::from_millis(250);
     loop {
-        match send_remote_close(workspace, pane_id) {
+        match send_remote_close(&transport, pane_id) {
             Ok(()) => {
                 let _ = fs::remove_file(&pending_path);
                 let _ = fs::remove_file(&cursor_path);
@@ -719,7 +809,7 @@ fn close_worker_is_live(pid: i32, lock_path: &Path) -> bool {
         .ok()
         .map(|command| String::from_utf8_lossy(&command).replace('\0', " "))
         .is_some_and(|command| {
-            command.contains("coder-close")
+            command.contains("remote-close")
                 && pane_uuid.is_some_and(|pane_uuid| command.contains(pane_uuid))
         })
 }
@@ -730,16 +820,15 @@ impl Drop for CloseWorkerGuard {
     }
 }
 
-fn send_remote_close(workspace: &str, pane_id: Uuid) -> Result<()> {
-    let remote = r#"exec "$HOME/.local/share/flock/current/flock" remote-agent connect"#;
-    let mut child = Command::new("coder")
-        .args(["ssh", workspace, "--", "sh", "-c", &format!("'{remote}'")])
+fn send_remote_close(transport: &RemoteTransport, pane_id: Uuid) -> Result<()> {
+    let mut child = transport
+        .connect_command()
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .spawn()?;
-    let mut writer = child.stdin.take().context("open coder close stdin")?;
-    let mut reader = child.stdout.take().context("open coder close stdout")?;
+    let mut writer = child.stdin.take().context("open remote close stdin")?;
+    let mut reader = child.stdout.take().context("open remote close stdout")?;
     write_frame(
         &mut writer,
         &ClientMessage::Hello {
@@ -769,8 +858,8 @@ enum TransportEnd {
     Exited(Option<i32>),
 }
 
-fn run_coder_transport(
-    workspace: &str,
+fn run_remote_transport(
+    transport: &RemoteTransport,
     pane_id: Uuid,
     attach_first: bool,
     cursor: u64,
@@ -779,18 +868,17 @@ fn run_coder_transport(
     input_router: Arc<InputRouter>,
     agent_state_tx: Option<&mpsc::Sender<RemoteAgentStateEvent>>,
 ) -> Result<TransportEnd> {
-    let remote = r#"exec "$HOME/.local/share/flock/current/flock" remote-agent connect"#;
-    let mut child = Command::new("coder")
-        .args(["ssh", workspace, "--", "sh", "-c", &format!("'{remote}'")])
+    let mut child = transport
+        .connect_command()
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit())
         .spawn()
-        .context("start coder ssh remote-agent transport")?;
+        .with_context(|| format!("start {} remote-agent transport", transport.label()))?;
     let child_stdin: TransportWriter = Arc::new(Mutex::new(Box::new(
-        child.stdin.take().context("open coder stdin")?,
+        child.stdin.take().context("open transport stdin")?,
     )));
-    let mut child_stdout = child.stdout.take().context("open coder stdout")?;
+    let mut child_stdout = child.stdout.take().context("open transport stdout")?;
     write_frame(
         &mut *child_stdin.lock().unwrap(),
         &ClientMessage::Hello {

@@ -66,54 +66,96 @@ use zellij_utils::{
     position::Position,
 };
 
-fn coder_backend_from_command(
+/// Fallback recognizer for the unified `remote-pty` pane binding; the typed
+/// `remote_backend` layout option is authoritative when present. The argv is
+/// variable-length (repeated `--ssh-arg`), so this walks flags rather than
+/// matching a fixed slice.
+fn remote_backend_from_command(
     command: Option<&[String]>,
     local_session_id: &str,
 ) -> Option<zellij_utils::data::RemoteBackend> {
     let command = command?;
-    let workspace = match command {
-        [flock, remote_agent, coder_pty, workspace_flag, workspace, ..]
-            if flock == "flock"
-                && remote_agent == "remote-agent"
-                && coder_pty == "coder-pty"
-                && workspace_flag == "--workspace" =>
+    match command {
+        [flock, remote_agent, remote_pty, rest @ ..]
+            if flock == "flock" && remote_agent == "remote-agent" && remote_pty == "remote-pty" =>
         {
-            Some(workspace.as_str())
+            let mut provider = None;
+            let mut workspace = None;
+            let mut destination = None;
+            let mut ssh_args = Vec::new();
+            let mut words = rest.iter();
+            while let Some(word) = words.next() {
+                match word.as_str() {
+                    "--provider" => provider = words.next(),
+                    "--workspace" => workspace = words.next(),
+                    "--destination" => destination = words.next(),
+                    "--ssh-arg" => ssh_args.extend(words.next().cloned()),
+                    _ => {},
+                }
+            }
+            match provider.map(String::as_str) {
+                Some("coder") => Some(zellij_utils::data::RemoteBackend::Coder {
+                    workspace: workspace?.clone(),
+                    local_session_id: local_session_id.to_owned(),
+                }),
+                Some("ssh") => {
+                    let destination = destination?.clone();
+                    Some(zellij_utils::data::RemoteBackend::Ssh {
+                        name: destination.clone(),
+                        destination,
+                        extra_args: ssh_args,
+                        local_session_id: local_session_id.to_owned(),
+                    })
+                },
+                _ => None,
+            }
         },
         _ => None,
-    }?;
-    Some(zellij_utils::data::RemoteBackend::Coder {
-        workspace: workspace.to_owned(),
-        local_session_id: local_session_id.to_owned(),
-    })
+    }
 }
 
 fn normalized_remote_backend(
     backend: Option<zellij_utils::data::RemoteBackend>,
     session: &str,
 ) -> Option<zellij_utils::data::RemoteBackend> {
+    let normalize = |local_session_id: String| {
+        if local_session_id.is_empty() {
+            session.to_owned()
+        } else {
+            local_session_id
+        }
+    };
     backend.map(|backend| match backend {
         zellij_utils::data::RemoteBackend::Coder {
             workspace,
             local_session_id,
         } => zellij_utils::data::RemoteBackend::Coder {
             workspace,
-            local_session_id: if local_session_id.is_empty() {
-                session.to_owned()
-            } else {
-                local_session_id
-            },
+            local_session_id: normalize(local_session_id),
+        },
+        zellij_utils::data::RemoteBackend::Ssh {
+            name,
+            destination,
+            extra_args,
+            local_session_id,
+        } => zellij_utils::data::RemoteBackend::Ssh {
+            name,
+            destination,
+            extra_args,
+            local_session_id: normalize(local_session_id),
         },
     })
 }
 
-fn coder_remote_panes(
+fn remote_panes_for_backend(
     backend: &Option<zellij_utils::data::RemoteBackend>,
     session: &str,
     manifest: &PaneManifest,
 ) -> BTreeMap<zellij_utils::data::PaneId, zellij_utils::data::RemotePaneMetadata> {
-    let Some(zellij_utils::data::RemoteBackend::Coder { workspace, .. }) = backend else {
-        return BTreeMap::new();
+    let workspace = match backend {
+        Some(zellij_utils::data::RemoteBackend::Coder { workspace, .. }) => workspace,
+        Some(zellij_utils::data::RemoteBackend::Ssh { destination, .. }) => destination,
+        None => return BTreeMap::new(),
     };
     manifest
         .panes
@@ -3644,14 +3686,15 @@ impl Screen {
         };
         let remote_backend = normalized_remote_backend(
             self.session_remote_backend.clone().or_else(|| {
-                coder_backend_from_command(
+                remote_backend_from_command(
                     self.session_default_command.as_deref(),
                     &self.session_name,
                 )
             }),
             &self.session_name,
         );
-        let remote_panes = coder_remote_panes(&remote_backend, &self.session_name, &pane_manifest);
+        let remote_panes =
+            remote_panes_for_backend(&remote_backend, &self.session_name, &pane_manifest);
         let remote_connection_state = remote_connection_state(&remote_panes);
         let session_info = SessionInfo {
             name: self.session_name.clone(),
@@ -8961,7 +9004,7 @@ pub(crate) fn screen_thread_main(
                 };
                 let remote_backend = normalized_remote_backend(
                     screen.session_remote_backend.clone().or_else(|| {
-                        coder_backend_from_command(
+                        remote_backend_from_command(
                             screen.session_default_command.as_deref(),
                             &screen.session_name,
                         )
@@ -8969,7 +9012,7 @@ pub(crate) fn screen_thread_main(
                     &screen.session_name,
                 );
                 let remote_panes =
-                    coder_remote_panes(&remote_backend, &screen.session_name, &pane_manifest);
+                    remote_panes_for_backend(&remote_backend, &screen.session_name, &pane_manifest);
                 let remote_connection_state = remote_connection_state(&remote_panes);
                 let session_info = SessionInfo {
                     name: screen.session_name.clone(),

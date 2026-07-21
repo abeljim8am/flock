@@ -380,7 +380,7 @@ pub fn delete_session(name: &str, force: bool) {
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
     }
-    if let Err(error) = crate::remote_session_cleanup::queue_saved_coder_pane_closes(name) {
+    if let Err(error) = crate::remote_session_cleanup::queue_saved_remote_pane_closes(name) {
         eprintln!(
             "Failed to queue remote pane cleanup for {:?}: {}",
             name, error

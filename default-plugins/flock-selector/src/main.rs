@@ -1159,6 +1159,7 @@ impl State {
             .iter()
             .filter_map(|session| match &session.remote_backend {
                 Some(RemoteBackend::Coder { workspace, .. }) => Some(workspace.clone()),
+                Some(_) => None,
                 None => session
                     .default_command
                     .as_deref()
@@ -1176,8 +1177,9 @@ impl State {
                 bound_workspace: session
                     .remote_backend
                     .as_ref()
-                    .map(|backend| match backend {
-                        RemoteBackend::Coder { workspace, .. } => workspace.clone(),
+                    .and_then(|backend| match backend {
+                        RemoteBackend::Coder { workspace, .. } => Some(workspace.clone()),
+                        _ => None,
                     })
                     .or_else(|| {
                         session
@@ -1400,6 +1402,7 @@ impl State {
             .iter()
             .find(|session| match &session.remote_backend {
                 Some(RemoteBackend::Coder { workspace, .. }) => workspace == &identifier,
+                Some(_) => false,
                 None => {
                     session
                         .default_command

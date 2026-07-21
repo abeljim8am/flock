@@ -92,7 +92,9 @@ pub fn remote_pty_argv(
     let mut argv = vec![
         executable.unwrap_or("flock").into(),
         "remote-agent".into(),
-        "coder-pty".into(),
+        "remote-pty".into(),
+        "--provider".into(),
+        "coder".into(),
         "--workspace".into(),
         identifier.into(),
     ];
@@ -104,10 +106,10 @@ pub fn remote_pty_argv(
 
 pub fn parse_gateway(argv: &[String]) -> Option<&str> {
     match argv {
-        [flock, remote_agent, coder_pty, args @ ..]
+        [flock, remote_agent, remote_pty, args @ ..]
             if is_flock_executable(flock)
                 && remote_agent == "remote-agent"
-                && coder_pty == "coder-pty" =>
+                && remote_pty == "remote-pty" =>
         {
             parse_remote_pty_args(args)
         },
@@ -116,13 +118,14 @@ pub fn parse_gateway(argv: &[String]) -> Option<&str> {
 }
 
 fn parse_remote_pty_args(args: &[String]) -> Option<&str> {
-    if let [workspace] = args {
-        return valid_identifier(workspace).then_some(workspace);
-    }
     let mut chunks = args.chunks_exact(2);
+    let mut provider = None;
     let mut workspace = None;
     for chunk in &mut chunks {
         match chunk {
+            [flag, value] if flag == "--provider" && provider.is_none() => {
+                provider = Some(value.as_str());
+            },
             [flag, value] if flag == "--workspace" && workspace.is_none() => {
                 workspace = Some(value.as_str());
             },
@@ -131,6 +134,9 @@ fn parse_remote_pty_args(args: &[String]) -> Option<&str> {
         }
     }
     if !chunks.remainder().is_empty() {
+        return None;
+    }
+    if provider != Some("coder") {
         return None;
     }
     workspace.filter(|workspace| valid_identifier(workspace))
@@ -1180,7 +1186,8 @@ mod tests {
         assert_eq!(parse_gateway(&gateway), Some("alice/api"));
         assert_eq!(gateway[0], "flock");
         assert_eq!(gateway[1], "remote-agent");
-        assert_eq!(gateway[2], "coder-pty");
+        assert_eq!(gateway[2], "remote-pty");
+        assert_eq!(&gateway[3..5], &["--provider", "coder"]);
         let debug_gateway =
             remote_pty_argv("alice/api", None, Some("/workspace/target/debug/flock"));
         assert_eq!(debug_gateway[0], "/workspace/target/debug/flock");

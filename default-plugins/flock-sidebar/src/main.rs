@@ -1255,6 +1255,7 @@ pub(crate) fn parse_remote_binding(argv: &[String]) -> Option<RemoteBinding> {
 pub(crate) fn session_remote_binding(session: &SessionInfo) -> Option<RemoteBinding> {
     match &session.remote_backend {
         Some(RemoteBackend::Coder { .. }) => Some(RemoteBinding::Coder),
+        Some(_) => None,
         None => session
             .default_command
             .as_deref()
@@ -1398,7 +1399,9 @@ mod tests {
             &argv(&[
                 "/tmp/flock",
                 "remote-agent",
-                "coder-pty",
+                "remote-pty",
+                "--provider",
+                "coder",
                 "--workspace",
                 "abeljim/wooli-test",
             ]),

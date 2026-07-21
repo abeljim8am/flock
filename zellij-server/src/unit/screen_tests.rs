@@ -1,4 +1,7 @@
-use super::{coder_remote_panes, screen_thread_main, CopyOptions, Screen, ScreenInstruction};
+use super::{
+    remote_backend_from_command, remote_panes_for_backend, screen_thread_main, CopyOptions,
+    Screen, ScreenInstruction,
+};
 use crate::panes::PaneId;
 use crate::{
     channels::SenderWithContext, os_input_output::ServerOsApi, route::route_action,
@@ -42,7 +45,7 @@ fn restored_coder_pane_keeps_its_saved_remote_uuid() {
             vec![PaneInfo {
                 id: 91,
                 terminal_command: Some(format!(
-                    "flock remote-agent coder-pty --workspace alice/api --pane-id {saved_uuid}"
+                    "flock remote-agent remote-pty --provider coder --workspace alice/api --pane-id {saved_uuid}"
                 )),
                 ..Default::default()
             }],
@@ -52,12 +55,71 @@ fn restored_coder_pane_keeps_its_saved_remote_uuid() {
         workspace: "alice/api".into(),
         local_session_id: "coder-api".into(),
     });
-    let panes = coder_remote_panes(&backend, "coder-api", &manifest);
+    let panes = remote_panes_for_backend(&backend, "coder-api", &manifest);
     assert_eq!(
         panes
             .get(&zellij_utils::data::PaneId::Terminal(91))
             .map(|pane| pane.pane_uuid.as_str()),
         Some(saved_uuid)
+    );
+}
+
+#[test]
+fn remote_pty_argv_recognizer_derives_typed_backends() {
+    use zellij_utils::data::RemoteBackend;
+
+    let argv = |words: &[&str]| words.iter().map(|word| word.to_string()).collect::<Vec<_>>();
+    assert_eq!(
+        remote_backend_from_command(
+            Some(&argv(&[
+                "flock",
+                "remote-agent",
+                "remote-pty",
+                "--provider",
+                "coder",
+                "--workspace",
+                "alice/api",
+            ])),
+            "local",
+        ),
+        Some(RemoteBackend::Coder {
+            workspace: "alice/api".into(),
+            local_session_id: "local".into(),
+        })
+    );
+    assert_eq!(
+        remote_backend_from_command(
+            Some(&argv(&[
+                "flock",
+                "remote-agent",
+                "remote-pty",
+                "--provider",
+                "ssh",
+                "--destination",
+                "abel@dev.example.com",
+                "--ssh-arg",
+                "-p",
+                "--ssh-arg",
+                "2222",
+                "--pane-id",
+                "9cf53ab7-4dd0-4cd1-a577-e2bc59f90549",
+            ])),
+            "local",
+        ),
+        Some(RemoteBackend::Ssh {
+            name: "abel@dev.example.com".into(),
+            destination: "abel@dev.example.com".into(),
+            extra_args: vec!["-p".into(), "2222".into()],
+            local_session_id: "local".into(),
+        })
+    );
+    assert_eq!(
+        remote_backend_from_command(Some(&argv(&["flock", "remote-agent", "remote-pty"])), "local"),
+        None
+    );
+    assert_eq!(
+        remote_backend_from_command(Some(&argv(&["coder", "ssh", "alice/api"])), "local"),
+        None
     );
 }
 

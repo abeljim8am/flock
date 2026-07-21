@@ -33,14 +33,23 @@ fn main() {
                     remote_agent::serve(socket, foreground)
                 },
                 RemoteAgentCommand::Connect { socket } => remote_agent::connect(socket),
-                RemoteAgentCommand::CoderPty {
+                RemoteAgentCommand::RemotePty {
+                    provider,
                     workspace,
+                    destination,
+                    ssh_arg,
                     pane_id,
                     cwd,
-                } => remote_agent::coder_pty(&workspace, pane_id.as_deref(), cwd),
-                RemoteAgentCommand::CoderClose { workspace, pane_id } => {
-                    remote_agent::coder_close(&workspace, &pane_id)
-                },
+                } => remote_transport(&provider, workspace, destination, ssh_arg)
+                    .and_then(|transport| remote_agent::remote_pty(transport, pane_id.as_deref(), cwd)),
+                RemoteAgentCommand::RemoteClose {
+                    provider,
+                    workspace,
+                    destination,
+                    ssh_arg,
+                    pane_id,
+                } => remote_transport(&provider, workspace, destination, ssh_arg)
+                    .and_then(|transport| remote_agent::remote_close(transport, &pane_id)),
                 RemoteAgentCommand::ReportState {
                     pane_id,
                     state,
@@ -63,8 +72,8 @@ fn main() {
 
     configure_logger();
     create_config_and_cache_folders();
-    if let Err(error) = zellij_utils::remote_session_cleanup::recover_pending_coder_closes() {
-        log::warn!("failed to recover pending Coder pane closes: {error}");
+    if let Err(error) = zellij_utils::remote_session_cleanup::recover_pending_remote_closes() {
+        log::warn!("failed to recover pending remote pane closes: {error}");
     }
 
     {
@@ -461,5 +470,27 @@ fn main() {
         }
     } else {
         commands::start_client(opts);
+    }
+}
+
+/// Build the provider transport from `remote-pty`/`remote-close` flags,
+/// enforcing the per-provider required arguments clap cannot express here.
+#[cfg(unix)]
+fn remote_transport(
+    provider: &str,
+    workspace: Option<String>,
+    destination: Option<String>,
+    ssh_args: Vec<String>,
+) -> anyhow::Result<remote_agent::RemoteTransport> {
+    use anyhow::{anyhow, Context};
+    match provider {
+        "coder" => Ok(remote_agent::RemoteTransport::Coder {
+            workspace: workspace.context("--provider coder requires --workspace")?,
+        }),
+        "ssh" => Ok(remote_agent::RemoteTransport::Ssh {
+            destination: destination.context("--provider ssh requires --destination")?,
+            ssh_args,
+        }),
+        other => Err(anyhow!("unknown remote provider {other:?}; expected coder or ssh")),
     }
 }
