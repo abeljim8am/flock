@@ -1162,7 +1162,7 @@ impl State {
                 None => session
                     .default_command
                     .as_deref()
-                    .and_then(coder::parse_coder_ssh)
+                    .and_then(coder::parse_gateway)
                     .map(str::to_owned),
             })
             .collect()
@@ -1183,7 +1183,7 @@ impl State {
                         session
                             .default_command
                             .as_deref()
-                            .and_then(coder::parse_coder_ssh)
+                            .and_then(coder::parse_gateway)
                             .map(str::to_owned)
                     }),
             })
@@ -1404,7 +1404,7 @@ impl State {
                     session
                         .default_command
                         .as_deref()
-                        .and_then(coder::parse_coder_ssh)
+                        .and_then(coder::parse_gateway)
                         == Some(identifier.as_str())
                 },
             })

@@ -147,7 +147,6 @@ mod tests {
         session.remote_backend = Some(RemoteBackend::Coder {
             workspace: "alice/api".into(),
             local_session_id: String::new(),
-            legacy: false,
         });
         for (id, uuid) in [(1, "uuid-one"), (2, "uuid-two")] {
             session.remote_panes.insert(
