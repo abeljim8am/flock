@@ -1944,6 +1944,11 @@ pub enum RemoteBackend {
         extra_args: Vec<String>,
         local_session_id: String,
     },
+    Devcontainer {
+        /// Normalized absolute host path of the project folder.
+        workspace_folder: String,
+        local_session_id: String,
+    },
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
