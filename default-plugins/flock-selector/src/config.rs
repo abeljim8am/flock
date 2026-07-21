@@ -50,6 +50,7 @@ pub struct SelectorConfig {
     pub codespaces_enabled: bool,
     pub devcontainers_enabled: bool,
     pub coder_enabled: bool,
+    pub ssh_enabled: bool,
     /// Optional repository injected as a Coder template parameter default when
     /// creating workspaces. This is selector-only: the sidebar never creates
     /// workspaces.
@@ -84,6 +85,7 @@ impl Default for SelectorConfig {
             codespaces_enabled: false,
             devcontainers_enabled: false,
             coder_enabled: false,
+            ssh_enabled: false,
             coder_dotfiles_uri: None,
             coder_dotfiles_parameter: DEFAULT_CODER_DOTFILES_PARAMETER.to_owned(),
             coder_dotfiles_branch: None,
@@ -117,6 +119,7 @@ impl SelectorConfig {
             "codespaces_enabled",
             "devcontainers_enabled",
             "coder_enabled",
+            "ssh_enabled",
         ]
         .iter()
         .filter_map(|key| {
@@ -140,6 +143,7 @@ impl SelectorConfig {
             codespaces_enabled: enabled(config.get("codespaces_enabled")),
             devcontainers_enabled: enabled(config.get("devcontainers_enabled")),
             coder_enabled: enabled(config.get("coder_enabled")),
+            ssh_enabled: enabled(config.get("ssh_enabled")),
             coder_dotfiles_uri: config
                 .get("coder_dotfiles_uri")
                 .map(|value| value.trim().to_owned())

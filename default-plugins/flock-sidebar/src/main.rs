@@ -1094,6 +1094,7 @@ impl State {
             RemoteBinding::Codespace => self.sessionizer.codespaces_enabled(),
             RemoteBinding::Devcontainer => self.sessionizer.devcontainers_enabled(),
             RemoteBinding::Coder => self.sessionizer.coder_enabled(),
+            RemoteBinding::Ssh => self.sessionizer.ssh_enabled(),
         }
     }
 
@@ -1238,6 +1239,7 @@ pub(crate) enum RemoteBinding {
     Codespace,
     Devcontainer,
     Coder,
+    Ssh,
 }
 
 /// Recognize any remote binding in an argv (a session's `default_command` or
@@ -1255,7 +1257,7 @@ pub(crate) fn parse_remote_binding(argv: &[String]) -> Option<RemoteBinding> {
 pub(crate) fn session_remote_binding(session: &SessionInfo) -> Option<RemoteBinding> {
     match &session.remote_backend {
         Some(RemoteBackend::Coder { .. }) => Some(RemoteBinding::Coder),
-        Some(_) => None,
+        Some(RemoteBackend::Ssh { .. }) => Some(RemoteBinding::Ssh),
         None => session
             .default_command
             .as_deref()
@@ -1404,6 +1406,44 @@ mod tests {
                 "coder",
                 "--workspace",
                 "abeljim/wooli-test",
+            ]),
+            true,
+            Instant::now(),
+        );
+        assert!(state.agents.get(&pane_id).unwrap().remote);
+    }
+
+    #[test]
+    fn typed_ssh_binding_keeps_session_visible_and_marks_its_panes_remote() {
+        let mut state = state_with_provider("ssh_enabled");
+        let mut session = SessionInfo::new("dev-box".into());
+        session.is_current_session = true;
+        session.remote_backend = Some(RemoteBackend::Ssh {
+            name: "Dev Box".into(),
+            destination: "abel@dev.example.com".into(),
+            extra_args: vec!["-p".into(), "2222".into()],
+            local_session_id: "dev-box".into(),
+        });
+        state.sessions = vec![session];
+
+        assert_eq!(state.visible_sessions().len(), 1);
+        assert!(state.current_session_is_bound());
+
+        let pane_id = PaneId::Terminal(3);
+        state.apply_command_changed(
+            pane_id,
+            &argv(&[
+                "/tmp/flock",
+                "remote-agent",
+                "remote-pty",
+                "--provider",
+                "ssh",
+                "--destination",
+                "abel@dev.example.com",
+                "--ssh-arg",
+                "-p",
+                "--ssh-arg",
+                "2222",
             ]),
             true,
             Instant::now(),

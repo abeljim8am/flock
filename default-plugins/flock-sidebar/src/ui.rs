@@ -165,8 +165,10 @@ fn session_activity(
     session: &SessionInfo,
     agents: &BTreeMap<PaneId, PaneAgentState>,
 ) -> SessionActivity {
-    if crate::session_remote_binding(session) == Some(crate::RemoteBinding::Coder)
-        && !session.agent_states.is_empty()
+    if matches!(
+        crate::session_remote_binding(session),
+        Some(crate::RemoteBinding::Coder | crate::RemoteBinding::Ssh)
+    ) && !session.agent_states.is_empty()
     {
         return session_activity_from_states(&session.agent_states);
     }
@@ -191,6 +193,17 @@ fn session_activity(
 /// also marks a blocked agent in the detail list, so a session waiting on the
 /// user stands out at a glance; done-unseen is teal, running green, idle yellow,
 /// nothing a dim dot.
+/// Remote-badge color from the session's daemon connection state: live blue,
+/// in-flight yellow, lost dim.
+fn connection_state_color(state: Option<RemoteConnectionState>, p: &Theme) -> PaletteColor {
+    match state {
+        Some(RemoteConnectionState::Connected) => p.blue,
+        Some(RemoteConnectionState::Connecting | RemoteConnectionState::Reconnecting) => p.yellow,
+        Some(RemoteConnectionState::Disconnected) => p.muted,
+        None => p.blue,
+    }
+}
+
 fn activity_dot(activity: SessionActivity, p: &Theme) -> (&'static str, PaletteColor) {
     match activity {
         SessionActivity::Blocked => ("◉", p.red),
@@ -437,8 +450,11 @@ pub(crate) fn build_rows(
             activity: session_activity(session, agents),
             is_current: session.is_current_session,
             binding: crate::session_remote_binding(session),
-            connection_state: matches!(&session.remote_backend, Some(RemoteBackend::Coder { .. }))
-                .then_some(session.remote_connection_state),
+            connection_state: matches!(
+                &session.remote_backend,
+                Some(RemoteBackend::Coder { .. } | RemoteBackend::Ssh { .. })
+            )
+            .then_some(session.remote_connection_state),
         });
     }
     // Bottom section: the current session's own agents, one row each. Only the
@@ -898,7 +914,11 @@ fn draw_row(
             // Cloud badges get two cells of breathing room before the session
             // name; the devcontainer badge keeps the standard one-cell gap.
             let badge_width = match binding {
-                Some(crate::RemoteBinding::Codespace | crate::RemoteBinding::Coder) => 3,
+                Some(
+                    crate::RemoteBinding::Codespace
+                    | crate::RemoteBinding::Coder
+                    | crate::RemoteBinding::Ssh,
+                ) => 3,
                 Some(crate::RemoteBinding::Devcontainer) => 2,
                 None => 0,
             };
@@ -924,15 +944,12 @@ fn draw_row(
                     spans.push(Span::new(" ", p.text));
                 },
                 Some(crate::RemoteBinding::Coder) => {
-                    let color = match connection_state {
-                        Some(RemoteConnectionState::Connected) => p.blue,
-                        Some(
-                            RemoteConnectionState::Connecting | RemoteConnectionState::Reconnecting,
-                        ) => p.yellow,
-                        Some(RemoteConnectionState::Disconnected) => p.muted,
-                        None => p.blue,
-                    };
+                    let color = connection_state_color(*connection_state, p);
                     spans.push(Span::new("☁︎  ", color));
+                },
+                Some(crate::RemoteBinding::Ssh) => {
+                    let color = connection_state_color(*connection_state, p);
+                    spans.push(Span::new("⇅  ", color));
                 },
                 None => {},
             }
