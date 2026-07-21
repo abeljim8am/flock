@@ -38,17 +38,19 @@ fn main() {
                     workspace,
                     destination,
                     ssh_arg,
+                    workspace_folder,
                     pane_id,
                     cwd,
-                } => remote_transport(&provider, workspace, destination, ssh_arg)
+                } => remote_transport(&provider, workspace, destination, ssh_arg, workspace_folder)
                     .and_then(|transport| remote_agent::remote_pty(transport, pane_id.as_deref(), cwd)),
                 RemoteAgentCommand::RemoteClose {
                     provider,
                     workspace,
                     destination,
                     ssh_arg,
+                    workspace_folder,
                     pane_id,
-                } => remote_transport(&provider, workspace, destination, ssh_arg)
+                } => remote_transport(&provider, workspace, destination, ssh_arg, workspace_folder)
                     .and_then(|transport| remote_agent::remote_close(transport, &pane_id)),
                 RemoteAgentCommand::ReportState {
                     pane_id,
@@ -481,6 +483,7 @@ fn remote_transport(
     workspace: Option<String>,
     destination: Option<String>,
     ssh_args: Vec<String>,
+    workspace_folder: Option<String>,
 ) -> anyhow::Result<remote_agent::RemoteTransport> {
     use anyhow::{anyhow, Context};
     match provider {
@@ -491,6 +494,12 @@ fn remote_transport(
             destination: destination.context("--provider ssh requires --destination")?,
             ssh_args,
         }),
-        other => Err(anyhow!("unknown remote provider {other:?}; expected coder or ssh")),
+        "devcontainer" => Ok(remote_agent::RemoteTransport::Devcontainer {
+            workspace_folder: workspace_folder
+                .context("--provider devcontainer requires --workspace-folder")?,
+        }),
+        other => Err(anyhow!(
+            "unknown remote provider {other:?}; expected coder, ssh, or devcontainer"
+        )),
     }
 }

@@ -1209,13 +1209,20 @@ mod tests {
                 .collect(),
         );
         let mut devcontainer = sess("dc", "/work/app");
-        devcontainer.default_command = Some(vec![
-            "sh".to_string(),
-            "-c".to_string(),
-            crate::devcontainer::WRAPPER_SCRIPT.to_string(),
-            crate::devcontainer::WRAPPER_ARG0.to_string(),
-            "/work/app".to_string(),
-        ]);
+        devcontainer.default_command = Some(
+            [
+                "flock",
+                "remote-agent",
+                "remote-pty",
+                "--provider",
+                "devcontainer",
+                "--workspace-folder",
+                "/work/app",
+            ]
+            .iter()
+            .map(|s| s.to_string())
+            .collect(),
+        );
         let mut coder = sess("coder", "");
         coder.remote_backend = Some(RemoteBackend::Coder {
             workspace: "alice/api".to_string(),

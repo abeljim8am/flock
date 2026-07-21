@@ -721,6 +721,17 @@ impl ZellijPlugin for State {
                         exit_code,
                         &String::from_utf8_lossy(&stderr),
                     );
+                } else if self.config.devcontainers_enabled
+                    && context.contains_key(devcontainers::BOOTSTRAP_CONTEXT_KEY)
+                {
+                    let path_str = context
+                        .get(devcontainers::BOOTSTRAP_CONTEXT_KEY)
+                        .expect("context key checked above");
+                    should_render = self.handle_devcontainer_bootstrap_result(
+                        path_str,
+                        exit_code,
+                        &String::from_utf8_lossy(&stderr),
+                    );
                 }
             },
             Event::Key(key) => {
@@ -1834,6 +1845,16 @@ impl State {
         // carries a `.devcontainer` marker. The prompt takes over the
         // keyboard; the picker closes when the flow resolves.
         let action = session::resolve_open(&path, &self.existing_sessions());
+        // Switching back into a bound devcontainer session fires the
+        // idempotent bootstrap as a fire-and-forget repair: a container
+        // rebuild wipes the installed flock binary, and reopening from the
+        // picker is the designated way to reinstall it.
+        if self.config.devcontainers_enabled
+            && matches!(action, OpenAction::Switch { .. })
+            && self.project_has_devcontainer(&path)
+        {
+            self.fire_devcontainer_bootstrap(&path);
+        }
         if self.config.devcontainers_enabled
             && matches!(action, OpenAction::Create { .. })
             && self.project_has_devcontainer(&path)
@@ -1912,6 +1933,7 @@ impl State {
                     &path,
                     &self.config.sidebar_args,
                     self.remote_layout_base.as_deref(),
+                    self.flock_executable.as_deref(),
                 ));
                 switch_session_with_layout(Some(&name), layout, Some(path));
                 self.discard_throwaway_session(current_session_name.as_deref());
@@ -1954,15 +1976,17 @@ impl State {
                 // Swallow everything else — the list underneath is frozen.
                 _ => true,
             },
-            DevcontainerPhase::Starting => match key.bare_key {
-                // Esc abandons the picker but not the up: with no session
-                // created yet there is nothing to unwind, and a finished up
-                // just makes the next pick instant.
-                BareKey::Esc => {
-                    close_self();
-                    false
-                },
-                _ => true,
+            DevcontainerPhase::Starting | DevcontainerPhase::Bootstrapping => {
+                match key.bare_key {
+                    // Esc abandons the picker but not the up/bootstrap: with
+                    // no session created yet there is nothing to unwind, and a
+                    // finished up just makes the next pick instant.
+                    BareKey::Esc => {
+                        close_self();
+                        false
+                    },
+                    _ => true,
+                }
             },
             DevcontainerPhase::Failed(_) => {
                 // Any key dismisses the error back to the normal picker.
@@ -1972,9 +1996,10 @@ impl State {
         }
     }
 
-    /// Route a `devcontainer up` result: create/switch on success, show the
-    /// classified error on failure. Ignores results that no longer match the
-    /// pending state (the user may have Esc'd and re-picked while it ran).
+    /// Route a `devcontainer up` result: bootstrap flock into the container on
+    /// success, show the classified error on failure. Ignores results that no
+    /// longer match the pending state (the user may have Esc'd and re-picked
+    /// while it ran).
     fn handle_devcontainer_up_result(
         &mut self,
         path_str: &str,
@@ -1988,6 +2013,39 @@ impl State {
             return false;
         }
         if exit_code == Some(0) {
+            let path = self
+                .pending_devcontainer
+                .as_ref()
+                .map(|pending| pending.path.clone())
+                .expect("checked above");
+            if let Some(pending) = self.pending_devcontainer.as_mut() {
+                pending.phase = DevcontainerPhase::Bootstrapping;
+            }
+            self.fire_devcontainer_bootstrap(&path);
+        } else if let Some(pending) = self.pending_devcontainer.as_mut() {
+            pending.phase =
+                DevcontainerPhase::Failed(devcontainers::classify_error(exit_code, stderr));
+        }
+        true
+    }
+
+    /// Route an in-container bootstrap result: create/switch the bound
+    /// session on success. A result with no matching pending state is a
+    /// fire-and-forget repair bootstrap (fired when switching to an existing
+    /// bound session) and is ignored.
+    fn handle_devcontainer_bootstrap_result(
+        &mut self,
+        path_str: &str,
+        exit_code: Option<i32>,
+        stderr: &str,
+    ) -> bool {
+        let matches_pending = self.pending_devcontainer.as_ref().is_some_and(|p| {
+            p.phase == DevcontainerPhase::Bootstrapping && p.path.to_string_lossy() == path_str
+        });
+        if !matches_pending {
+            return false;
+        }
+        if exit_code == Some(0) {
             let pending = self.pending_devcontainer.take().expect("checked above");
             self.open_project_in_devcontainer(pending.path);
         } else if let Some(pending) = self.pending_devcontainer.as_mut() {
@@ -1995,6 +2053,14 @@ impl State {
                 DevcontainerPhase::Failed(devcontainers::classify_error(exit_code, stderr));
         }
         true
+    }
+
+    /// Fire the idempotent in-container flock install. Cheap when already
+    /// installed; after a container rebuild it is the repair action.
+    fn fire_devcontainer_bootstrap(&self, path: &Path) {
+        let argv = devcontainers::bootstrap_argv(path, self.remote_agent_binary.as_deref());
+        let argv_refs: Vec<&str> = argv.iter().map(|s| s.as_str()).collect();
+        run_command(&argv_refs, devcontainers::bootstrap_context(path));
     }
 
     /// Whether `path` (a project folder) carries a `.devcontainer` marker,

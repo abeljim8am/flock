@@ -1829,6 +1829,7 @@ impl Pty {
             let mut workspace = None;
             let mut destination = None;
             let mut ssh_args = Vec::new();
+            let mut workspace_folder = None;
             let mut words = argv[subcommand + 2..].iter();
             while let Some(word) = words.next() {
                 match word.as_str() {
@@ -1836,6 +1837,7 @@ impl Pty {
                     "--workspace" => workspace = words.next(),
                     "--destination" => destination = words.next(),
                     "--ssh-arg" => ssh_args.extend(words.next().cloned()),
+                    "--workspace-folder" => workspace_folder = words.next(),
                     _ => {},
                 }
             }
@@ -1846,6 +1848,9 @@ impl Pty {
                 Some("ssh") => Some(RemoteCloseTransport::Ssh {
                     destination: destination?.clone(),
                     extra_args: ssh_args,
+                }),
+                Some("devcontainer") => Some(RemoteCloseTransport::Devcontainer {
+                    workspace_folder: workspace_folder?.clone(),
                 }),
                 _ => None,
             }

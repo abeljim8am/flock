@@ -130,6 +130,9 @@ pub enum RemoteTransport {
         destination: String,
         ssh_args: Vec<String>,
     },
+    Devcontainer {
+        workspace_folder: String,
+    },
 }
 
 impl RemoteTransport {
@@ -138,6 +141,7 @@ impl RemoteTransport {
         match self {
             Self::Coder { workspace } => workspace,
             Self::Ssh { destination, .. } => destination,
+            Self::Devcontainer { workspace_folder } => workspace_folder,
         }
     }
 
@@ -145,18 +149,71 @@ impl RemoteTransport {
         match self {
             Self::Coder { .. } => "Coder",
             Self::Ssh { .. } => "SSH",
+            Self::Devcontainer { .. } => "devcontainer",
         }
     }
 
+    /// A command that can revive the far end after a failed connect attempt:
+    /// `devcontainer up` restarts a stopped container (or recreates it after a
+    /// rebuild). Coder/ssh hosts have no local revive story — `None`.
+    fn recover_command(&self) -> Option<Command> {
+        match self {
+            Self::Devcontainer { workspace_folder } => {
+                let mut command = Command::new("devcontainer");
+                command.args(["up", "--workspace-folder", workspace_folder]);
+                Some(command)
+            },
+            _ => None,
+        }
+    }
+
+    /// Whether a close-worker error means the far end is already gone for
+    /// good: a stopped/removed container has killed the daemon and every pane
+    /// shell with it, so the close request is moot and counts as done.
+    fn close_target_gone(&self, error: &str) -> bool {
+        match self {
+            Self::Devcontainer { .. } => {
+                let lower = error.to_ascii_lowercase();
+                lower.contains("is not running")
+                    || lower.contains("no such container")
+                    || lower.contains("no container found")
+            },
+            _ => false,
+        }
+    }
+
+    /// Whether the close worker should give up after a bounded number of
+    /// attempts, leaving the pending file for re-arm at the next flock start.
+    /// Containers can be transiently unreachable in ways that never converge
+    /// (deleted project, wedged docker daemon); coder/ssh keep retrying like
+    /// today.
+    fn close_retries_bounded(&self) -> bool {
+        matches!(self, Self::Devcontainer { .. })
+    }
+
     fn connect_command(&self) -> Command {
-        // Both transports hand the trailing words to the remote login shell as
-        // one space-joined string, so the script must ride inside single
-        // quotes to survive that second parse.
+        // The ssh-style transports hand the trailing words to the remote login
+        // shell as one space-joined string, so the script must ride inside
+        // single quotes to survive that second parse. `devcontainer exec`
+        // passes argv through verbatim (docker-exec style), so its script
+        // stays raw.
         let remote = r#"exec "$HOME/.local/share/flock/current/flock" remote-agent connect"#;
         match self {
             Self::Coder { workspace } => {
                 let mut command = Command::new("coder");
                 command.args(["ssh", workspace, "--", "sh", "-c", &format!("'{remote}'")]);
+                command
+            },
+            Self::Devcontainer { workspace_folder } => {
+                let mut command = Command::new("devcontainer");
+                command.args([
+                    "exec",
+                    "--workspace-folder",
+                    workspace_folder,
+                    "sh",
+                    "-c",
+                    remote,
+                ]);
                 command
             },
             Self::Ssh {
@@ -198,6 +255,9 @@ impl RemoteTransport {
             } => RemoteCloseTransport::Ssh {
                 destination: destination.clone(),
                 extra_args: ssh_args.clone(),
+            },
+            Self::Devcontainer { workspace_folder } => RemoteCloseTransport::Devcontainer {
+                workspace_folder: workspace_folder.clone(),
             },
         }
     }
@@ -487,6 +547,9 @@ pub fn serve(socket: Option<PathBuf>, foreground: bool) -> Result<()> {
     let listener = UnixListener::bind(&socket)
         .with_context(|| format!("bind user-only socket {}", socket.display()))?;
     fs::set_permissions(&socket, fs::Permissions::from_mode(0o600))?;
+    if let Err(error) = install_opencode_state_plugin() {
+        eprintln!("flock remote-agent: could not install the OpenCode state plugin: {error:#}");
+    }
     let panes: Panes = Arc::new(Mutex::new(HashMap::new()));
     for stream in listener.incoming() {
         match stream {
@@ -658,6 +721,25 @@ pub fn remote_pty(
                     "\r\nflock: {} connection lost ({error}); reconnecting…",
                     transport.label(),
                 )?;
+                // A stopped container can be revived locally; run the
+                // transport's recovery (idempotent `devcontainer up`) before
+                // retrying. Only fires on the failure path, so transient
+                // daemon reconnects never pay for it.
+                if let Some(mut recover) = transport.recover_command() {
+                    let recovered = recover
+                        .stdin(Stdio::null())
+                        .stdout(Stdio::null())
+                        .stderr(Stdio::inherit())
+                        .status()
+                        .map(|status| status.success())
+                        .unwrap_or(false);
+                    if recovered {
+                        writeln!(
+                            io::stderr(),
+                            "\r\nflock: container is up; if reconnecting still fails, it may have been rebuilt — reopen it from the session picker to reinstall flock",
+                        )?;
+                    }
+                }
             },
         }
         persist_connection(&cursor_path, "reconnecting")?;
@@ -742,23 +824,38 @@ pub fn remote_close(transport: RemoteTransport, pane_id: &str) -> Result<()> {
         Some(worker) => worker,
         None => return Ok(()),
     };
+    // Containers can be gone for good (stopped/removed — the daemon and every
+    // pane shell died with them), which counts as done, and can also fail in
+    // ways that never converge, so their retries are bounded and the pending
+    // file is left behind for re-arm at the next flock start.
+    const BOUNDED_CLOSE_ATTEMPTS: u32 = 20;
     let mut delay = Duration::from_millis(250);
+    let mut attempts = 0u32;
     loop {
         match send_remote_close(&transport, pane_id) {
-            Ok(()) => {
-                let _ = fs::remove_file(&pending_path);
-                let _ = fs::remove_file(&cursor_path);
-                let _ = fs::remove_file(cursor_path.with_extension("foreground"));
-                let _ = fs::remove_file(cursor_path.with_extension("cwd"));
-                let _ = fs::remove_file(cursor_path.with_extension("connection"));
-                return Ok(());
+            Ok(()) => {},
+            Err(error) if transport.close_target_gone(&format!("{error:#}")) => {
+                eprintln!("flock: remote close target is gone ({error:#}); treating as closed");
             },
             Err(error) => {
-                eprintln!("flock: remote pane close pending ({error}); retrying");
+                attempts += 1;
+                if transport.close_retries_bounded() && attempts >= BOUNDED_CLOSE_ATTEMPTS {
+                    bail!(
+                        "remote pane close did not converge after {attempts} attempts ({error:#}); leaving the pending request for the next start"
+                    );
+                }
+                eprintln!("flock: remote pane close pending ({error:#}); retrying");
                 thread::sleep(delay);
                 delay = (delay * 2).min(Duration::from_secs(10));
+                continue;
             },
         }
+        let _ = fs::remove_file(&pending_path);
+        let _ = fs::remove_file(&cursor_path);
+        let _ = fs::remove_file(cursor_path.with_extension("foreground"));
+        let _ = fs::remove_file(cursor_path.with_extension("cwd"));
+        let _ = fs::remove_file(cursor_path.with_extension("connection"));
+        return Ok(());
     }
 }
 
@@ -825,8 +922,32 @@ fn send_remote_close(transport: &RemoteTransport, pane_id: Uuid) -> Result<()> {
         .connect_command()
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
+        .stderr(Stdio::piped())
         .spawn()?;
+    let result = exchange_close_frames(&mut child, pane_id);
+    if result.is_err() {
+        // Attach the transport's own words to the failure — the caller
+        // classifies container-gone messages, and a bare EOF says nothing.
+        let _ = child.kill();
+        let stderr = child
+            .stderr
+            .take()
+            .and_then(|mut stderr| {
+                let mut buffer = String::new();
+                stderr.read_to_string(&mut buffer).ok()?;
+                Some(buffer)
+            })
+            .unwrap_or_default();
+        let _ = child.wait();
+        let stderr = stderr.trim();
+        if !stderr.is_empty() {
+            return result.with_context(|| format!("transport reported: {stderr}"));
+        }
+    }
+    result
+}
+
+fn exchange_close_frames(child: &mut std::process::Child, pane_id: Uuid) -> Result<()> {
     let mut writer = child.stdin.take().context("open remote close stdin")?;
     let mut reader = child.stdout.take().context("open remote close stdout")?;
     write_frame(
@@ -1197,6 +1318,31 @@ fn require_supported_platform() -> Result<()> {
     {
         bail!("unsupported platform: remote sessions require Linux x86_64 or aarch64");
     }
+    Ok(())
+}
+
+/// Idempotently install the bundled OpenCode state plugin into the daemon
+/// host's user config (compare-and-swap, like the old devcontainer wrapper
+/// did per pane). The daemon is the one process guaranteed to run on every
+/// remote host regardless of transport, so hook installation lives here and
+/// uniformly benefits coder, ssh, and devcontainer sessions. Claude/codex
+/// hooks stay dotfiles-managed.
+fn install_opencode_state_plugin() -> Result<()> {
+    const PLUGIN: &str =
+        include_str!("../default-plugins/flock-sidebar/assets/opencode/flock-agent-state.js");
+    let config_root = std::env::var_os("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".config")))
+        .context("HOME or XDG_CONFIG_HOME is required")?;
+    let directory = config_root.join("opencode").join("plugins");
+    let target = directory.join("flock-agent-state.js");
+    if fs::read_to_string(&target).is_ok_and(|current| current == PLUGIN) {
+        return Ok(());
+    }
+    fs::create_dir_all(&directory)?;
+    let temporary = directory.join(format!(".flock-agent-state.js.tmp.{}", std::process::id()));
+    fs::write(&temporary, PLUGIN)?;
+    fs::rename(&temporary, &target)?;
     Ok(())
 }
 

@@ -157,8 +157,8 @@ pub enum RemoteAgentCommand {
     /// Local terminal bridge for a daemon-owned remote PTY.
     #[clap(name = "remote-pty", hide = true)]
     RemotePty {
-        /// Remote provider: "coder" (requires --workspace) or "ssh"
-        /// (requires --destination).
+        /// Remote provider: "coder" (requires --workspace), "ssh" (requires
+        /// --destination), or "devcontainer" (requires --workspace-folder).
         #[clap(long, value_parser)]
         provider: String,
         #[clap(long, value_parser)]
@@ -167,6 +167,8 @@ pub enum RemoteAgentCommand {
         destination: Option<String>,
         #[clap(long = "ssh-arg", value_parser, multiple_occurrences = true)]
         ssh_arg: Vec<String>,
+        #[clap(long, value_parser)]
+        workspace_folder: Option<String>,
         #[clap(long, value_parser)]
         pane_id: Option<String>,
         #[clap(long, value_parser)]
@@ -183,6 +185,8 @@ pub enum RemoteAgentCommand {
         destination: Option<String>,
         #[clap(long = "ssh-arg", value_parser, multiple_occurrences = true)]
         ssh_arg: Vec<String>,
+        #[clap(long, value_parser)]
+        workspace_folder: Option<String>,
         #[clap(long, value_parser)]
         pane_id: String,
     },

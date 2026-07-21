@@ -957,6 +957,16 @@ fn render_devcontainer_notice(
             ),
             Span::new("  (first build can take a while)", p.muted).dim(),
         ],
+        DevcontainerPhase::Bootstrapping => vec![
+            Span::new(" ⬢ ", p.yellow),
+            Span::new(
+                format!(
+                    "preparing persistent session for \"{}\"…",
+                    pending.display_name
+                ),
+                p.text,
+            ),
+        ],
         DevcontainerPhase::Failed(err) => {
             let msg = match err {
                 DevcontainerError::CliMissing => {

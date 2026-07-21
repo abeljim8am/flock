@@ -83,6 +83,7 @@ fn remote_backend_from_command(
             let mut workspace = None;
             let mut destination = None;
             let mut ssh_args = Vec::new();
+            let mut workspace_folder = None;
             let mut words = rest.iter();
             while let Some(word) = words.next() {
                 match word.as_str() {
@@ -90,6 +91,7 @@ fn remote_backend_from_command(
                     "--workspace" => workspace = words.next(),
                     "--destination" => destination = words.next(),
                     "--ssh-arg" => ssh_args.extend(words.next().cloned()),
+                    "--workspace-folder" => workspace_folder = words.next(),
                     _ => {},
                 }
             }
@@ -107,6 +109,10 @@ fn remote_backend_from_command(
                         local_session_id: local_session_id.to_owned(),
                     })
                 },
+                Some("devcontainer") => Some(zellij_utils::data::RemoteBackend::Devcontainer {
+                    workspace_folder: workspace_folder?.clone(),
+                    local_session_id: local_session_id.to_owned(),
+                }),
                 _ => None,
             }
         },
@@ -144,6 +150,13 @@ fn normalized_remote_backend(
             extra_args,
             local_session_id: normalize(local_session_id),
         },
+        zellij_utils::data::RemoteBackend::Devcontainer {
+            workspace_folder,
+            local_session_id,
+        } => zellij_utils::data::RemoteBackend::Devcontainer {
+            workspace_folder,
+            local_session_id: normalize(local_session_id),
+        },
     })
 }
 
@@ -155,6 +168,9 @@ fn remote_panes_for_backend(
     let workspace = match backend {
         Some(zellij_utils::data::RemoteBackend::Coder { workspace, .. }) => workspace,
         Some(zellij_utils::data::RemoteBackend::Ssh { destination, .. }) => destination,
+        Some(zellij_utils::data::RemoteBackend::Devcontainer {
+            workspace_folder, ..
+        }) => workspace_folder,
         None => return BTreeMap::new(),
     };
     manifest
