@@ -119,8 +119,6 @@ pub fn spinner_frame(tick: u32) -> &'static str {
 pub(crate) enum SessionActivity {
     /// No agents in the session.
     None,
-    /// A remote workspace is showing a cached snapshot and is unreachable.
-    Offline,
     /// One or more agents present, all idle and already seen — nothing to do.
     Stopped,
     /// At least one agent is actively working.
@@ -199,7 +197,6 @@ fn activity_dot(activity: SessionActivity, p: &Theme) -> (&'static str, PaletteC
         SessionActivity::DoneUnseen => ("●", p.teal),
         SessionActivity::Running => ("●", p.green),
         SessionActivity::Stopped => ("●", p.yellow),
-        SessionActivity::Offline => ("◌", p.muted),
         SessionActivity::None => ("○", p.muted),
     }
 }
@@ -220,12 +217,6 @@ fn agent_icon(state: AgentState, seen: bool, tick: u32, p: &Theme) -> (&'static 
 /// dot, using the same attention priority as our own session — so a *blocked*
 /// agent in another workspace shows its red ◉ here, not a generic "stopped" dot.
 fn session_activity_from_states(states: &BTreeMap<PaneId, PaneAgentStatus>) -> SessionActivity {
-    if states
-        .values()
-        .any(|status| status.label.ends_with(" · offline"))
-    {
-        return SessionActivity::Offline;
-    }
     rollup_activity(
         states
             .values()
@@ -301,7 +292,6 @@ pub(crate) enum Row {
         /// devcontainer.
         binding: Option<crate::RemoteBinding>,
         connection_state: Option<RemoteConnectionState>,
-        legacy_remote: bool,
     },
     Agent(AgentEntry),
 }
@@ -313,17 +303,6 @@ pub enum Target {
     Session(String),
     /// Focus this agent pane.
     Pane(PaneId),
-    /// Focus a pane owned by the durable Zellij server in a Coder workspace.
-    RemotePane(String),
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RemoteAgentEntry {
-    pub pane_id: String,
-    pub label: String,
-    pub state: AgentState,
-    pub seen: bool,
-    pub is_active: bool,
 }
 
 /// A rendered row's click target: which absolute pane row it occupies and which
@@ -447,7 +426,6 @@ pub(crate) fn build_rows(
     tabs: &[TabInfo],
     agents: &BTreeMap<PaneId, PaneAgentState>,
     sessions: &[SessionInfo],
-    remote_agents: &[RemoteAgentEntry],
 ) -> Vec<Row> {
     let mut rows = Vec::new();
     // Top section: the workspaces overview — one dot-only row per session, no
@@ -461,30 +439,14 @@ pub(crate) fn build_rows(
             binding: crate::session_remote_binding(session),
             connection_state: matches!(&session.remote_backend, Some(RemoteBackend::Coder { .. }))
                 .then_some(session.remote_connection_state),
-            legacy_remote: matches!(
-                &session.remote_backend,
-                Some(RemoteBackend::Coder { legacy: true, .. })
-            ),
         });
     }
     // Bottom section: the current session's own agents, one row each. Only the
     // current session's panes are observable from here, so this is the live
     // detail view for the workspace you're in.
     if let Some(current) = sessions.iter().find(|s| s.is_current_session) {
-        if remote_agents.is_empty() {
-            let entries = build_entries(panes, tabs, agents, &current.agent_states);
-            rows.extend(entries.into_iter().map(Row::Agent));
-        } else {
-            rows.extend(remote_agents.iter().map(|entry| {
-                Row::Agent(AgentEntry {
-                    target: Target::RemotePane(entry.pane_id.clone()),
-                    label: entry.label.clone(),
-                    state: entry.state,
-                    seen: entry.seen,
-                    is_active: entry.is_active,
-                })
-            }));
-        }
+        let entries = build_entries(panes, tabs, agents, &current.agent_states);
+        rows.extend(entries.into_iter().map(Row::Agent));
     }
     rows
 }
@@ -523,9 +485,8 @@ pub fn navigable_targets(
     tabs: &[TabInfo],
     agents: &BTreeMap<PaneId, PaneAgentState>,
     sessions: &[SessionInfo],
-    remote_agents: &[RemoteAgentEntry],
 ) -> Vec<Target> {
-    build_rows(panes, tabs, agents, sessions, remote_agents)
+    build_rows(panes, tabs, agents, sessions)
         .iter()
         .map(row_target)
         .collect()
@@ -638,7 +599,6 @@ pub struct RenderInput<'a> {
     pub panes: &'a PaneManifest,
     pub tabs: &'a [TabInfo],
     pub agents: &'a BTreeMap<PaneId, PaneAgentState>,
-    pub remote_agents: &'a [RemoteAgentEntry],
     pub sessions: &'a [SessionInfo],
     pub palette: &'a Theme,
     /// Shared open/closed state for both sidebar sections.
@@ -707,13 +667,7 @@ pub fn render(input: RenderInput) -> RenderOutput {
         };
     }
 
-    let rows_data = build_rows(
-        input.panes,
-        input.tabs,
-        input.agents,
-        input.sessions,
-        input.remote_agents,
-    );
+    let rows_data = build_rows(input.panes, input.tabs, input.agents, input.sessions);
     let selected = clamp_selection(input.selected, rows_data.len());
 
     // Closed mode uses the icon rail even if the pane has enough room for labels.
@@ -937,7 +891,6 @@ fn draw_row(
             is_current,
             binding,
             connection_state,
-            legacy_remote,
         } => {
             let (dot, dot_color) = activity_dot(*activity, p);
             let emphasized = cursor || *is_current;
@@ -945,7 +898,6 @@ fn draw_row(
             // Cloud badges get two cells of breathing room before the session
             // name; the devcontainer badge keeps the standard one-cell gap.
             let badge_width = match binding {
-                Some(crate::RemoteBinding::Coder) if *legacy_remote => 4,
                 Some(crate::RemoteBinding::Codespace | crate::RemoteBinding::Coder) => 3,
                 Some(crate::RemoteBinding::Devcontainer) => 2,
                 None => 0,
@@ -980,14 +932,7 @@ fn draw_row(
                         Some(RemoteConnectionState::Disconnected) => p.muted,
                         None => p.blue,
                     };
-                    spans.push(Span::new(
-                        if *legacy_remote {
-                            "☁︎↑ "
-                        } else {
-                            "☁︎  "
-                        },
-                        color,
-                    ));
+                    spans.push(Span::new("☁︎  ", color));
                 },
                 None => {},
             }
@@ -1255,11 +1200,10 @@ mod tests {
             "/work/app".to_string(),
         ]);
         let mut coder = sess("coder", "");
-        coder.default_command = Some(vec![
-            "coder".to_string(),
-            "ssh".to_string(),
-            "alice/api".to_string(),
-        ]);
+        coder.remote_backend = Some(RemoteBackend::Coder {
+            workspace: "alice/api".to_string(),
+            local_session_id: "coder".to_string(),
+        });
         let plain = sess("plain", "/work/other");
 
         let rows = build_rows(
@@ -1267,7 +1211,6 @@ mod tests {
             &[],
             &BTreeMap::new(),
             &[codespace, devcontainer, coder, plain],
-            &[],
         );
         let binding_of = |wanted: &str| {
             rows.iter()
@@ -1292,7 +1235,6 @@ mod tests {
                 is_current: false,
                 binding: Some(binding),
                 connection_state: None,
-                legacy_remote: false,
             };
             let mut output = String::new();
             draw_row(&mut output, &row, 0, 20, false, 0, &Theme::default());
@@ -1328,7 +1270,6 @@ mod tests {
             panes: &panes,
             tabs: &tabs,
             agents: &agents,
-            remote_agents: &[],
             sessions: &sessions,
             palette: &palette,
             sidebar_mode: SidebarMode::Closed,
@@ -1359,7 +1300,6 @@ mod tests {
             panes: &panes,
             tabs: &tabs,
             agents: &agents,
-            remote_agents: &[],
             sessions: &sessions,
             palette: &palette,
             sidebar_mode: SidebarMode::Open,
@@ -1409,7 +1349,6 @@ mod tests {
             panes: &panes,
             tabs: &tabs,
             agents: &agents,
-            remote_agents: &[],
             sessions: &sessions,
             palette: &palette,
             sidebar_mode: SidebarMode::Closed,
@@ -1434,46 +1373,13 @@ mod tests {
             sess("c", ""),
             sess("d", "/home/u/other"),
         ];
-        let targets = navigable_targets(
-            &PaneManifest::default(),
-            &[],
-            &BTreeMap::new(),
-            &sessions,
-            &[],
-        );
+        let targets = navigable_targets(&PaneManifest::default(), &[], &BTreeMap::new(), &sessions);
         assert_eq!(
             targets,
             vec![
                 Target::Session("d".to_string()), // /home/u/other
                 Target::Session("a".to_string()), // /home/u/proj
                 Target::Session("c".to_string()), // unknown, last
-            ]
-        );
-    }
-
-    #[test]
-    fn remote_agent_rows_replace_gateway_screen_rows_and_keep_focus_identity() {
-        let mut current = sess("api", "");
-        current.is_current_session = true;
-        let remote = vec![RemoteAgentEntry {
-            pane_id: "terminal_7".into(),
-            label: "codex".into(),
-            state: AgentState::Working,
-            seen: true,
-            is_active: true,
-        }];
-        let targets = navigable_targets(
-            &PaneManifest::default(),
-            &[],
-            &BTreeMap::new(),
-            &[current],
-            &remote,
-        );
-        assert_eq!(
-            targets,
-            vec![
-                Target::Session("api".into()),
-                Target::RemotePane("terminal_7".into())
             ]
         );
     }
@@ -1567,26 +1473,6 @@ mod tests {
     }
 
     #[test]
-    fn cached_coder_snapshot_gets_a_distinct_offline_activity() {
-        let states = BTreeMap::from_iter([(
-            PaneId::Plugin(u32::MAX),
-            PaneAgentStatus {
-                state: AgentRunState::Unknown,
-                label: "codex · offline".into(),
-                seen: true,
-            },
-        )]);
-        assert_eq!(
-            session_activity_from_states(&states),
-            SessionActivity::Offline
-        );
-        assert_eq!(
-            activity_dot(SessionActivity::Offline, &Theme::default()).0,
-            "◌"
-        );
-    }
-
-    #[test]
     fn current_session_activity_falls_back_to_published_state() {
         let agents: BTreeMap<PaneId, PaneAgentState> = BTreeMap::new();
         let mut current_session = sess("workspace-a", "/home/u/proj");
@@ -1630,7 +1516,7 @@ mod tests {
             },
         );
 
-        let rows = build_rows(&panes, &tabs, &agents, &[current_session], &[]);
+        let rows = build_rows(&panes, &tabs, &agents, &[current_session]);
         assert!(rows.iter().any(|row| matches!(
             row,
             Row::Agent(entry)
@@ -1675,7 +1561,7 @@ mod tests {
             },
         );
 
-        let rows = build_rows(&panes, &tabs, &agents, &[current_session], &[]);
+        let rows = build_rows(&panes, &tabs, &agents, &[current_session]);
         assert!(rows.iter().any(|row| matches!(
             row,
             Row::Agent(entry)

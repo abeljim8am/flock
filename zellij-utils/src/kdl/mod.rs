@@ -7541,7 +7541,6 @@ fn session_info_remote_backend_and_pane_cursor_round_trip() {
     session_info.remote_backend = Some(RemoteBackend::Coder {
         workspace: "alice/api".into(),
         local_session_id: "coder".into(),
-        legacy: false,
     });
     session_info.remote_connection_state = RemoteConnectionState::Reconnecting;
     session_info.remote_panes.insert(

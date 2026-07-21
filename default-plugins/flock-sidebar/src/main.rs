@@ -36,7 +36,6 @@
 //! the sidebar groups sessions under that folder (see [`ui::group_sessions`])
 //! instead of guessing from pane cwds.
 
-mod coder;
 mod codespace;
 mod detect;
 mod devcontainer;
@@ -83,8 +82,6 @@ const AGENT_COMMAND_SYNC_SECS: f64 = 1.0;
 /// rides a slower cadence than the state tick; a few seconds of state latency
 /// is fine for a status dot.
 const DEVCONTAINER_HOOK_POLL_SECS: f64 = 3.0;
-const CODER_SNAPSHOT_POLL_SECS: f64 = 3.0;
-const CODER_SNAPSHOT_STALE_SECS: f64 = 7.0;
 
 /// Pipe message name (sent by a `MessagePlugin` keybind, e.g. Super b) that
 /// toggles the sidebar between its slim rail and an expanded width. We resize
@@ -109,9 +106,6 @@ const HIDDEN_SESSION_NAME: &str = "flock-selector";
 
 #[derive(Default)]
 struct State {
-    /// A remote instance can run invisibly as the authoritative tracker for a
-    /// durable Coder session and answer snapshot pipe requests.
-    tracker_only: bool,
     /// Whether our permission request has been granted yet. Until it is, we
     /// can't read pane contents / application state, so we render a hint.
     permissions_granted: bool,
@@ -199,13 +193,6 @@ struct State {
     /// The resolved container id of this session's devcontainer, cached
     /// between polls; cleared when a poll says the container is gone.
     devcontainer_container_id: Option<String>,
-    /// Latest authoritative agent snapshot from the durable Zellij server in
-    /// this gateway's Coder workspace.
-    coder_snapshot: Option<coder::Snapshot>,
-    coder_snapshot_workspace: Option<String>,
-    last_coder_snapshot_poll: Option<Instant>,
-    last_coder_snapshot_received: Option<Instant>,
-    coder_snapshot_poll_in_flight: bool,
 }
 
 register_plugin!(State);
@@ -213,13 +200,6 @@ register_plugin!(State);
 impl ZellijPlugin for State {
     fn load(&mut self, configuration: BTreeMap<String, String>) {
         self.sessionizer = SessionizerConfig::from_args(&configuration);
-        self.tracker_only = configuration
-            .get("tracker_only")
-            .is_some_and(|value| value.trim().eq_ignore_ascii_case("true"));
-        if self.tracker_only {
-            hide_self();
-        }
-
         // Exclude the sidebar from focus navigation, like zellij's own tab-bar /
         // status-bar: Ctrl-h/l skip over it instead of landing on it, and it's a
         // glance-and-click ambient rail (mouse clicks still work) rather than a
@@ -323,31 +303,7 @@ impl ZellijPlugin for State {
                 }
             },
             Event::RunCommandResult(exit_code, stdout, stderr, context) => {
-                if self.sessionizer.coder_enabled()
-                    && context.contains_key(coder::SNAPSHOT_CONTEXT_KEY)
-                {
-                    self.coder_snapshot_poll_in_flight = false;
-                    if exit_code == Some(0) {
-                        match coder::parse_snapshot(&String::from_utf8_lossy(&stdout)) {
-                            Ok(snapshot) => {
-                                if let Some(identifier) = context.get(coder::SNAPSHOT_CONTEXT_KEY) {
-                                    coder::save_cached(identifier, &snapshot);
-                                }
-                                self.coder_snapshot = Some(snapshot);
-                                self.last_coder_snapshot_received = Some(Instant::now());
-                                should_render = true;
-                            },
-                            Err(reason) => {
-                                eprintln!("flock-sidebar: invalid Coder snapshot: {reason}");
-                            },
-                        }
-                    } else if !stderr.is_empty() {
-                        eprintln!(
-                            "flock-sidebar: Coder snapshot failed: {}",
-                            String::from_utf8_lossy(&stderr).trim()
-                        );
-                    }
-                } else if self.sessionizer.devcontainers_enabled()
+                if self.sessionizer.devcontainers_enabled()
                     && context.contains_key(devcontainer::PS_CONTEXT_KEY)
                 {
                     let id = String::from_utf8_lossy(&stdout)
@@ -418,7 +374,6 @@ impl ZellijPlugin for State {
                 // In a devcontainer-bound session, poll the in-container hook
                 // files (results arrive as RunCommandResult events).
                 self.maybe_poll_devcontainer_hooks(now);
-                self.maybe_poll_coder_snapshot(now);
                 // Catch the resize if permissions/geometry weren't ready when
                 // the first PaneUpdate arrived (runs once, gated by the flag).
                 self.maybe_set_default_width();
@@ -493,23 +448,6 @@ impl ZellijPlugin for State {
             self.publish_sidebar_state_if_changed();
             return false; // the resize itself triggers a re-render
         }
-        if pipe_message.name == coder::SNAPSHOT_PIPE_NAME {
-            self.publish_state_if_changed();
-            let mut snapshot = coder::Snapshot::from_states(
-                now_millis(),
-                self.current_session_name()
-                    .unwrap_or_else(|| "flock".to_owned()),
-                &self.last_published,
-            );
-            for pane in &mut snapshot.panes {
-                pane.focused = self.pane_is_focused(pane.pane_id);
-            }
-            match serde_json::to_string(&snapshot) {
-                Ok(json) => cli_pipe_output(&pipe_message.name, &json),
-                Err(reason) => eprintln!("flock-sidebar: snapshot serialization failed: {reason}"),
-            }
-            return false;
-        }
         // Only the agent self-report channel concerns us otherwise; ignore the
         // rest so we don't claim pipes meant for other plugins.
         if pipe_message.name != HOOK_PIPE_NAME {
@@ -530,9 +468,6 @@ impl ZellijPlugin for State {
     }
 
     fn render(&mut self, rows: usize, cols: usize) {
-        if self.tracker_only {
-            return;
-        }
         self.rows = rows;
         self.cols = cols;
         let sessions = self.render_sessions();
@@ -542,7 +477,6 @@ impl ZellijPlugin for State {
             panes: &self.panes,
             tabs: &self.tabs,
             agents: &self.agents,
-            remote_agents: &self.remote_agent_entries(),
             sessions: &sessions,
             palette: &self.palette,
             sidebar_mode: self.sidebar_mode,
@@ -563,116 +497,6 @@ impl ZellijPlugin for State {
 }
 
 impl State {
-    fn pane_is_focused(&self, pane_id: PaneId) -> bool {
-        let active_tab = self
-            .tabs
-            .iter()
-            .find(|tab| tab.active)
-            .map(|tab| tab.position);
-        active_tab
-            .and_then(|tab| self.panes.panes.get(&tab))
-            .is_some_and(|panes| {
-                panes.iter().any(|pane| {
-                    let candidate = if pane.is_plugin {
-                        PaneId::Plugin(pane.id)
-                    } else {
-                        PaneId::Terminal(pane.id)
-                    };
-                    candidate == pane_id && pane.is_focused
-                })
-            })
-    }
-    fn current_session_name(&self) -> Option<String> {
-        self.sessions
-            .iter()
-            .find(|session| session.is_current_session)
-            .map(|session| session.name.clone())
-    }
-
-    fn current_coder_workspace(&self) -> Option<String> {
-        if !self.sessionizer.coder_enabled() {
-            return None;
-        }
-        self.sessions
-            .iter()
-            .find(|session| session.is_current_session)
-            .and_then(|session| match &session.remote_backend {
-                Some(RemoteBackend::Coder { workspace, .. }) => Some(workspace.clone()),
-                None => session
-                    .default_command
-                    .as_deref()
-                    .and_then(coder::parse_coder_ssh)
-                    .map(str::to_owned),
-            })
-    }
-
-    /// Whether the current session is a *legacy* nested-Flock Coder session
-    /// (a `coder ssh` gateway pane into a remote Flock). Only those need the
-    /// remote snapshot channel; native remote-agent sessions track their panes
-    /// locally in `agents` like any other session.
-    fn current_coder_session_is_legacy(&self) -> bool {
-        self.sessions
-            .iter()
-            .find(|session| session.is_current_session)
-            .is_some_and(|session| {
-                matches!(
-                    &session.remote_backend,
-                    Some(RemoteBackend::Coder { legacy: true, .. })
-                ) || (session.remote_backend.is_none()
-                    && session
-                        .default_command
-                        .as_deref()
-                        .and_then(coder::parse_coder_ssh)
-                        .is_some())
-            })
-    }
-
-    fn maybe_poll_coder_snapshot(&mut self, now: Instant) {
-        // Native remote-agent sessions publish pane state in SessionInfo and
-        // never need remote Flock/sidebar snapshot polling. Keep polling only
-        // for recognized legacy nested-Flock sessions.
-        if !self.current_coder_session_is_legacy() {
-            return;
-        }
-        if self.tracker_only {
-            return;
-        }
-        let Some(identifier) = self.current_coder_workspace() else {
-            self.coder_snapshot_workspace = None;
-            self.coder_snapshot = None;
-            self.last_coder_snapshot_received = None;
-            self.coder_snapshot_poll_in_flight = false;
-            return;
-        };
-        if self.coder_snapshot_workspace.as_deref() != Some(identifier.as_str()) {
-            self.coder_snapshot_workspace = Some(identifier.clone());
-            self.coder_snapshot = coder::load_cached(&identifier);
-            self.last_coder_snapshot_poll = None;
-            self.last_coder_snapshot_received = None;
-            self.coder_snapshot_poll_in_flight = false;
-        }
-        if self.coder_snapshot_poll_in_flight {
-            return;
-        }
-        if self
-            .last_coder_snapshot_poll
-            .is_some_and(|last| now.duration_since(last).as_secs_f64() < CODER_SNAPSHOT_POLL_SECS)
-        {
-            return;
-        }
-        self.last_coder_snapshot_poll = Some(now);
-        self.coder_snapshot_poll_in_flight = true;
-        let argv = coder::snapshot_argv(&identifier);
-        let refs: Vec<&str> = argv.iter().map(String::as_str).collect();
-        run_command(&refs, coder::snapshot_context(&identifier));
-    }
-
-    fn coder_snapshot_stale(&self, now: Instant) -> bool {
-        self.current_coder_workspace().is_some()
-            && self.last_coder_snapshot_received.is_none_or(|received| {
-                now.duration_since(received).as_secs_f64() >= CODER_SNAPSHOT_STALE_SECS
-            })
-    }
     /// Whether any agent — in this session or any other — is currently Working.
     /// Drives the faster spinner-animation cadence; the cross-session check keeps
     /// the spinner animating for working agents shown from the published bus, not
@@ -805,39 +629,7 @@ impl State {
     /// the same ordering drives the render, so indices line up.
     fn targets(&self) -> Vec<Target> {
         let sessions = self.visible_sessions();
-        ui::navigable_targets(
-            &self.panes,
-            &self.tabs,
-            &self.agents,
-            &sessions,
-            &self.remote_agent_entries(),
-        )
-    }
-
-    fn remote_agent_entries(&self) -> Vec<ui::RemoteAgentEntry> {
-        let Some(snapshot) = self.coder_snapshot.as_ref() else {
-            return Vec::new();
-        };
-        let stale = self.coder_snapshot_stale(Instant::now());
-        snapshot
-            .panes
-            .iter()
-            .map(|pane| ui::RemoteAgentEntry {
-                pane_id: pane_id_string(pane.pane_id),
-                label: if stale {
-                    format!("{} · offline", pane.label)
-                } else {
-                    pane.label.clone()
-                },
-                state: if stale {
-                    AgentState::Unknown
-                } else {
-                    run_state_to_detected(pane.status.state)
-                },
-                seen: pane.status.seen,
-                is_active: !stale && pane.focused,
-            })
-            .collect()
+        ui::navigable_targets(&self.panes, &self.tabs, &self.agents, &sessions)
     }
 
     /// Sessions visible in the workspace section. The flock-selector's cold-shell
@@ -1036,13 +828,6 @@ impl State {
             Some(Target::Session(name)) => switch_session(Some(&name)),
             Some(Target::Pane(PaneId::Terminal(id))) => focus_terminal_pane(id, false, false),
             Some(Target::Pane(PaneId::Plugin(id))) => focus_plugin_pane(id, false, false),
-            Some(Target::RemotePane(pane_id)) => {
-                if let Some(identifier) = self.current_coder_workspace() {
-                    let argv = coder::focus_argv(&identifier, &pane_id);
-                    let refs: Vec<&str> = argv.iter().map(String::as_str).collect();
-                    run_command(&refs, BTreeMap::new());
-                }
-            },
             None => {},
         }
     }
@@ -1087,32 +872,16 @@ impl State {
         }
     }
 
-    /// The per-pane agent statuses this session should publish. Legacy
-    /// nested-Flock Coder sessions republish the remote tracker's snapshot
-    /// (their local panes are just the gateway); every other session — native
-    /// remote-agent Coder sessions included — publishes its live tracked panes.
+    /// The per-pane agent statuses this session should publish: every live
+    /// tracked agent pane, Coder remote panes included (their state arrives
+    /// through the forwarded hook channel like any other hook report).
     fn build_publish_states(&self) -> BTreeMap<PaneId, PaneAgentStatus> {
         let mut states = BTreeMap::new();
-        if self.current_coder_session_is_legacy() {
-            if let Some(snapshot) = &self.coder_snapshot {
-                let stale = self.coder_snapshot_stale(Instant::now());
-                for (index, pane) in snapshot.panes.iter().enumerate() {
-                    let mut status = pane.status.clone();
-                    if stale {
-                        status.state = AgentRunState::Unknown;
-                        status.label = format!("{} · offline", status.label);
-                        status.seen = true;
-                    }
-                    states.insert(PaneId::Plugin(u32::MAX - index as u32), status);
-                }
+        for (pane_id, st) in &self.agents {
+            if !st.is_agent() {
+                continue;
             }
-        } else {
-            for (pane_id, st) in &self.agents {
-                if !st.is_agent() {
-                    continue;
-                }
-                states.insert(*pane_id, self.status_to_publish(pane_id, st));
-            }
+            states.insert(*pane_id, self.status_to_publish(pane_id, st));
         }
         states
     }
@@ -1480,9 +1249,6 @@ pub(crate) fn parse_remote_binding(argv: &[String]) -> Option<RemoteBinding> {
     if devcontainer::parse_devcontainer_command(argv).is_some() {
         return Some(RemoteBinding::Devcontainer);
     }
-    if coder::parse_coder_ssh(argv).is_some() {
-        return Some(RemoteBinding::Coder);
-    }
     None
 }
 
@@ -1512,22 +1278,6 @@ fn to_run_state(state: AgentState) -> AgentRunState {
         AgentState::Working => AgentRunState::Working,
         AgentState::Blocked => AgentRunState::Blocked,
         AgentState::Unknown => AgentRunState::Unknown,
-    }
-}
-
-fn run_state_to_detected(state: AgentRunState) -> AgentState {
-    match state {
-        AgentRunState::Idle => AgentState::Idle,
-        AgentRunState::Working => AgentState::Working,
-        AgentRunState::Blocked => AgentState::Blocked,
-        AgentRunState::Unknown => AgentState::Unknown,
-    }
-}
-
-fn pane_id_string(pane_id: PaneId) -> String {
-    match pane_id {
-        PaneId::Terminal(id) => format!("terminal_{id}"),
-        PaneId::Plugin(id) => format!("plugin_{id}"),
     }
 }
 
@@ -1615,7 +1365,7 @@ mod tests {
     #[test]
     fn disabled_remote_bindings_are_not_recognized_or_badged() {
         let mut state = State::default();
-        let command = argv(&["coder", "ssh", "alice/api"]);
+        let command = argv(&["gh", "codespace", "ssh", "-c", "my-cs"]);
         let pane_id = PaneId::Terminal(3);
         state.apply_command_changed(pane_id, &command, true, Instant::now());
         assert!(!state.agents.get(&pane_id).unwrap().remote);
@@ -1629,19 +1379,6 @@ mod tests {
     }
 
     #[test]
-    fn enabled_coder_binding_uses_remote_screen_detection() {
-        let mut state = state_with_provider("coder_enabled");
-        let pane_id = PaneId::Terminal(3);
-        state.apply_command_changed(
-            pane_id,
-            &argv(&["coder", "ssh", "alice/api"]),
-            true,
-            Instant::now(),
-        );
-        assert!(state.agents.get(&pane_id).unwrap().remote);
-    }
-
-    #[test]
     fn typed_coder_binding_keeps_session_visible_and_marks_its_panes_remote() {
         let mut state = state_with_provider("coder_enabled");
         let mut session = SessionInfo::new("wooli-test".into());
@@ -1649,7 +1386,6 @@ mod tests {
         session.remote_backend = Some(RemoteBackend::Coder {
             workspace: "abeljim/wooli-test".into(),
             local_session_id: "wooli-test".into(),
-            legacy: false,
         });
         state.sessions = vec![session];
 
@@ -1680,7 +1416,6 @@ mod tests {
         session.remote_backend = Some(RemoteBackend::Coder {
             workspace: "abeljim/wooli-test".into(),
             local_session_id: "wooli-test".into(),
-            legacy: false,
         });
         state.sessions = vec![session];
 
@@ -1691,59 +1426,10 @@ mod tests {
             Instant::now(),
         );
 
-        assert!(!state.current_coder_session_is_legacy());
         let published = state.build_publish_states();
         let status = published.get(&pane_id).expect("coder pane published");
         assert_eq!(status.state, AgentRunState::Working);
         assert_eq!(status.label, "claude");
-    }
-
-    #[test]
-    fn legacy_coder_session_publishes_snapshot_not_local_agents() {
-        let mut state = state_with_provider("coder_enabled");
-        let mut session = SessionInfo::new("api".into());
-        session.is_current_session = true;
-        session.remote_backend = Some(RemoteBackend::Coder {
-            workspace: "alice/api".into(),
-            local_session_id: "api".into(),
-            legacy: true,
-        });
-        state.sessions = vec![session];
-        // The local gateway pane may be hook-tracked, but a legacy session's
-        // published picture must come from the remote tracker's snapshot.
-        state
-            .agents
-            .entry(PaneId::Terminal(1))
-            .or_default()
-            .set_hook_authority("claude".into(), AgentState::Working, Instant::now());
-
-        assert!(state.current_coder_session_is_legacy());
-        assert!(state.build_publish_states().is_empty());
-
-        state.coder_snapshot = Some(coder::Snapshot {
-            version: 1,
-            generated_at_millis: 42,
-            session: coder::REMOTE_SESSION_NAME.into(),
-            panes: vec![coder::SnapshotPane {
-                pane_id: PaneId::Terminal(7),
-                label: "codex".into(),
-                status: PaneAgentStatus {
-                    state: AgentRunState::Blocked,
-                    label: "codex".into(),
-                    seen: false,
-                },
-                focused: false,
-            }],
-        });
-        state.last_coder_snapshot_received = Some(Instant::now());
-
-        let published = state.build_publish_states();
-        assert_eq!(published.len(), 1);
-        let status = published
-            .get(&PaneId::Plugin(u32::MAX))
-            .expect("snapshot pane");
-        assert_eq!(status.state, AgentRunState::Blocked);
-        assert!(!published.contains_key(&PaneId::Terminal(1)));
     }
 
     #[test]

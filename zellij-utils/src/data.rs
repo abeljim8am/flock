@@ -1934,8 +1934,6 @@ pub enum RemoteBackend {
     Coder {
         workspace: String,
         local_session_id: String,
-        #[serde(default)]
-        legacy: bool,
     },
 }
 

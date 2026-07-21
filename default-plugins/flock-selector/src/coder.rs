@@ -14,14 +14,8 @@ pub const TEMPLATE_LIST_CONTEXT_KEY: &str = "flock_coder_template_list";
 pub const CREATE_CONTEXT_KEY: &str = "flock_coder_create";
 pub const BOOTSTRAP_CONTEXT_KEY: &str = "flock_coder_bootstrap";
 
-pub const GATEWAY_WRAPPER_ARG0: &str = "flock-coder-gateway";
 pub const RELEASE_TAG: &str = "v26.3.0";
 pub const RELEASE_BASE_URL: &str = "https://github.com/abeljim8am/flock/releases/download";
-
-/// The host-side gateway is deliberately an exact argv shape. Both Flock
-/// plugins recognize this as the durable Coder binding, while the shell body
-/// remains an implementation detail that can evolve without changing identity.
-pub const GATEWAY_SCRIPT: &str = r#"trap 'exit 130' INT; trap 'exit 143' TERM; identifier="$1"; while :; do coder ssh -t "$identifier" -- '"$HOME/.local/share/flock/current/flock"' attach --create flock options --default-layout flock-coder-remote; status=$?; [ "$status" -eq 0 ] && exit 0; printf '\nflock: Coder connection lost; retrying in 2s (Ctrl-c to stop)\n' >&2; sleep 2 || exit "$status"; done"#;
 
 const CACHE_PATH: &str = "/data/coder-workspaces.json";
 const FALLBACK_NAME: &str = "coder";
@@ -86,10 +80,6 @@ pub fn list_argv() -> Vec<String> {
 }
 
 #[cfg(test)]
-pub fn ssh_argv(identifier: &str) -> Vec<String> {
-    vec!["coder".into(), "ssh".into(), identifier.into()]
-}
-
 pub fn gateway_argv(identifier: &str) -> Vec<String> {
     remote_pty_argv(identifier, None, None)
 }
@@ -120,15 +110,6 @@ pub fn parse_gateway(argv: &[String]) -> Option<&str> {
                 && coder_pty == "coder-pty" =>
         {
             parse_remote_pty_args(args)
-        },
-        [sh, dash_c, script, arg0, identifier]
-            if sh == "sh"
-                && dash_c == "-c"
-                && script == GATEWAY_SCRIPT
-                && arg0 == GATEWAY_WRAPPER_ARG0
-                && valid_identifier(identifier) =>
-        {
-            Some(identifier)
         },
         _ => None,
     }
@@ -326,17 +307,6 @@ pub fn create_context(name: &str) -> BTreeMap<String, String> {
     BTreeMap::from_iter([(CREATE_CONTEXT_KEY.into(), name.into())])
 }
 
-pub fn parse_coder_ssh(argv: &[String]) -> Option<&str> {
-    match argv {
-        [coder, ssh, identifier]
-            if coder == "coder" && ssh == "ssh" && valid_identifier(identifier) =>
-        {
-            Some(identifier)
-        },
-        _ => parse_gateway(argv),
-    }
-}
-
 fn valid_identifier(identifier: &str) -> bool {
     let mut parts = identifier.split('/');
     parts.next().is_some_and(|part| !part.is_empty())
@@ -355,7 +325,6 @@ pub fn layout_doc_for(
         "provider": "coder",
         "workspace": identifier,
         "local_session_id": "",
-        "legacy": false,
     })
     .to_string();
     let options = format!(
@@ -1081,11 +1050,8 @@ mod tests {
             stop_argv("alice/api"),
             vec!["coder", "stop", "-y", "alice/api"]
         );
-        let ssh = ssh_argv("alice/api");
-        assert_eq!(ssh, vec!["coder", "ssh", "alice/api"]);
-        assert_eq!(parse_coder_ssh(&ssh), Some("alice/api"));
         assert_eq!(
-            parse_coder_ssh(&["coder".into(), "ssh".into(), "api".into()]),
+            parse_gateway(&["coder".into(), "ssh".into(), "alice/api".into()]),
             None
         );
     }
@@ -1180,7 +1146,6 @@ mod tests {
             config.options.remote_backend,
             Some(zellij_tile::prelude::RemoteBackend::Coder {
                 ref workspace,
-                legacy: false,
                 ..
             }) if workspace == "alice/api"
         ));
@@ -1213,7 +1178,6 @@ mod tests {
     fn gateway_binding_and_bootstrap_are_exact_and_safe() {
         let gateway = gateway_argv("alice/api");
         assert_eq!(parse_gateway(&gateway), Some("alice/api"));
-        assert_eq!(parse_coder_ssh(&gateway), Some("alice/api"));
         assert_eq!(gateway[0], "flock");
         assert_eq!(gateway[1], "remote-agent");
         assert_eq!(gateway[2], "coder-pty");
