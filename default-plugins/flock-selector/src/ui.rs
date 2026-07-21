@@ -786,10 +786,7 @@ fn render_ssh_wizard(
             y,
             cols,
             None,
-            &[
-                Span::new(" ✗ ", p.red),
-                Span::new(error.as_str(), p.text),
-            ],
+            &[Span::new(" ✗ ", p.red), Span::new(error.as_str(), p.text)],
         );
         y = y.saturating_sub(1);
     }
@@ -836,12 +833,28 @@ fn render_ssh_wizard(
         y = y.saturating_sub(1);
     }
     if wizard.editing.is_some() && wizard.phase == HostPhase::Destination {
-        render_row(&mut out, 0, y, cols, None, &[
-            Span::new(" editing — changing the destination re-homes the host's remote panes", p.muted).dim(),
-        ]);
+        render_row(
+            &mut out,
+            0,
+            y,
+            cols,
+            None,
+            &[Span::new(
+                " editing — changing the destination re-homes the host's remote panes",
+                p.muted,
+            )
+            .dim()],
+        );
         y = y.saturating_sub(1);
     }
-    render_row(&mut out, 0, y, cols, None, &[Span::new(hint, p.muted).dim()]);
+    render_row(
+        &mut out,
+        0,
+        y,
+        cols,
+        None,
+        &[Span::new(hint, p.muted).dim()],
+    );
     let value = match wizard.phase {
         HostPhase::Name => &wizard.name,
         HostPhase::Destination => &wizard.destination,

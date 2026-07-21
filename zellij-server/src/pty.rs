@@ -1915,8 +1915,7 @@ impl Pty {
         transport: &zellij_utils::remote_session_cleanup::RemoteCloseTransport,
     ) {
         if let Some(pane_uuid) = self.remote_uuid_for_pane(id, transport.identity()) {
-            let _ =
-                zellij_utils::remote_session_cleanup::queue_remote_close(transport, &pane_uuid);
+            let _ = zellij_utils::remote_session_cleanup::queue_remote_close(transport, &pane_uuid);
         }
     }
 

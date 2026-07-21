@@ -1669,7 +1669,10 @@ impl State {
             return false;
         };
         let confirm = key.has_no_modifiers()
-            && matches!(key.bare_key, BareKey::Char('y') | BareKey::Char('Y') | BareKey::Enter);
+            && matches!(
+                key.bare_key,
+                BareKey::Char('y') | BareKey::Char('Y') | BareKey::Enter
+            );
         if confirm {
             self.ssh_hosts.retain(|host| host.name != name);
             ssh::save_hosts(&self.ssh_hosts);

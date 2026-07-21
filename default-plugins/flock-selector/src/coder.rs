@@ -1169,5 +1169,4 @@ mod tests {
         assert!(!debug[2].contains("/workspace/target/debug"));
         assert!(!debug[2].contains("alice/api"));
     }
-
 }

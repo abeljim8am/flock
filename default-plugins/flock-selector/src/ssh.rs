@@ -110,7 +110,11 @@ pub fn rank<'a>(hosts: &'a [SshHost], query: &str) -> Vec<RankedSshHost<'a>> {
     ranked
 }
 
-pub fn remote_pty_argv(host: &SshHost, pane_id: Option<&str>, executable: Option<&str>) -> Vec<String> {
+pub fn remote_pty_argv(
+    host: &SshHost,
+    pane_id: Option<&str>,
+    executable: Option<&str>,
+) -> Vec<String> {
     let mut argv = vec![
         executable.unwrap_or("flock").into(),
         "remote-agent".into(),
@@ -428,7 +432,11 @@ impl HostWizard {
 
 /// Apply a finished wizard: replace the edited entry (matched by its original
 /// name) or append a new one. Returns the updated list for persistence.
-pub fn apply_wizard(hosts: &[SshHost], wizard_result: SshHost, editing: Option<&str>) -> Vec<SshHost> {
+pub fn apply_wizard(
+    hosts: &[SshHost],
+    wizard_result: SshHost,
+    editing: Option<&str>,
+) -> Vec<SshHost> {
     let mut hosts = hosts.to_vec();
     match editing {
         Some(original) => {
@@ -672,7 +680,9 @@ mod tests {
         assert_eq!(ranked.len(), 2);
         let all = rank(&hosts, "");
         assert_eq!(
-            all.iter().map(|entry| entry.host.name.as_str()).collect::<Vec<_>>(),
+            all.iter()
+                .map(|entry| entry.host.name.as_str())
+                .collect::<Vec<_>>(),
             vec!["api", "build", "zeta"]
         );
     }

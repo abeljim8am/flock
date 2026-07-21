@@ -1,6 +1,6 @@
 use super::{
-    remote_backend_from_command, remote_panes_for_backend, screen_thread_main, CopyOptions,
-    Screen, ScreenInstruction,
+    remote_backend_from_command, remote_panes_for_backend, screen_thread_main, CopyOptions, Screen,
+    ScreenInstruction,
 };
 use crate::panes::PaneId;
 use crate::{
@@ -68,7 +68,12 @@ fn restored_coder_pane_keeps_its_saved_remote_uuid() {
 fn remote_pty_argv_recognizer_derives_typed_backends() {
     use zellij_utils::data::RemoteBackend;
 
-    let argv = |words: &[&str]| words.iter().map(|word| word.to_string()).collect::<Vec<_>>();
+    let argv = |words: &[&str]| {
+        words
+            .iter()
+            .map(|word| word.to_string())
+            .collect::<Vec<_>>()
+    };
     assert_eq!(
         remote_backend_from_command(
             Some(&argv(&[
@@ -114,7 +119,10 @@ fn remote_pty_argv_recognizer_derives_typed_backends() {
         })
     );
     assert_eq!(
-        remote_backend_from_command(Some(&argv(&["flock", "remote-agent", "remote-pty"])), "local"),
+        remote_backend_from_command(
+            Some(&argv(&["flock", "remote-agent", "remote-pty"])),
+            "local"
+        ),
         None
     );
     assert_eq!(

@@ -42,7 +42,9 @@ fn main() {
                     pane_id,
                     cwd,
                 } => remote_transport(&provider, workspace, destination, ssh_arg, workspace_folder)
-                    .and_then(|transport| remote_agent::remote_pty(transport, pane_id.as_deref(), cwd)),
+                    .and_then(|transport| {
+                        remote_agent::remote_pty(transport, pane_id.as_deref(), cwd)
+                    }),
                 RemoteAgentCommand::RemoteClose {
                     provider,
                     workspace,
