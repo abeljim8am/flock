@@ -3,11 +3,11 @@
 # managed by flock-sidebar; reinstalling or updating the integration overwrites this file.
 # add custom hooks beside this file instead of editing it.
 # FLOCK_INTEGRATION_ID=claude
-# FLOCK_INTEGRATION_VERSION=2
+# FLOCK_INTEGRATION_VERSION=3
 #
-# Ported from herdr's claude integration hook. Instead of writing herdr's unix
-# socket, it reports the agent's state to the flock-sidebar plugin over a Zellij
-# CLI pipe:
+# Ported from herdr's claude integration hook. The same hook reports through a
+# local Flock pipe or the Coder remote-agent daemon according to
+# FLOCK_STATE_CHANNEL. The local form is:
 #
 #   flock pipe --name flock-state --args 'pane_id=<id>,state=<state>,agent=claude,...'
 #
@@ -42,6 +42,7 @@ action = os.environ.get("FLOCK_ACTION", "")
 pane_id = os.environ.get("FLOCK_PANE_ID")
 flock_executable = os.environ.get("FLOCK_EXECUTABLE")
 hook_input_file = os.environ.get("FLOCK_HOOK_INPUT_FILE")
+state_channel = os.environ.get("FLOCK_STATE_CHANNEL", "")
 
 if not pane_id or not flock_executable:
     raise SystemExit(0)
@@ -66,11 +67,25 @@ if is_subagent and action in ("idle", "release"):
     # Subagent completion must not make the parent pane look done early.
     raise SystemExit(0)
 
-args = f"pane_id={pane_id},state={action},agent=claude,source={source}"
+if state_channel == "remote-agent":
+    command = [
+        flock_executable,
+        "remote-agent",
+        "report-state",
+        "--pane-id",
+        pane_id,
+        "--state",
+        action,
+        "--agent",
+        "claude",
+    ]
+else:
+    args = f"pane_id={pane_id},state={action},agent=claude,source={source}"
+    command = [flock_executable, "pipe", "--name", "flock-state", "--args", args]
 
 try:
     subprocess.run(
-        [flock_executable, "pipe", "--name", "flock-state", "--args", args],
+        command,
         stdin=subprocess.DEVNULL,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,

@@ -172,6 +172,16 @@ pub enum RemoteAgentCommand {
         #[clap(long, value_parser)]
         pane_id: String,
     },
+    /// Report an agent state transition to the remote PTY daemon.
+    #[clap(name = "report-state", hide = true)]
+    ReportState {
+        #[clap(long, value_parser)]
+        pane_id: String,
+        #[clap(long, value_parser)]
+        state: String,
+        #[clap(long, value_parser)]
+        agent: String,
+    },
 }
 
 #[derive(Debug, Parser, Clone, Serialize, Deserialize)]
@@ -1722,6 +1732,32 @@ mod tests {
             Some(Command::Subscribe(s)) => s,
             other => panic!("Expected Subscribe, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn parses_remote_agent_state_report() {
+        let cli = CliArgs::try_parse_from([
+            "flock",
+            "remote-agent",
+            "report-state",
+            "--pane-id",
+            "00000000-0000-4000-a000-000000000001",
+            "--state",
+            "blocked",
+            "--agent",
+            "opencode",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Command::RemoteAgent(RemoteAgentCommand::ReportState {
+                pane_id,
+                state,
+                agent,
+            })) if pane_id == "00000000-0000-4000-a000-000000000001"
+                && state == "blocked"
+                && agent == "opencode"
+        ));
     }
 
     #[test]

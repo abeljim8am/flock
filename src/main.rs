@@ -41,6 +41,11 @@ fn main() {
                 RemoteAgentCommand::CoderClose { workspace, pane_id } => {
                     remote_agent::coder_close(&workspace, &pane_id)
                 },
+                RemoteAgentCommand::ReportState {
+                    pane_id,
+                    state,
+                    agent,
+                } => remote_agent::report_state(&pane_id, &state, &agent, None),
             };
             if let Err(error) = result {
                 eprintln!("flock remote-agent: {error:#}");

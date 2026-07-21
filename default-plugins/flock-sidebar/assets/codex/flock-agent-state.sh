@@ -3,12 +3,12 @@
 # managed by flock-sidebar; reinstalling or updating the integration overwrites this file.
 # add custom hooks beside this file instead of editing it.
 # FLOCK_INTEGRATION_ID=codex
-# FLOCK_INTEGRATION_VERSION=2
+# FLOCK_INTEGRATION_VERSION=3
 #
-# Ported from herdr's codex integration hook. Instead of writing herdr's unix
-# socket, it reports the agent's state to the flock-sidebar plugin over a Zellij
-# CLI pipe. Codex carries no subagent frames, so no stdin parsing is needed and
-# this stays pure shell.
+# Ported from herdr's codex integration hook. The same hook reports through a
+# local Flock pipe or the Coder remote-agent daemon according to
+# FLOCK_STATE_CHANNEL. Codex carries no subagent frames, so no stdin parsing is
+# needed and this stays pure shell.
 
 set -eu
 
@@ -27,9 +27,15 @@ esac
 flock_executable="${FLOCK_EXECUTABLE:-}"
 [ -n "$flock_executable" ] && [ -x "$flock_executable" ] || exit 0
 
-"$flock_executable" pipe --name flock-state \
-  --args "pane_id=${FLOCK_PANE_ID},state=${action},agent=codex,source=flock:codex" \
-  </dev/null >/dev/null 2>&1 &
+if [ "${FLOCK_STATE_CHANNEL:-}" = "remote-agent" ]; then
+  set -- "$flock_executable" remote-agent report-state \
+    --pane-id "$FLOCK_PANE_ID" --state "$action" --agent codex
+else
+  set -- "$flock_executable" pipe --name flock-state \
+    --args "pane_id=${FLOCK_PANE_ID},state=${action},agent=codex,source=flock:codex"
+fi
+
+"$@" </dev/null >/dev/null 2>&1 &
 pipe_pid=$!
 (sleep 2; kill "$pipe_pid" 2>/dev/null || true) &
 watchdog_pid=$!

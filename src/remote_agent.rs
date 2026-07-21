@@ -23,7 +23,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 use uuid::Uuid;
 
-pub const PROTOCOL_VERSION: u16 = 1;
+pub const PROTOCOL_VERSION: u16 = 2;
 const MAX_FRAME_BYTES: usize = 16 * 1024 * 1024;
 const HISTORY_LIMIT_BYTES: usize = 4 * 1024 * 1024;
 
@@ -72,6 +72,50 @@ pub enum ClientMessage {
     ClosePane {
         pane_id: Uuid,
     },
+    ReportAgentState {
+        pane_id: Uuid,
+        state: RemoteAgentRunState,
+        agent: String,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RemoteAgentRunState {
+    Working,
+    Idle,
+    Blocked,
+    Release,
+}
+
+impl RemoteAgentRunState {
+    fn parse(value: &str) -> Result<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "working" => Ok(Self::Working),
+            "idle" => Ok(Self::Idle),
+            "blocked" => Ok(Self::Blocked),
+            "release" => Ok(Self::Release),
+            _ => {
+                bail!("invalid agent state {value:?}; expected working, idle, blocked, or release")
+            },
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Working => "working",
+            Self::Idle => "idle",
+            Self::Blocked => "blocked",
+            Self::Release => "release",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RemoteAgentStateEvent {
+    pub pane_id: Uuid,
+    pub state: RemoteAgentRunState,
+    pub agent: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -114,6 +158,12 @@ pub enum ServerMessage {
     PaneClosed {
         pane_id: Uuid,
     },
+    AgentStateChanged {
+        event: RemoteAgentStateEvent,
+    },
+    AgentStateAccepted {
+        pane_id: Uuid,
+    },
 }
 
 #[derive(Clone)]
@@ -130,6 +180,7 @@ struct PaneState {
     history_bytes: Mutex<usize>,
     next_sequence: Mutex<u64>,
     subscribers: Mutex<Vec<mpsc::Sender<ServerMessage>>>,
+    latest_agent_state: Mutex<Option<RemoteAgentStateEvent>>,
     exit_status: Mutex<Option<Option<i32>>>,
 }
 
@@ -199,8 +250,18 @@ impl PaneState {
             pane_id: self.id,
             next_sequence: *next_sequence,
         })?;
+        if let Some(event) = self.latest_agent_state.lock().unwrap().clone() {
+            tx.send(ServerMessage::AgentStateChanged { event })?;
+        }
         subscribers.push(tx.clone());
         Ok(())
+    }
+
+    fn record_agent_state(&self, event: RemoteAgentStateEvent) {
+        let mut subscribers = self.subscribers.lock().unwrap();
+        *self.latest_agent_state.lock().unwrap() = Some(event.clone());
+        let message = ServerMessage::AgentStateChanged { event };
+        subscribers.retain(|subscriber| subscriber.send(message.clone()).is_ok());
     }
 }
 
@@ -459,6 +520,7 @@ pub fn coder_pty(workspace: &str, pane_id: Option<&str>, cwd: Option<PathBuf>) -
             ))?
         },
     };
+    let agent_state_tx = start_local_agent_state_forwarder();
     let input_router = Arc::new(InputRouter::new(pane_id));
     let stdin_router = input_router.clone();
     thread::spawn(move || {
@@ -491,6 +553,7 @@ pub fn coder_pty(workspace: &str, pane_id: Option<&str>, cwd: Option<PathBuf>) -
             &cursor_path,
             cwd.as_deref(),
             input_router.clone(),
+            agent_state_tx.as_ref(),
         ) {
             Ok(TransportEnd::Exited(status)) => {
                 persist_connection(&cursor_path, "disconnected")?;
@@ -511,6 +574,63 @@ pub fn coder_pty(workspace: &str, pane_id: Option<&str>, cwd: Option<PathBuf>) -
         thread::sleep(delay);
         delay = (delay * 2).min(Duration::from_secs(5));
     }
+}
+
+/// Submit one integration hook event to the per-user daemon. This command runs
+/// inside the remote workspace and exits only after the daemon has retained the
+/// event, so a short-lived hook cannot race its own process exit.
+pub fn report_state(
+    pane_id: &str,
+    state: &str,
+    agent: &str,
+    socket: Option<PathBuf>,
+) -> Result<()> {
+    let pane_id = Uuid::parse_str(pane_id).context("invalid pane UUID")?;
+    let state = RemoteAgentRunState::parse(state)?;
+    validate_agent_label(agent)?;
+    let socket = socket.unwrap_or(default_socket_path()?);
+    let mut stream = UnixStream::connect(&socket)
+        .with_context(|| format!("connect to remote-agent at {}", socket.display()))?;
+    let mut reader = stream.try_clone()?;
+    write_frame(
+        &mut stream,
+        &ClientMessage::Hello {
+            protocol: PROTOCOL_VERSION,
+            client_version: env!("CARGO_PKG_VERSION").into(),
+        },
+    )?;
+    match read_frame::<_, ServerMessage>(&mut reader)? {
+        ServerMessage::Hello {
+            protocol: PROTOCOL_VERSION,
+            ..
+        } => {},
+        ServerMessage::Error { message } => bail!("{message}"),
+        response => bail!("unexpected report-state handshake: {response:?}"),
+    }
+    write_frame(
+        &mut stream,
+        &ClientMessage::ReportAgentState {
+            pane_id,
+            state,
+            agent: agent.to_owned(),
+        },
+    )?;
+    loop {
+        match read_frame::<_, ServerMessage>(&mut reader)? {
+            ServerMessage::AgentStateAccepted { pane_id: accepted } if accepted == pane_id => {
+                return Ok(())
+            },
+            ServerMessage::Error { message } => bail!("{message}"),
+            _ => {},
+        }
+    }
+}
+
+fn validate_agent_label(agent: &str) -> Result<()> {
+    if agent.trim().is_empty() || agent.contains([',', '=']) {
+        bail!("agent label must be non-empty and cannot contain ',' or '='");
+    }
+    Ok(())
 }
 
 pub fn coder_close(workspace: &str, pane_id: &str) -> Result<()> {
@@ -657,6 +777,7 @@ fn run_coder_transport(
     cursor_path: &Path,
     cwd: Option<&Path>,
     input_router: Arc<InputRouter>,
+    agent_state_tx: Option<&mpsc::Sender<RemoteAgentStateEvent>>,
 ) -> Result<TransportEnd> {
     let remote = r#"exec "$HOME/.local/share/flock/current/flock" remote-agent connect"#;
     let mut child = Command::new("coder")
@@ -759,6 +880,11 @@ fn run_coder_transport(
             ServerMessage::Exited { status, .. } => {
                 return Ok(TransportEnd::Exited(status));
             },
+            ServerMessage::AgentStateChanged { event } if event.pane_id == pane_id => {
+                if let Some(agent_state_tx) = agent_state_tx {
+                    let _ = agent_state_tx.send(event);
+                }
+            },
             _ => {},
         }
     }
@@ -838,6 +964,11 @@ fn run_coder_transport(
                     persist_cwd(cursor_path, &cwd)?;
                 }
             },
+            Ok(ServerMessage::AgentStateChanged { event }) if event.pane_id == pane_id => {
+                if let Some(agent_state_tx) = agent_state_tx {
+                    let _ = agent_state_tx.send(event);
+                }
+            },
             Ok(ServerMessage::Error { message }) => bail!("{message}"),
             Ok(_) => {},
             Err(_) => {
@@ -896,6 +1027,61 @@ fn persist_connection(cursor_path: &Path, state: &str) -> Result<()> {
     fs::create_dir_all(parent)?;
     fs::write(path, state)?;
     Ok(())
+}
+
+fn start_local_agent_state_forwarder() -> Option<mpsc::Sender<RemoteAgentStateEvent>> {
+    let pane_id = std::env::var("FLOCK_PANE_ID").ok()?;
+    pane_id.parse::<u32>().ok()?;
+    let executable = std::env::var_os("FLOCK_EXECUTABLE")
+        .map(PathBuf::from)
+        .or_else(|| std::env::current_exe().ok())?;
+    let (tx, rx) = mpsc::channel::<RemoteAgentStateEvent>();
+    thread::spawn(move || {
+        for event in rx {
+            if let Err(error) = forward_agent_state_to_local_plugin(&executable, &pane_id, &event) {
+                eprintln!("flock: failed to forward remote agent state: {error:#}");
+            }
+        }
+    });
+    Some(tx)
+}
+
+fn local_agent_state_args(pane_id: &str, event: &RemoteAgentStateEvent) -> String {
+    format!(
+        "pane_id={pane_id},state={},agent={},source=flock:coder-remote",
+        event.state.as_str(),
+        event.agent
+    )
+}
+
+fn forward_agent_state_to_local_plugin(
+    executable: &Path,
+    pane_id: &str,
+    event: &RemoteAgentStateEvent,
+) -> Result<()> {
+    let args = local_agent_state_args(pane_id, event);
+    let mut child = Command::new(executable)
+        .args(["pipe", "--name", "flock-state", "--args", &args])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .context("start local flock-state publisher")?;
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        if let Some(status) = child.try_wait()? {
+            if status.success() {
+                return Ok(());
+            }
+            bail!("local flock-state publisher exited with {status}");
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            bail!("local flock-state publisher timed out");
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
 }
 
 fn minimal_terminal_env() -> HashMap<String, String> {
@@ -1059,6 +1245,27 @@ fn handle_client(stream: UnixStream, panes: Panes) -> Result<()> {
                     tx.send(ServerMessage::PaneClosed { pane_id })?;
                 }
             },
+            ClientMessage::ReportAgentState {
+                pane_id,
+                state,
+                agent,
+            } => {
+                if let Err(error) = validate_agent_label(&agent) {
+                    tx.send(ServerMessage::Error {
+                        message: error.to_string(),
+                    })?;
+                    continue;
+                }
+                with_pane(&panes, pane_id, &tx, |pane| {
+                    pane.record_agent_state(RemoteAgentStateEvent {
+                        pane_id,
+                        state,
+                        agent,
+                    });
+                    tx.send(ServerMessage::AgentStateAccepted { pane_id })?;
+                    Ok(())
+                })?
+            },
         }
     }
     drop(tx);
@@ -1126,6 +1333,7 @@ fn spawn_pane_with_shell(
     let mut command = Command::new(&shell);
     command.arg("-l");
     command.envs(env.into_iter().filter(|(key, _)| allowed_env(key)));
+    command.envs(controlled_remote_pane_env(id)?);
     if let Some(cwd) = cwd.filter(|cwd| cwd.is_dir()) {
         command.current_dir(cwd);
     }
@@ -1160,6 +1368,7 @@ fn spawn_pane_with_shell(
         history_bytes: Mutex::new(0),
         next_sequence: Mutex::new(1),
         subscribers: Mutex::new(Vec::new()),
+        latest_agent_state: Mutex::new(None),
         exit_status: Mutex::new(None),
     }))
 }
@@ -1168,6 +1377,18 @@ use std::os::unix::process::CommandExt;
 
 fn allowed_env(key: &str) -> bool {
     matches!(key, "TERM" | "COLORTERM" | "LANG" | "LC_ALL" | "LC_CTYPE")
+}
+
+fn controlled_remote_pane_env(id: Uuid) -> Result<HashMap<String, String>> {
+    let executable = std::env::current_exe()
+        .context("resolve remote Flock executable")?
+        .to_string_lossy()
+        .into_owned();
+    Ok(HashMap::from_iter([
+        ("FLOCK_PANE_ID".into(), id.to_string()),
+        ("FLOCK_STATE_CHANNEL".into(), "remote-agent".into()),
+        ("FLOCK_EXECUTABLE".into(), executable),
+    ]))
 }
 
 fn start_pane_threads(pane: Arc<PaneState>) {
@@ -1280,7 +1501,7 @@ mod tests {
     #[test]
     fn frames_round_trip_and_reject_malformed_lengths() {
         let message = ClientMessage::Hello {
-            protocol: 1,
+            protocol: PROTOCOL_VERSION,
             client_version: "26.0.0".into(),
         };
         let mut bytes = Vec::new();
@@ -1291,6 +1512,20 @@ mod tests {
         );
         assert!(read_frame::<_, ClientMessage>(&mut [0, 0, 0, 0].as_slice()).is_err());
         assert!(read_frame::<_, ClientMessage>(&mut u32::MAX.to_be_bytes().as_slice()).is_err());
+
+        let state_message = ServerMessage::AgentStateChanged {
+            event: RemoteAgentStateEvent {
+                pane_id: Uuid::new_v4(),
+                state: RemoteAgentRunState::Working,
+                agent: "opencode".into(),
+            },
+        };
+        let mut state_bytes = Vec::new();
+        write_frame(&mut state_bytes, &state_message).unwrap();
+        assert_eq!(
+            read_frame::<_, ServerMessage>(&mut state_bytes.as_slice()).unwrap(),
+            state_message
+        );
     }
 
     #[test]
@@ -1308,6 +1543,7 @@ mod tests {
             history_bytes: Mutex::new(0),
             next_sequence: Mutex::new(1),
             subscribers: Mutex::new(Vec::new()),
+            latest_agent_state: Mutex::new(None),
             exit_status: Mutex::new(None),
         };
         pane.record_output(vec![1; HISTORY_LIMIT_BYTES]);
@@ -1332,6 +1568,7 @@ mod tests {
             history_bytes: Mutex::new(0),
             next_sequence: Mutex::new(1),
             subscribers: Mutex::new(Vec::new()),
+            latest_agent_state: Mutex::new(None),
             exit_status: Mutex::new(None),
         };
         pane.record_output(b"replay".to_vec());
@@ -1356,6 +1593,155 @@ mod tests {
             ServerMessage::Output { sequence: 2, data, .. } if data == b"live"
         ));
         assert_eq!(messages.len(), 3);
+    }
+
+    #[test]
+    fn latest_agent_state_and_release_are_replayed_after_attach() {
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open("/dev/null")
+            .unwrap();
+        let pane_id = Uuid::new_v4();
+        let pane = PaneState {
+            id: pane_id,
+            pid: 1,
+            master: Mutex::new(file),
+            history: Mutex::new(VecDeque::new()),
+            history_bytes: Mutex::new(0),
+            next_sequence: Mutex::new(1),
+            subscribers: Mutex::new(Vec::new()),
+            latest_agent_state: Mutex::new(None),
+            exit_status: Mutex::new(None),
+        };
+        pane.record_agent_state(RemoteAgentStateEvent {
+            pane_id,
+            state: RemoteAgentRunState::Working,
+            agent: "opencode".into(),
+        });
+        pane.record_agent_state(RemoteAgentStateEvent {
+            pane_id,
+            state: RemoteAgentRunState::Release,
+            agent: "opencode".into(),
+        });
+        let (tx, rx) = mpsc::channel();
+        pane.subscribe_with_replay(0, &tx).unwrap();
+        let messages: Vec<_> = rx.try_iter().collect();
+        assert!(matches!(messages[0], ServerMessage::Attached { .. }));
+        assert!(matches!(
+            &messages[1],
+            ServerMessage::AgentStateChanged {
+                event: RemoteAgentStateEvent {
+                    state: RemoteAgentRunState::Release,
+                    agent,
+                    ..
+                }
+            } if agent == "opencode"
+        ));
+    }
+
+    #[test]
+    fn daemon_acknowledges_and_broadcasts_agent_state_reports() {
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open("/dev/null")
+            .unwrap();
+        let pane_id = Uuid::new_v4();
+        let pane = Arc::new(PaneState {
+            id: pane_id,
+            pid: 1,
+            master: Mutex::new(file),
+            history: Mutex::new(VecDeque::new()),
+            history_bytes: Mutex::new(0),
+            next_sequence: Mutex::new(1),
+            subscribers: Mutex::new(Vec::new()),
+            latest_agent_state: Mutex::new(None),
+            exit_status: Mutex::new(None),
+        });
+        let panes = Arc::new(Mutex::new(HashMap::from_iter([(pane_id, pane.clone())])));
+        let (mut client, server) = UnixStream::pair().unwrap();
+        let daemon = thread::spawn(move || handle_client(server, panes));
+        let mut reader = client.try_clone().unwrap();
+        write_frame(
+            &mut client,
+            &ClientMessage::Hello {
+                protocol: PROTOCOL_VERSION,
+                client_version: "test".into(),
+            },
+        )
+        .unwrap();
+        assert!(matches!(
+            read_frame::<_, ServerMessage>(&mut reader).unwrap(),
+            ServerMessage::Hello {
+                protocol: PROTOCOL_VERSION,
+                ..
+            }
+        ));
+        let (subscriber_tx, subscriber_rx) = mpsc::channel();
+        pane.subscribers.lock().unwrap().push(subscriber_tx);
+        write_frame(
+            &mut client,
+            &ClientMessage::ReportAgentState {
+                pane_id,
+                state: RemoteAgentRunState::Blocked,
+                agent: "claude".into(),
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            read_frame::<_, ServerMessage>(&mut reader).unwrap(),
+            ServerMessage::AgentStateAccepted { pane_id }
+        );
+        assert!(matches!(
+            subscriber_rx.recv_timeout(Duration::from_secs(1)).unwrap(),
+            ServerMessage::AgentStateChanged {
+                event: RemoteAgentStateEvent {
+                    state: RemoteAgentRunState::Blocked,
+                    ref agent,
+                    ..
+                }
+            } if agent == "claude"
+        ));
+        client.shutdown(Shutdown::Both).unwrap();
+        daemon.join().unwrap().unwrap();
+    }
+
+    #[test]
+    fn agent_state_values_and_local_pipe_args_are_stable() {
+        assert_eq!(
+            RemoteAgentRunState::parse("BLOCKED").unwrap(),
+            RemoteAgentRunState::Blocked
+        );
+        assert!(RemoteAgentRunState::parse("unknown").is_err());
+        assert!(validate_agent_label("").is_err());
+        assert!(validate_agent_label("bad,label").is_err());
+        let event = RemoteAgentStateEvent {
+            pane_id: Uuid::new_v4(),
+            state: RemoteAgentRunState::Idle,
+            agent: "opencode".into(),
+        };
+        assert_eq!(
+            local_agent_state_args("7", &event),
+            "pane_id=7,state=idle,agent=opencode,source=flock:coder-remote"
+        );
+    }
+
+    #[test]
+    fn bundled_integrations_use_one_asset_with_runtime_transport_selection() {
+        let opencode =
+            include_str!("../default-plugins/flock-sidebar/assets/opencode/flock-agent-state.js");
+        let codex =
+            include_str!("../default-plugins/flock-sidebar/assets/codex/flock-agent-state.sh");
+        let claude =
+            include_str!("../default-plugins/flock-sidebar/assets/claude/flock-agent-state.sh");
+        for integration in [opencode, codex, claude] {
+            assert!(integration.contains("FLOCK_STATE_CHANNEL"));
+            assert!(integration.contains("remote-agent"));
+            assert!(integration.contains("report-state"));
+            assert!(integration.contains("flock-state"));
+        }
+        assert!(opencode.contains("useFileChannel"));
     }
 
     #[test]
@@ -1505,6 +1891,20 @@ mod tests {
         assert!(allowed_env("LANG"));
         assert!(!allowed_env("ZELLIJ_CONFIG_DIR"));
         assert!(!allowed_env("HOME"));
+        assert!(!allowed_env("FLOCK_PANE_ID"));
+        assert!(!allowed_env("FLOCK_EXECUTABLE"));
+        assert!(!allowed_env("FLOCK_STATE_CHANNEL"));
+
+        let pane_id = Uuid::new_v4();
+        let controlled = controlled_remote_pane_env(pane_id).unwrap();
+        assert_eq!(controlled.get("FLOCK_PANE_ID"), Some(&pane_id.to_string()));
+        assert_eq!(
+            controlled.get("FLOCK_STATE_CHANNEL").map(String::as_str),
+            Some("remote-agent")
+        );
+        assert!(controlled
+            .get("FLOCK_EXECUTABLE")
+            .is_some_and(|executable| !executable.is_empty()));
     }
 
     #[test]
