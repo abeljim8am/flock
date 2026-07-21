@@ -110,7 +110,11 @@ session is reopened, deleted, or the Coder workspace stops.
 Agent hook integrations live in
 [`default-plugins/flock-sidebar/assets`](default-plugins/flock-sidebar/assets).
 They improve accuracy, but are optional because Flock can detect state from pane
-content and foreground processes.
+content and foreground processes. Each integration is universal: the same
+OpenCode plugin or Codex/Claude hook selects the local pipe, devcontainer file
+bridge, or Coder remote-agent transport from `FLOCK_STATE_CHANNEL`. Install the
+same integration versions in Coder workspaces through your dotfiles or agent
+configuration; Flock does not rewrite those configurations automatically.
 
 ## Credits and license
 

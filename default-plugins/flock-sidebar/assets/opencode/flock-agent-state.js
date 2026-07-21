@@ -2,7 +2,7 @@
 // managed by flock-sidebar; reinstalling or updating the integration overwrites this file.
 // add custom hooks/plugins beside this file instead of editing it.
 // FLOCK_INTEGRATION_ID=opencode
-// FLOCK_INTEGRATION_VERSION=4
+// FLOCK_INTEGRATION_VERSION=5
 //
 // Ported from herdr's opencode integration plugin (herdr-agent-state.js,
 // HERDR_INTEGRATION_VERSION=8). Instead of writing herdr's unix socket, it
@@ -25,6 +25,8 @@
 // which flock-sidebar polls from the host via `docker exec … cat`. For older
 // wrappers without the marker, a failed `zellij pipe` delivery switches the
 // plugin to the file channel. Locally the successful pipe remains the channel.
+// v5 adds the Coder remote-agent channel. The same plugin file is used in every
+// environment; FLOCK_STATE_CHANNEL selects the transport at runtime.
 
 import { spawn } from "node:child_process";
 import { mkdirSync, writeFileSync, renameSync } from "node:fs";
@@ -44,6 +46,8 @@ const STATE_DIR = "/tmp/flock-state";
 const fileChannelRequested =
   process.env.FLOCK_STATE_CHANNEL?.trim().toLowerCase() === "file" ||
   Boolean(process.env.REMOTE_CONTAINERS || process.env.DEVCONTAINER);
+const remoteAgentRequested =
+  process.env.FLOCK_STATE_CHANNEL?.trim().toLowerCase() === "remote-agent";
 const fileFallbackAllowed = !process.env.FLOCK_SESSION_NAME;
 let useFileChannel = fileChannelRequested;
 
@@ -108,6 +112,41 @@ function reportState(state) {
   if (useFileChannel) {
     writeStateFile(paneId, state);
     return Promise.resolve();
+  }
+
+  if (remoteAgentRequested) {
+    const flockExecutable = process.env.FLOCK_EXECUTABLE;
+    if (!flockExecutable) {
+      return Promise.resolve();
+    }
+    return new Promise((resolve) => {
+      let settled = false;
+      const finish = () => {
+        if (settled) return;
+        settled = true;
+        resolve();
+      };
+      try {
+        const child = spawn(
+          flockExecutable,
+          [
+            "remote-agent",
+            "report-state",
+            "--pane-id",
+            paneId,
+            "--state",
+            state,
+            "--agent",
+            AGENT,
+          ],
+          { stdio: "ignore", timeout: 2000 },
+        );
+        child.once("error", finish);
+        child.once("exit", finish);
+      } catch {
+        finish();
+      }
+    });
   }
 
   const args = `pane_id=${paneId},state=${state},agent=${AGENT},source=${SOURCE}`;
