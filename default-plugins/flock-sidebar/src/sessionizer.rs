@@ -16,6 +16,7 @@ pub struct SessionizerConfig {
     codespaces_enabled: bool,
     devcontainers_enabled: bool,
     coder_enabled: bool,
+    ssh_enabled: bool,
 }
 
 impl SessionizerConfig {
@@ -31,6 +32,7 @@ impl SessionizerConfig {
             codespaces_enabled: enabled(config.get("codespaces_enabled")),
             devcontainers_enabled: enabled(config.get("devcontainers_enabled")),
             coder_enabled: enabled(config.get("coder_enabled")),
+            ssh_enabled: enabled(config.get("ssh_enabled")),
         }
     }
 
@@ -44,6 +46,10 @@ impl SessionizerConfig {
 
     pub fn coder_enabled(&self) -> bool {
         self.coder_enabled
+    }
+
+    pub fn ssh_enabled(&self) -> bool {
+        self.ssh_enabled
     }
 
     pub fn is_configured(&self) -> bool {

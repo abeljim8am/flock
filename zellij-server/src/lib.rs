@@ -357,11 +357,11 @@ fn host_cwd_for_remote_backend(
     remote_backend: Option<&RemoteBackend>,
     cwd: Option<PathBuf>,
 ) -> Option<PathBuf> {
-    if matches!(remote_backend, Some(RemoteBackend::Coder { .. })) {
-        // Host paths have no meaning inside a Coder workspace. Leaving the
-        // initial cwd unset gives the remote shell the same startup directory
-        // as a normal Coder SSH session. Explicit/inherited remote pane paths
-        // are attached later by the PTY layer and remain unaffected.
+    if remote_backend.is_some() {
+        // Host paths have no meaning on the remote side of any provider
+        // binding. Leaving the initial cwd unset gives the remote shell its
+        // normal startup directory. Explicit/inherited remote pane paths are
+        // attached later by the PTY layer and remain unaffected.
         None
     } else {
         cwd
@@ -393,11 +393,8 @@ pub(crate) struct SessionMetaData {
 }
 
 impl SessionMetaData {
-    fn flush_coder_resurrection_state(&self) {
-        if !matches!(
-            self.session_remote_backend.as_ref(),
-            Some(RemoteBackend::Coder { .. })
-        ) {
+    fn flush_remote_resurrection_state(&self) {
+        if self.session_remote_backend.is_none() {
             return;
         }
         let (completion_tx, completion_rx) = oneshot::channel();
@@ -1468,7 +1465,7 @@ pub fn start_server(mut os_input: Box<dyn ServerOsApi>, socket_path: PathBuf) {
             },
             ServerInstruction::KillSession => {
                 if let Some(session_data) = session_data.read().unwrap().as_ref() {
-                    session_data.flush_coder_resurrection_state();
+                    session_data.flush_remote_resurrection_state();
                 }
                 let client_ids = session_state.read().unwrap().client_ids();
                 for client_id in client_ids {

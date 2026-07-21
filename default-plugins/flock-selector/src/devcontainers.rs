@@ -1,22 +1,18 @@
-//! Devcontainer support: the binding wrapper + recognizer, `devcontainer` argv
-//! builders, `.devcontainer` marker scanning, error classification, and the
-//! prompt/starting UI state.
+//! Devcontainer support: the remote-agent binding + recognizer,
+//! `devcontainer` argv builders, `.devcontainer` marker scanning, error
+//! classification, and the prompt/starting/bootstrapping UI state.
 //!
-//! A devcontainer binds 1:1 to a zellij session the same way a codespace does
-//! (see [`crate::codespaces`]): the session is created from a generated
-//! stringified layout whose embedded options set `default_command` to a
-//! wrapper that starts (idempotently) and execs into the folder's container,
-//! plus `session_serialization false` so a dead bound session is never
-//! resurrected. The picker runs `devcontainer up` ONCE before creating the
-//! session — that serializes the only racy step (container creation/build);
-//! every pane's wrapper `up` after that is a cheap start/attach that also
-//! revives a container stopped behind the session's back.
-//!
-//! The binding argv is `["sh", "-c", WRAPPER_SCRIPT, WRAPPER_ARG0, <path>]`:
-//! the script text is a constant and the workspace folder travels as the
-//! positional `$1`, so no quoting of the path ever happens and the recognizer
-//! ([`parse_devcontainer_command`]) is an exact match, like
-//! [`crate::codespaces::parse_codespace_ssh`].
+//! A devcontainer binds 1:1 to a zellij session on the remote-agent
+//! architecture (see [`crate::coder`] and [`crate::ssh`]): the session is
+//! created from a generated stringified layout whose embedded options set
+//! `default_command` to the unified `remote-pty --provider devcontainer`
+//! bridge and carry the typed `remote_backend`, with session serialization ON
+//! — panes are persistent PTYs owned by the in-container daemon, so a bound
+//! session resurrects and reattaches by stable UUID. The picker runs
+//! `devcontainer up` ONCE before creating the session (serializing the only
+//! racy step: container creation/build) and then bootstraps the flock binary
+//! into the container; the bridge's reconnect loop re-runs `up` on failure,
+//! reviving containers stopped behind the session's back.
 //!
 //! Everything here is pure (no host calls) so it unit-tests without a plugin
 //! host; [`crate::State`] wires the argv builders into `run_command` and routes
@@ -25,12 +21,15 @@
 use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 
-use crate::codespaces::layout_doc_with_binding;
 use crate::config::normalize;
+use crate::remote_bootstrap;
 
 /// Context key tagging a `devcontainer up` RunCommandResult; its value is the
 /// (normalized) workspace folder the up was fired for.
 pub const UP_CONTEXT_KEY: &str = "flock_devcontainer_up";
+/// Context key tagging an in-container flock bootstrap RunCommandResult; its
+/// value is the (normalized) workspace folder.
+pub const BOOTSTRAP_CONTEXT_KEY: &str = "flock_devcontainer_bootstrap";
 /// Context key tagging a `.devcontainer` marker scan; its value is the scan
 /// scope ([`SCAN_SCOPE_ROOTS`] or [`SCAN_SCOPE_INDIVIDUAL`]).
 pub const SCAN_CONTEXT_KEY: &str = "flock_devcontainer_scan";
@@ -39,61 +38,118 @@ pub const SCAN_SCOPE_ROOTS: &str = "roots";
 /// Scan-scope value: markers directly inside each individual dir.
 pub const SCAN_SCOPE_INDIVIDUAL: &str = "individual";
 
-/// `$0` of the wrapper — a marker naming the binding so the recognizer can't
-/// mistake an arbitrary user `sh -c` for ours.
-///
-/// The wrapper shape is duplicated in `flock-sidebar/src/devcontainer.rs`
-/// (plugins share no crate — see the `normalize` precedent in `config.rs`);
-/// the two must stay in sync.
-pub const WRAPPER_ARG0: &str = "flock-devcontainer";
-
-/// The constant wrapper script every pane in a bound session runs. `$1` is the
-/// workspace folder (see [`wrapper_argv`]) — passed positionally so the script
-/// text never embeds the path. `up` is idempotent: with the container already
-/// created (the picker guarantees that before the session exists) it is a fast
-/// start/attach, and it revives a container stopped behind the session's back.
-/// Its stdout is silenced (a JSON success line per pane is noise); stderr is
-/// kept so a real failure prints before the pane closes. Before entering the
-/// container it copies the host's managed OpenCode state plugin into the
-/// remote user's config when that plugin exists. The final exec forwards the
-/// pane id and explicitly selects Flock's file bridge; the inner single-quoted
-/// `sh -c` runs in the container, where `${SHELL}` (set by the devcontainer
-/// CLI's userEnvProbe when available) picks the login shell.
-///
-/// Duplicated in `flock-sidebar/src/devcontainer.rs`; keep in sync.
-pub const WRAPPER_SCRIPT: &str = r#"devcontainer up --workspace-folder "$1" >/dev/null || exit $?; hook="${XDG_CONFIG_HOME:-$HOME/.config}/opencode/plugins/flock-agent-state.js"; if [ -r "$hook" ]; then devcontainer exec --workspace-folder "$1" sh -c 'dir="${XDG_CONFIG_HOME:-$HOME/.config}/opencode/plugins"; mkdir -p "$dir" || exit 1; tmp="$dir/.flock-agent-state.js.tmp.$$"; cat >"$tmp" || exit 1; if cmp -s "$tmp" "$dir/flock-agent-state.js"; then rm -f "$tmp"; else mv -f "$tmp" "$dir/flock-agent-state.js"; fi' <"$hook" || printf '%s\n' 'flock: warning: could not install the OpenCode state plugin in the devcontainer' >&2; fi; exec devcontainer exec --workspace-folder "$1" --remote-env FLOCK_PANE_ID="$FLOCK_PANE_ID" --remote-env FLOCK_STATE_CHANNEL=file sh -c 'exec "${SHELL:-sh}" -l'"#;
-
 /// The binding argv: what every pane in a bound session runs. Single source of
-/// truth for the shape [`parse_devcontainer_command`] recognizes.
-pub fn wrapper_argv(workspace_folder: &Path) -> Vec<String> {
+/// truth for the shape [`parse_gateway`] recognizes. The workspace folder
+/// travels as one argv element, so paths with spaces never get re-quoted.
+pub fn remote_pty_argv(
+    workspace_folder: &Path,
+    pane_id: Option<&str>,
+    executable: Option<&str>,
+) -> Vec<String> {
+    let mut argv = vec![
+        executable.unwrap_or("flock").to_owned(),
+        "remote-agent".to_owned(),
+        "remote-pty".to_owned(),
+        "--provider".to_owned(),
+        "devcontainer".to_owned(),
+        "--workspace-folder".to_owned(),
+        workspace_folder.to_string_lossy().to_string(),
+    ];
+    if let Some(pane_id) = pane_id {
+        argv.extend(["--pane-id".to_owned(), pane_id.to_owned()]);
+    }
+    argv
+}
+
+/// Inverse of [`remote_pty_argv`]: the bound workspace folder, or `None` for
+/// anything else. Duplicated in `flock-sidebar/src/devcontainer.rs` (plugins
+/// share no crate); the two must stay in sync.
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn parse_gateway(argv: &[String]) -> Option<&str> {
+    match argv {
+        [flock, remote_agent, remote_pty, args @ ..]
+            if is_flock_executable(flock)
+                && remote_agent == "remote-agent"
+                && remote_pty == "remote-pty" =>
+        {
+            let mut chunks = args.chunks_exact(2);
+            let mut provider = None;
+            let mut workspace_folder = None;
+            for chunk in &mut chunks {
+                match chunk {
+                    [flag, value] if flag == "--provider" && provider.is_none() => {
+                        provider = Some(value.as_str());
+                    },
+                    [flag, value] if flag == "--workspace-folder" && workspace_folder.is_none() => {
+                        workspace_folder = Some(value.as_str());
+                    },
+                    [flag, _] if flag == "--pane-id" || flag == "--cwd" => {},
+                    _ => return None,
+                }
+            }
+            if !chunks.remainder().is_empty() || provider != Some("devcontainer") {
+                return None;
+            }
+            workspace_folder.filter(|folder| !folder.is_empty())
+        },
+        _ => None,
+    }
+}
+
+fn is_flock_executable(executable: &str) -> bool {
+    executable == "flock" || (Path::new(executable).is_absolute() && !executable.is_empty())
+}
+
+/// Install the flock binary inside the container using the shared
+/// arch-detecting script. `devcontainer exec` passes argv through verbatim
+/// (docker-exec style), so the script rides raw — no quote wrapping. Fired on
+/// EVERY open (create and switch): container rebuilds wipe the installed
+/// binary, and the script's fast path makes the installed case a no-op, so
+/// reopening from the picker doubles as the repair action.
+pub fn bootstrap_argv(workspace_folder: &Path, debug_binary: Option<&str>) -> Vec<String> {
+    if let Some(debug_binary) = debug_binary {
+        return debug_bootstrap_argv(workspace_folder, debug_binary);
+    }
+    vec![
+        "devcontainer".to_owned(),
+        "exec".to_owned(),
+        "--workspace-folder".to_owned(),
+        workspace_folder.to_string_lossy().to_string(),
+        "sh".to_owned(),
+        "-c".to_owned(),
+        remote_bootstrap::install_script(),
+    ]
+}
+
+/// Stream an explicitly selected local binary into the container. The binary
+/// path and workspace folder are positional shell arguments, never
+/// interpolated into either script.
+fn debug_bootstrap_argv(workspace_folder: &Path, debug_binary: &str) -> Vec<String> {
+    let local_script = format!(
+        r#"set -eu
+binary="$1"
+workspace_folder="$2"
+[ -f "$binary" ] || {{ echo "flock: debug remote agent binary not found: $binary" >&2; exit 66; }}
+remote={}
+devcontainer exec --workspace-folder "$workspace_folder" sh -c "$remote" < "$binary""#,
+        remote_bootstrap::quote_remote_script_arg(&remote_bootstrap::debug_install_script()),
+    );
     vec![
         "sh".to_owned(),
         "-c".to_owned(),
-        WRAPPER_SCRIPT.to_owned(),
-        WRAPPER_ARG0.to_owned(),
+        local_script,
+        "flock-debug-bootstrap".to_owned(),
+        debug_binary.to_owned(),
         workspace_folder.to_string_lossy().to_string(),
     ]
 }
 
-/// Recognize a devcontainer binding in a session's `default_command`,
-/// returning the workspace folder. Must stay the exact inverse of
-/// [`wrapper_argv`]. Duplicated in `flock-sidebar/src/devcontainer.rs`
-/// (plugins share no crate); the two must stay in sync.
-///
-/// The selector itself has no runtime caller: it matches bound sessions by
-/// `workspace_root` (a devcontainer session is created with the project as
-/// its cwd), so the recognizer lives here as the tested inverse of the shape
-/// the sidebar reads.
-#[cfg_attr(not(test), allow(dead_code))]
-pub fn parse_devcontainer_command(argv: &[String]) -> Option<&str> {
-    match argv {
-        [sh, dash_c, script, arg0, path]
-            if sh == "sh" && dash_c == "-c" && script == WRAPPER_SCRIPT && arg0 == WRAPPER_ARG0 =>
-        {
-            Some(path)
-        },
-        _ => None,
-    }
+/// Context map for a bootstrap command, carrying the workspace folder.
+pub fn bootstrap_context(workspace_folder: &Path) -> BTreeMap<String, String> {
+    BTreeMap::from_iter([(
+        BOOTSTRAP_CONTEXT_KEY.to_owned(),
+        workspace_folder.to_string_lossy().to_string(),
+    )])
 }
 
 /// Argv for the picker's one-time `devcontainer up` (create/build/start —
@@ -116,15 +172,33 @@ pub fn up_context(workspace_folder: &Path) -> BTreeMap<String, String> {
 }
 
 /// The generated stringified layout a bound session is created from — the same
-/// chrome (user `remote_session_layout` base or the built-in flock mirror)
-/// as a codespace session, with this binding's wrapper argv appended. See
-/// [`crate::codespaces::layout_doc_with_binding`] for the shared mechanics.
+/// chrome (user `remote_session_layout` base or the built-in flock mirror) as
+/// a coder/ssh session, with the remote-pty binding, the typed
+/// `remote_backend`, and serialization ON (resurrected panes reattach to the
+/// in-container daemon by stable UUID; the bridge revives a stopped container
+/// with `devcontainer up` on its reconnect path).
 pub fn layout_doc_for(
     workspace_folder: &Path,
     sidebar_args: &[(String, String)],
     base_layout: Option<&str>,
+    executable: Option<&str>,
 ) -> String {
-    layout_doc_with_binding(&wrapper_argv(workspace_folder), sidebar_args, base_layout)
+    let command = remote_pty_argv(workspace_folder, None, executable);
+    let backend = serde_json::json!({
+        "provider": "devcontainer",
+        "workspace_folder": workspace_folder.to_string_lossy(),
+        "local_session_id": "",
+    })
+    .to_string();
+    let options = format!(
+        "remote_backend {}\nsession_serialization true\nshow_startup_tips false\nshow_release_notes false\n",
+        kdl_quote(&backend)
+    );
+    crate::codespaces::layout_doc_with_options(&command, sidebar_args, base_layout, &options)
+}
+
+fn kdl_quote(value: &str) -> String {
+    format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\""))
 }
 
 // ---------------------------------------------------------------------------
@@ -232,9 +306,13 @@ pub fn classify_error(exit_code: Option<i32>, stderr: &str) -> DevcontainerError
 pub enum DevcontainerPhase {
     /// Asking "start in devcontainer? y/n".
     Prompt,
-    /// `devcontainer up` is in flight; the session is created on success.
+    /// `devcontainer up` is in flight; the bootstrap follows on success.
     Starting,
-    /// The up failed; showing the classified error until a key dismisses it.
+    /// The in-container flock bootstrap is in flight; the session is created
+    /// on success.
+    Bootstrapping,
+    /// The up/bootstrap failed; showing the classified error until a key
+    /// dismisses it.
     Failed(DevcontainerError),
 }
 
@@ -258,51 +336,78 @@ mod tests {
     }
 
     #[test]
-    fn wrapper_argv_round_trips_through_recognizer() {
-        let argv = wrapper_argv(Path::new("/Users/me/my proj"));
-        assert_eq!(parse_devcontainer_command(&argv), Some("/Users/me/my proj"));
-        assert!(argv[2].contains("opencode/plugins/flock-agent-state.js"));
-        assert!(argv[2].contains("--remote-env FLOCK_PANE_ID=\"$FLOCK_PANE_ID\""));
-        assert!(argv[2].contains("--remote-env FLOCK_STATE_CHANNEL=file"));
+    fn gateway_binding_round_trips_including_spaced_paths() {
+        let path = Path::new("/Users/me/my proj");
+        let gateway = remote_pty_argv(path, None, None);
+        assert_eq!(
+            gateway,
+            to_argv(&[
+                "flock",
+                "remote-agent",
+                "remote-pty",
+                "--provider",
+                "devcontainer",
+                "--workspace-folder",
+                "/Users/me/my proj",
+            ])
+        );
+        assert_eq!(parse_gateway(&gateway), Some("/Users/me/my proj"));
+
+        let debug_gateway = remote_pty_argv(path, Some("uuid-1"), Some("/tmp/debug/flock"));
+        assert_eq!(debug_gateway[0], "/tmp/debug/flock");
+        assert_eq!(parse_gateway(&debug_gateway), Some("/Users/me/my proj"));
+        let mut with_cwd = debug_gateway.clone();
+        with_cwd.extend(["--cwd".to_owned(), "/workspaces/proj".to_owned()]);
+        assert_eq!(parse_gateway(&with_cwd), Some("/Users/me/my proj"));
     }
 
     #[test]
     fn recognizer_rejects_other_commands() {
-        // A user's own sh -c is not the binding.
+        assert_eq!(parse_gateway(&to_argv(&["sh", "-c", "echo hi"])), None);
+        // Other providers on the unified subcommand are not this binding.
         assert_eq!(
-            parse_devcontainer_command(&to_argv(&["sh", "-c", "echo hi"])),
-            None
-        );
-        // Same shape but a modified script or marker is not the binding.
-        assert_eq!(
-            parse_devcontainer_command(&to_argv(&[
-                "sh",
-                "-c",
-                "devcontainer up --workspace-folder \"$1\"",
-                WRAPPER_ARG0,
-                "/p"
-            ])),
+            parse_gateway(&crate::coder::remote_pty_argv("alice/api", None, None)),
             None
         );
         assert_eq!(
-            parse_devcontainer_command(&to_argv(&[
-                "sh",
-                "-c",
-                WRAPPER_SCRIPT,
-                "not-the-marker",
-                "/p"
-            ])),
+            parse_gateway(&to_argv(&["gh", "codespace", "ssh", "-c", "x"])),
             None
         );
-        // Extra args and the codespace binding are rejected.
-        let mut extra = wrapper_argv(Path::new("/p"));
+        let mut extra = remote_pty_argv(Path::new("/p"), None, None);
         extra.push("surplus".to_owned());
-        assert_eq!(parse_devcontainer_command(&extra), None);
+        assert_eq!(parse_gateway(&extra), None);
+        assert_eq!(parse_gateway(&to_argv(&["fish"])), None);
+    }
+
+    #[test]
+    fn bootstrap_execs_raw_arch_detecting_script() {
+        let bootstrap = bootstrap_argv(Path::new("/work/my app"), None);
         assert_eq!(
-            parse_devcontainer_command(&to_argv(&["gh", "codespace", "ssh", "-c", "x"])),
-            None
+            &bootstrap[..6],
+            &[
+                "devcontainer",
+                "exec",
+                "--workspace-folder",
+                "/work/my app",
+                "sh",
+                "-c",
+            ]
         );
-        assert_eq!(parse_devcontainer_command(&to_argv(&["fish"])), None);
+        let script = bootstrap.last().unwrap();
+        // Verbatim argv transport: the script is raw, not quote-wrapped.
+        assert!(script.starts_with("set -eu"));
+        assert!(script.contains("x86_64-unknown-linux-musl"));
+        assert!(script.contains("aarch64-unknown-linux-musl"));
+        assert!(!script.contains("/work/my app"));
+
+        let debug = bootstrap_argv(Path::new("/work/app"), Some("/tmp/flock with spaces"));
+        assert_eq!(&debug[..2], &["sh", "-c"]);
+        assert_eq!(debug[3], "flock-debug-bootstrap");
+        assert_eq!(debug[4], "/tmp/flock with spaces");
+        assert_eq!(debug[5], "/work/app");
+        assert!(debug[2].contains("devcontainer exec --workspace-folder \"$workspace_folder\""));
+        assert!(debug[2].contains("< \"$binary\""));
+        assert!(!debug[2].contains("/tmp/flock with spaces"));
     }
 
     #[test]
@@ -399,22 +504,14 @@ mod tests {
         );
     }
 
-    #[test]
-    fn layout_doc_carries_wrapper_binding_and_disables_serialization() {
-        let doc = layout_doc_for(Path::new("/work/app"), &[], None);
-        assert!(doc.contains("session_serialization false"));
-        assert!(doc.starts_with("layout {"));
-        assert!(doc.contains(r#""flock-devcontainer" "/work/app""#));
-    }
-
     /// The generated doc must survive the exact parse the server runs on a
-    /// stringified layout — including the wrapper script's embedded quotes and
-    /// a workspace path with spaces.
+    /// stringified layout — including a workspace path with spaces — and must
+    /// carry the typed backend with serialization ON.
     #[test]
     fn layout_doc_parses_with_the_server_side_parser() {
         let path = Path::new("/Users/me/my proj");
         let args = vec![("individual_dirs".to_owned(), "/a;/b".to_owned())];
-        let doc = layout_doc_for(path, &args, None);
+        let doc = layout_doc_for(path, &args, None, None);
         let (layout, config) = zellij_utils::input::layout::Layout::from_stringified_layout(
             &doc,
             zellij_utils::input::config::Config::default(),
@@ -426,17 +523,24 @@ mod tests {
         );
         assert_eq!(
             config.options.default_command.as_deref(),
-            Some(wrapper_argv(path).as_slice())
+            Some(remote_pty_argv(path, None, None).as_slice())
         );
-        assert_eq!(config.options.session_serialization, Some(false));
+        assert!(matches!(
+            config.options.remote_backend,
+            Some(zellij_tile::prelude::RemoteBackend::Devcontainer {
+                ref workspace_folder,
+                ..
+            }) if workspace_folder == "/Users/me/my proj"
+        ));
+        assert_eq!(config.options.session_serialization, Some(true));
     }
 
     #[test]
     fn layout_doc_uses_user_base_layout_when_provided() {
         let base = "layout {\n    pane borderless=true\n}";
-        let doc = layout_doc_for(Path::new("/work/app"), &[], Some(base));
+        let doc = layout_doc_for(Path::new("/work/app"), &[], Some(base), None);
         assert!(doc.starts_with("layout {\n    pane borderless=true\n}\n"));
-        assert!(doc.contains(r#""flock-devcontainer" "/work/app""#));
+        assert!(doc.contains(r#""--workspace-folder" "/work/app""#));
         // The built-in mirror must not leak in alongside the user's base.
         assert!(!doc.contains("flock_ui"));
     }

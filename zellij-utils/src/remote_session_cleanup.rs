@@ -20,6 +20,9 @@ pub enum RemoteCloseTransport {
         #[serde(default)]
         extra_args: Vec<String>,
     },
+    Devcontainer {
+        workspace_folder: String,
+    },
 }
 
 impl RemoteCloseTransport {
@@ -28,6 +31,7 @@ impl RemoteCloseTransport {
         match self {
             Self::Coder { workspace } => workspace,
             Self::Ssh { destination, .. } => destination,
+            Self::Devcontainer { workspace_folder } => workspace_folder,
         }
     }
 
@@ -43,6 +47,11 @@ impl RemoteCloseTransport {
             } => Self::Ssh {
                 destination: destination.clone(),
                 extra_args: extra_args.clone(),
+            },
+            RemoteBackend::Devcontainer {
+                workspace_folder, ..
+            } => Self::Devcontainer {
+                workspace_folder: workspace_folder.clone(),
             },
         }
     }
@@ -63,6 +72,10 @@ impl RemoteCloseTransport {
                 for arg in extra_args {
                     args.extend(["--ssh-arg".to_owned(), arg.clone()]);
                 }
+            },
+            Self::Devcontainer { workspace_folder } => {
+                args.extend(["--provider".to_owned(), "devcontainer".to_owned()]);
+                args.extend(["--workspace-folder".to_owned(), workspace_folder.clone()]);
             },
         }
         args

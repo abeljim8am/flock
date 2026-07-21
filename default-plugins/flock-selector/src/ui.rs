@@ -25,6 +25,7 @@ use crate::devcontainers::{DevcontainerError, DevcontainerPhase, PendingDevconta
 use crate::live_sessions::{RankedSession, SessionActivity};
 use crate::palette::{bg, fg, goto, Theme, BOLD, DIM, NORMAL_INTENSITY, RESET};
 use crate::ranking::Ranked;
+use crate::ssh::{HostPhase, HostWizard, RankedSshHost};
 
 /// The badge glyph marking a project/codespace that already has a live session.
 const OPEN_BADGE: &str = "●";
@@ -38,6 +39,7 @@ pub enum PickerMode {
     Projects,
     Codespaces,
     Coder,
+    Ssh,
 }
 
 /// A styled run of text on one row.
@@ -103,6 +105,17 @@ pub struct RenderInput<'a> {
     pub coder_create: Option<&'a CreateWizard>,
     /// Transient success message after a no-wait create returns.
     pub coder_create_notice: Option<&'a str>,
+    /// Ranked saved SSH hosts (Ssh mode).
+    pub ssh_results: &'a [RankedSshHost<'a>],
+    /// Destinations that currently have a live bound session.
+    pub bound_ssh_destinations: &'a std::collections::HashSet<String>,
+    /// The SSH host add/edit form owns the picker while present.
+    pub ssh_wizard: Option<&'a HostWizard>,
+    /// Bootstrap failure or progress notice for the Ssh mode.
+    pub ssh_error: Option<&'a str>,
+    pub ssh_notice: Option<&'a str>,
+    /// Name of the host a delete confirmation is pending for.
+    pub pending_ssh_delete: Option<&'a str>,
     /// The devcontainer prompt/up owning the picker, if any — rendered as a
     /// full-width notice row just above the input.
     pub pending_devcontainer: Option<&'a PendingDevcontainer>,
@@ -149,6 +162,12 @@ pub fn render(input: RenderInput) -> RenderOutput {
         pending_coder_stop,
         coder_create,
         coder_create_notice,
+        ssh_results,
+        bound_ssh_destinations,
+        ssh_wizard,
+        ssh_error,
+        ssh_notice,
+        pending_ssh_delete,
         pending_devcontainer,
         palette: p,
         rows,
@@ -180,7 +199,7 @@ pub fn render(input: RenderInput) -> RenderOutput {
             cols,
             mode,
             enabled_modes,
-            coder_create.is_some(),
+            coder_create.is_some() || ssh_wizard.is_some(),
             p,
         );
     }
@@ -188,6 +207,11 @@ pub fn render(input: RenderInput) -> RenderOutput {
     if mode == PickerMode::Coder {
         if let Some(wizard) = coder_create {
             return render_coder_create(out, rows, cols, has_header, wizard, p);
+        }
+    }
+    if mode == PickerMode::Ssh {
+        if let Some(wizard) = ssh_wizard {
+            return render_ssh_wizard(out, rows, cols, wizard, p);
         }
     }
 
@@ -202,6 +226,7 @@ pub fn render(input: RenderInput) -> RenderOutput {
         PickerMode::Projects => results.len(),
         PickerMode::Codespaces => codespace_results.len(),
         PickerMode::Coder => coder_results.len(),
+        PickerMode::Ssh => ssh_results.len(),
     };
     let capacity = rows.saturating_sub(if has_header { 2 } else { 1 });
     let selected = if total == 0 {
@@ -267,6 +292,20 @@ pub fn render(input: RenderInput) -> RenderOutput {
                         " loading Coder workspaces…"
                     } else if query.trim().is_empty() {
                         " no Coder workspaces"
+                    } else {
+                        " no matches"
+                    };
+                    vec![Span::new(msg, p.muted).dim()]
+                },
+            },
+            PickerMode::Ssh => match ssh_error {
+                Some(error) => vec![
+                    Span::new(" ✗", p.red),
+                    Span::new(format!(" {}", error), p.muted).dim(),
+                ],
+                None => {
+                    let msg = if query.trim().is_empty() {
+                        " no saved SSH hosts — Ctrl-o adds one"
                     } else {
                         " no matches"
                     };
@@ -346,6 +385,15 @@ pub fn render(input: RenderInput) -> RenderOutput {
                 row_map.push((y, idx));
             }
         },
+        PickerMode::Ssh => {
+            for (k, idx) in (scroll..visible_end).enumerate() {
+                let y = input_y - 1 - k;
+                let r = &ssh_results[idx];
+                let is_bound = bound_ssh_destinations.contains(&r.host.destination);
+                render_ssh_row(&mut out, y, cols, r, idx == selected, is_bound, p);
+                row_map.push((y, idx));
+            }
+        },
     }
 
     // A pending devcontainer prompt/up owns the keyboard, so its notice row
@@ -372,6 +420,45 @@ pub fn render(input: RenderInput) -> RenderOutput {
                     cols,
                     None,
                     &coder_error_spans(error, p),
+                );
+            }
+        }
+    }
+    if mode == PickerMode::Ssh {
+        if let Some(name) = pending_ssh_delete {
+            render_row(
+                &mut out,
+                0,
+                input_y.saturating_sub(1),
+                cols,
+                None,
+                &[
+                    Span::new(" ⌦ ", p.red),
+                    Span::new(format!("delete saved host \"{}\"?", name), p.text).bold(),
+                    Span::new("  [y]es · any other key cancels", p.muted).dim(),
+                ],
+            );
+        } else if let Some(notice) = ssh_notice {
+            render_row(
+                &mut out,
+                0,
+                input_y.saturating_sub(1),
+                cols,
+                None,
+                &[Span::new(" ◌ ", p.yellow), Span::new(notice, p.text).bold()],
+            );
+        } else if total > 0 {
+            if let Some(error) = ssh_error {
+                render_row(
+                    &mut out,
+                    0,
+                    input_y.saturating_sub(1),
+                    cols,
+                    None,
+                    &[
+                        Span::new(" ✗", p.red),
+                        Span::new(format!(" {}", error), p.muted).dim(),
+                    ],
                 );
             }
         }
@@ -422,6 +509,7 @@ fn render_header_row(
             PickerMode::Projects => "Projects",
             PickerMode::Codespaces => "Codespaces",
             PickerMode::Coder => "Coder",
+            PickerMode::Ssh => "SSH",
         };
         spans.push(styled(label, style_for(*enabled)));
     }
@@ -434,6 +522,7 @@ fn render_header_row(
             PickerMode::Projects => "Tab ",
             PickerMode::Codespaces => "Tab switch · Ctrl-x stop ",
             PickerMode::Coder => "Tab switch · Ctrl-o create · Ctrl-x stop ",
+            PickerMode::Ssh => "Tab switch · Ctrl-o add · Ctrl-e edit · Ctrl-x delete ",
         }
     };
     let left_w: usize = spans.iter().map(|s| s.text.width()).sum();
@@ -612,6 +701,162 @@ fn render_coder_create(
     }
 }
 
+/// One saved SSH host row: `<●?> <name>  <dim destination>  <dim extra args>`.
+fn render_ssh_row(
+    out: &mut String,
+    y: usize,
+    cols: usize,
+    r: &RankedSshHost,
+    selected: bool,
+    is_bound: bool,
+    p: &Theme,
+) {
+    let row_bg = selected.then_some(p.selection_bg);
+    let mut spans = Vec::new();
+    if is_bound {
+        spans.push(Span::new(" ", p.text));
+        spans.push(Span::new(OPEN_BADGE, p.green));
+    } else {
+        spans.push(Span::new("  ", p.text));
+    }
+    spans.push(Span::new(" ", p.text));
+
+    let name_budget = cols.saturating_sub(4).min(cols / 2 + 8).max(4);
+    let name = truncate_text(&r.host.name, name_budget);
+    let name_style = Style {
+        fg: p.text,
+        bold: true,
+        dim: false,
+    };
+    push_highlighted(
+        &mut spans,
+        &name,
+        &clip_ranges(&r.name_ranges, &name),
+        name_style,
+        name_style,
+    );
+
+    let used: usize = spans.iter().map(|span| span.text.width()).sum();
+    let destination_budget = cols.saturating_sub(used + 2);
+    if destination_budget > 1 {
+        let destination_style = Style {
+            fg: p.text,
+            bold: false,
+            dim: true,
+        };
+        spans.push(styled("  ", destination_style));
+        let destination = truncate_text(&r.host.destination, destination_budget);
+        push_highlighted(
+            &mut spans,
+            &destination,
+            &clip_ranges(&r.destination_ranges, &destination),
+            destination_style,
+            destination_style,
+        );
+    }
+
+    if !r.host.extra_args.is_empty() {
+        let used: usize = spans.iter().map(|span| span.text.width()).sum();
+        let args = r.host.extra_args.join(" ");
+        let args_budget = cols.saturating_sub(used + 2);
+        if args_budget > 1 {
+            spans.push(Span::new("  ", p.text));
+            spans.push(Span::new(truncate_text(&args, args_budget), p.muted).dim());
+        }
+    }
+    render_row(out, 0, y, cols, row_bg, &spans);
+}
+
+/// The SSH host add/edit form: previously entered fields render as summary
+/// rows, the active field is the input row, and a phase-specific hint row
+/// explains the constraints (key-based auth, token-per-arg).
+fn render_ssh_wizard(
+    mut out: String,
+    rows: usize,
+    cols: usize,
+    wizard: &HostWizard,
+    p: &Theme,
+) -> RenderOutput {
+    let input_y = rows.saturating_sub(1);
+    let mut y = input_y.saturating_sub(1);
+    if let Some(error) = wizard.error.as_ref() {
+        render_row(
+            &mut out,
+            0,
+            y,
+            cols,
+            None,
+            &[
+                Span::new(" ✗ ", p.red),
+                Span::new(error.as_str(), p.text),
+            ],
+        );
+        y = y.saturating_sub(1);
+    }
+    let (label, hint) = match wizard.phase {
+        HostPhase::Name => (
+            "Host name",
+            " a display label; sessions bind to the destination, so renaming is always safe",
+        ),
+        HostPhase::Destination => (
+            "Destination",
+            " user@host or a ~/.ssh/config alias — key/agent auth required (BatchMode)",
+        ),
+        HostPhase::ExtraArgs => (
+            "Extra ssh args",
+            " optional, whitespace-separated tokens, e.g. -p 2222 -i ~/.ssh/key — Enter saves",
+        ),
+    };
+    if wizard.phase >= HostPhase::Destination {
+        render_row(
+            &mut out,
+            0,
+            y,
+            cols,
+            None,
+            &[
+                Span::new(" Name  ", p.muted).dim(),
+                Span::new(wizard.name.as_str(), p.text).bold(),
+            ],
+        );
+        y = y.saturating_sub(1);
+    }
+    if wizard.phase >= HostPhase::ExtraArgs {
+        render_row(
+            &mut out,
+            0,
+            y,
+            cols,
+            None,
+            &[
+                Span::new(" Destination  ", p.muted).dim(),
+                Span::new(wizard.destination.as_str(), p.text).bold(),
+            ],
+        );
+        y = y.saturating_sub(1);
+    }
+    if wizard.editing.is_some() && wizard.phase == HostPhase::Destination {
+        render_row(&mut out, 0, y, cols, None, &[
+            Span::new(" editing — changing the destination re-homes the host's remote panes", p.muted).dim(),
+        ]);
+        y = y.saturating_sub(1);
+    }
+    render_row(&mut out, 0, y, cols, None, &[Span::new(hint, p.muted).dim()]);
+    let value = match wizard.phase {
+        HostPhase::Name => &wizard.name,
+        HostPhase::Destination => &wizard.destination,
+        HostPhase::ExtraArgs => &wizard.extra_args_input,
+    };
+    render_wizard_input(&mut out, input_y, cols, label, value, 0, 0, p);
+    out.push_str(RESET);
+    RenderOutput {
+        ansi: out,
+        selected: 0,
+        scroll: 0,
+        row_map: Vec::new(),
+    }
+}
+
 fn render_wizard_input(
     out: &mut String,
     y: usize,
@@ -711,6 +956,16 @@ fn render_devcontainer_notice(
                 p.text,
             ),
             Span::new("  (first build can take a while)", p.muted).dim(),
+        ],
+        DevcontainerPhase::Bootstrapping => vec![
+            Span::new(" ⬢ ", p.yellow),
+            Span::new(
+                format!(
+                    "preparing persistent session for \"{}\"…",
+                    pending.display_name
+                ),
+                p.text,
+            ),
         ],
         DevcontainerPhase::Failed(err) => {
             let msg = match err {
@@ -1330,6 +1585,12 @@ mod tests {
             pending_coder_stop: None,
             coder_create: None,
             coder_create_notice: None,
+            ssh_results: &[],
+            bound_ssh_destinations: &std::collections::HashSet::new(),
+            ssh_wizard: None,
+            ssh_error: None,
+            ssh_notice: None,
+            pending_ssh_delete: None,
             pending_devcontainer: None,
             palette: &theme,
             selected: 0,
@@ -1390,6 +1651,12 @@ mod tests {
             pending_coder_stop: None,
             coder_create: None,
             coder_create_notice: None,
+            ssh_results: &[],
+            bound_ssh_destinations: &std::collections::HashSet::new(),
+            ssh_wizard: None,
+            ssh_error: None,
+            ssh_notice: None,
+            pending_ssh_delete: None,
             pending_devcontainer: None,
             palette: &theme,
             selected: 0,
@@ -1430,6 +1697,12 @@ mod tests {
                 pending_coder_stop: None,
                 coder_create: None,
                 coder_create_notice: None,
+                ssh_results: &[],
+                bound_ssh_destinations: &std::collections::HashSet::new(),
+                ssh_wizard: None,
+                ssh_error: None,
+                ssh_notice: None,
+                pending_ssh_delete: None,
                 pending_devcontainer: None,
                 palette: &theme,
                 selected: 0,
@@ -1484,6 +1757,12 @@ mod tests {
                 pending_coder_stop: None,
                 coder_create: Some(wizard),
                 coder_create_notice: None,
+                ssh_results: &[],
+                bound_ssh_destinations: &std::collections::HashSet::new(),
+                ssh_wizard: None,
+                ssh_error: None,
+                ssh_notice: None,
+                pending_ssh_delete: None,
                 pending_devcontainer: None,
                 palette: &theme,
                 selected: 0,

@@ -38,6 +38,7 @@ mod palette;
 mod ranking;
 mod remote_bootstrap;
 mod session;
+mod ssh;
 mod ui;
 
 use std::collections::{BTreeMap, HashSet};
@@ -148,6 +149,26 @@ struct State {
     devcontainer_projects: BTreeMap<String, HashSet<PathBuf>>,
     /// The devcontainer prompt/up currently owning the picker's keyboard.
     pending_devcontainer: Option<PendingDevcontainer>,
+    /// Saved SSH hosts — user-authored source of truth, loaded from and saved
+    /// to the plugin's data mount. Empty and inert unless `ssh_enabled`.
+    ssh_hosts: Vec<ssh::SshHost>,
+    /// The SSH add/edit form currently owning the picker's keyboard.
+    ssh_wizard: Option<ssh::HostWizard>,
+    /// An Enter-ed SSH host whose bootstrap is in flight.
+    pending_ssh_open: Option<PendingSshOpen>,
+    /// Host name a Ctrl-x delete confirmation is pending for.
+    pending_ssh_delete: Option<String>,
+    /// Last SSH bootstrap failure, surfaced as a hint line in Ssh mode.
+    ssh_error: Option<String>,
+    /// Progress notice while an SSH bootstrap runs.
+    ssh_notice: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PendingSshOpen {
+    host: ssh::SshHost,
+    session_name: String,
+    previous_session: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -164,6 +185,9 @@ fn enabled_modes_for(config: &SelectorConfig) -> Vec<PickerMode> {
     }
     if config.coder_enabled {
         modes.push(PickerMode::Coder);
+    }
+    if config.ssh_enabled {
+        modes.push(PickerMode::Ssh);
     }
     modes
 }
@@ -211,6 +235,80 @@ mod tests {
                 PickerMode::Coder,
             ]
         );
+
+        config.ssh_enabled = true;
+        assert_eq!(
+            enabled_modes_for(&config),
+            vec![
+                PickerMode::Sessions,
+                PickerMode::Projects,
+                PickerMode::Codespaces,
+                PickerMode::Coder,
+                PickerMode::Ssh,
+            ]
+        );
+    }
+
+    #[test]
+    fn ssh_wizard_keys_edit_fields_and_commit_saves_hosts() {
+        let mut state = State {
+            permissions_granted: true,
+            mode: PickerMode::Ssh,
+            config: SelectorConfig {
+                ssh_enabled: true,
+                ..SelectorConfig::default()
+            },
+            ssh_wizard: Some(ssh::HostWizard::add()),
+            ..State::default()
+        };
+        for character in "dev".chars() {
+            state.handle_ssh_wizard_key(KeyWithModifier::new(BareKey::Char(character)));
+        }
+        assert_eq!(state.ssh_wizard.as_ref().unwrap().name, "dev");
+        state.handle_ssh_wizard_key(KeyWithModifier::new(BareKey::Backspace));
+        assert_eq!(state.ssh_wizard.as_ref().unwrap().name, "de");
+        state.handle_ssh_wizard_key(KeyWithModifier::new(BareKey::Char('v')));
+        state.handle_ssh_wizard_key(KeyWithModifier::new(BareKey::Enter));
+        assert_eq!(
+            state.ssh_wizard.as_ref().unwrap().phase,
+            ssh::HostPhase::Destination
+        );
+        state.handle_ssh_wizard_key(KeyWithModifier::new(BareKey::Enter));
+        assert!(state.ssh_wizard.as_ref().unwrap().error.is_some());
+        state.handle_ssh_wizard_key(KeyWithModifier::new(BareKey::Esc));
+        assert_eq!(
+            state.ssh_wizard.as_ref().unwrap().phase,
+            ssh::HostPhase::Name
+        );
+        state.handle_ssh_wizard_key(KeyWithModifier::new(BareKey::Esc));
+        assert!(state.ssh_wizard.is_none());
+    }
+
+    #[test]
+    fn ssh_delete_requires_confirmation() {
+        let mut state = State {
+            permissions_granted: true,
+            mode: PickerMode::Ssh,
+            config: SelectorConfig {
+                ssh_enabled: true,
+                ..SelectorConfig::default()
+            },
+            ssh_hosts: vec![ssh::SshHost {
+                name: "dev".into(),
+                destination: "abel@dev.example.com".into(),
+                extra_args: Vec::new(),
+            }],
+            ..State::default()
+        };
+        assert!(state.request_ssh_delete());
+        assert_eq!(state.pending_ssh_delete.as_deref(), Some("dev"));
+        state.handle_ssh_delete_key(KeyWithModifier::new(BareKey::Char('n')));
+        assert_eq!(state.ssh_hosts.len(), 1);
+        assert!(state.pending_ssh_delete.is_none());
+
+        assert!(state.request_ssh_delete());
+        state.handle_ssh_delete_key(KeyWithModifier::new(BareKey::Char('y')));
+        assert!(state.ssh_hosts.is_empty());
     }
 
     #[test]
@@ -310,6 +408,9 @@ impl ZellijPlugin for State {
         }
         if self.config.coder_enabled {
             self.coder_workspaces = coder::load_cache();
+        }
+        if self.config.ssh_enabled {
+            self.ssh_hosts = ssh::load_hosts();
         }
         // Individual dirs are projects directly, so show them immediately; a
         // root scan fills in the subdirectories once permissions land.
@@ -439,7 +540,8 @@ impl ZellijPlugin for State {
                     should_render = true;
                 } else if (self.config.codespaces_enabled
                     || self.config.devcontainers_enabled
-                    || self.config.coder_enabled)
+                    || self.config.coder_enabled
+                    || self.config.ssh_enabled)
                     && context.contains_key(codespaces::LAYOUT_CONTEXT_KEY)
                 {
                     // The user's shared remote layout base. A failed read (missing
@@ -491,6 +593,35 @@ impl ZellijPlugin for State {
                                 .trim()
                                 .to_owned(),
                         ));
+                    }
+                    should_render = true;
+                } else if self.config.ssh_enabled
+                    && context.contains_key(ssh::BOOTSTRAP_CONTEXT_KEY)
+                {
+                    let pending = self.pending_ssh_open.take();
+                    self.ssh_notice = None;
+                    if exit_code == Some(0) {
+                        if let Some(pending) = pending {
+                            let layout = LayoutInfo::Stringified(ssh::layout_doc_for(
+                                &pending.host,
+                                &self.config.sidebar_args,
+                                self.remote_layout_base.as_deref(),
+                                self.flock_executable.as_deref(),
+                            ));
+                            switch_session_with_layout(Some(&pending.session_name), layout, None);
+                            self.discard_throwaway_session(pending.previous_session.as_deref());
+                            close_self();
+                        }
+                    } else {
+                        self.ssh_error = Some(
+                            String::from_utf8_lossy(&stderr)
+                                .lines()
+                                .rev()
+                                .find(|line| !line.trim().is_empty())
+                                .unwrap_or("remote Zellij bootstrap failed")
+                                .trim()
+                                .to_owned(),
+                        );
                     }
                     should_render = true;
                 } else if self.config.coder_enabled
@@ -590,6 +721,17 @@ impl ZellijPlugin for State {
                         exit_code,
                         &String::from_utf8_lossy(&stderr),
                     );
+                } else if self.config.devcontainers_enabled
+                    && context.contains_key(devcontainers::BOOTSTRAP_CONTEXT_KEY)
+                {
+                    let path_str = context
+                        .get(devcontainers::BOOTSTRAP_CONTEXT_KEY)
+                        .expect("context key checked above");
+                    should_render = self.handle_devcontainer_bootstrap_result(
+                        path_str,
+                        exit_code,
+                        &String::from_utf8_lossy(&stderr),
+                    );
                 }
             },
             Event::Key(key) => {
@@ -610,6 +752,8 @@ impl ZellijPlugin for State {
         let bound_codespaces = self.bound_codespace_names();
         let coder_results = coder::rank(&self.coder_workspaces, &self.query);
         let bound_coder_workspaces = self.bound_coder_workspace_names();
+        let ssh_results = ssh::rank(&self.ssh_hosts, &self.query);
+        let bound_ssh_destinations = self.bound_ssh_destinations();
         let enabled_modes = self.enabled_modes();
 
         let output = ui::render(ui::RenderInput {
@@ -634,6 +778,12 @@ impl ZellijPlugin for State {
             pending_coder_stop: self.pending_coder_stop.as_deref(),
             coder_create: self.coder_create.as_ref(),
             coder_create_notice: self.coder_create_notice.as_deref(),
+            ssh_results: &ssh_results,
+            bound_ssh_destinations: &bound_ssh_destinations,
+            ssh_wizard: self.ssh_wizard.as_ref(),
+            ssh_error: self.ssh_error.as_deref(),
+            ssh_notice: self.ssh_notice.as_deref(),
+            pending_ssh_delete: self.pending_ssh_delete.as_deref(),
             pending_devcontainer: self.pending_devcontainer.as_ref(),
             palette: &self.palette,
             selected: self.selected,
@@ -643,6 +793,7 @@ impl ZellijPlugin for State {
                 PickerMode::Projects => self.projects.len(),
                 PickerMode::Codespaces => self.codespaces.len(),
                 PickerMode::Coder => self.coder_workspaces.len(),
+                PickerMode::Ssh => self.ssh_hosts.len(),
             },
             rows,
             cols,
@@ -749,7 +900,13 @@ impl State {
         if self.coder_create.is_some() {
             return self.handle_coder_create_key(key);
         }
-        if self.pending_coder_open.is_some() {
+        if self.ssh_wizard.is_some() {
+            return self.handle_ssh_wizard_key(key);
+        }
+        if self.pending_ssh_delete.is_some() {
+            return self.handle_ssh_delete_key(key);
+        }
+        if self.pending_coder_open.is_some() || self.pending_ssh_open.is_some() {
             return true;
         }
         // Navigation: in the reverse layout the best result sits at the bottom
@@ -826,8 +983,24 @@ impl State {
                 BareKey::Char('x') if self.mode == PickerMode::Sessions => {
                     return self.kill_selected_session();
                 },
+                BareKey::Char('x') if self.mode == PickerMode::Ssh => {
+                    return self.request_ssh_delete();
+                },
                 BareKey::Char('o') if self.mode == PickerMode::Coder => {
                     return self.open_coder_create();
+                },
+                BareKey::Char('o') if self.mode == PickerMode::Ssh => {
+                    self.ssh_wizard = Some(ssh::HostWizard::add());
+                    self.ssh_error = None;
+                    return true;
+                },
+                BareKey::Char('e') if self.mode == PickerMode::Ssh => {
+                    if let Some(host) = self.selected_ssh_host() {
+                        self.ssh_wizard = Some(ssh::HostWizard::edit(&host));
+                        self.ssh_error = None;
+                        return true;
+                    }
+                    return false;
                 },
                 _ => return false,
             }
@@ -843,6 +1016,7 @@ impl State {
             PickerMode::Projects => self.projects.len(),
             PickerMode::Codespaces => self.codespaces.len(),
             PickerMode::Coder => self.coder_workspaces.len(),
+            PickerMode::Ssh => self.ssh_hosts.len(),
         }
     }
 
@@ -922,7 +1096,8 @@ impl State {
     fn fire_remote_layout_read(&self) {
         if !(self.config.codespaces_enabled
             || self.config.devcontainers_enabled
-            || self.config.coder_enabled)
+            || self.config.coder_enabled
+            || self.config.ssh_enabled)
         {
             return;
         }
@@ -1424,6 +1599,208 @@ impl State {
         true
     }
 
+    /// Destinations that currently have a live bound session (typed backend
+    /// first, `default_command` recognizer as fallback), for the open badge.
+    fn bound_ssh_destinations(&self) -> HashSet<String> {
+        if !self.config.ssh_enabled {
+            return HashSet::new();
+        }
+        self.sessions
+            .iter()
+            .filter_map(|session| match &session.remote_backend {
+                Some(RemoteBackend::Ssh { destination, .. }) => Some(destination.clone()),
+                Some(_) => None,
+                None => session
+                    .default_command
+                    .as_deref()
+                    .and_then(ssh::parse_gateway)
+                    .map(str::to_owned),
+            })
+            .collect()
+    }
+
+    fn existing_ssh_sessions(&self) -> Vec<coder::ExistingSession> {
+        self.sessions
+            .iter()
+            .map(|session| coder::ExistingSession {
+                name: session.name.clone(),
+                bound_workspace: session
+                    .remote_backend
+                    .as_ref()
+                    .and_then(|backend| match backend {
+                        RemoteBackend::Ssh { destination, .. } => Some(destination.clone()),
+                        _ => None,
+                    })
+                    .or_else(|| {
+                        session
+                            .default_command
+                            .as_deref()
+                            .and_then(ssh::parse_gateway)
+                            .map(str::to_owned)
+                    }),
+            })
+            .collect()
+    }
+
+    /// The saved host under the cursor, resolved through the same ranking the
+    /// render pass uses so Ctrl-e / Ctrl-x act on what the user sees.
+    fn selected_ssh_host(&self) -> Option<ssh::SshHost> {
+        let ranked = ssh::rank(&self.ssh_hosts, &self.query);
+        ranked.get(self.selected).map(|ranked| ranked.host.clone())
+    }
+
+    fn request_ssh_delete(&mut self) -> bool {
+        if !self.config.ssh_enabled {
+            return false;
+        }
+        match self.selected_ssh_host() {
+            Some(host) => {
+                self.pending_ssh_delete = Some(host.name);
+                true
+            },
+            None => false,
+        }
+    }
+
+    /// The delete confirmation owns the keyboard: `y`/`Enter` deletes the
+    /// saved entry (user data, hence the confirm), anything else cancels.
+    fn handle_ssh_delete_key(&mut self, key: KeyWithModifier) -> bool {
+        let Some(name) = self.pending_ssh_delete.take() else {
+            return false;
+        };
+        let confirm = key.has_no_modifiers()
+            && matches!(key.bare_key, BareKey::Char('y') | BareKey::Char('Y') | BareKey::Enter);
+        if confirm {
+            self.ssh_hosts.retain(|host| host.name != name);
+            ssh::save_hosts(&self.ssh_hosts);
+            self.reset_selection();
+        }
+        true
+    }
+
+    /// The add/edit form owns the keyboard until it commits or cancels.
+    fn handle_ssh_wizard_key(&mut self, key: KeyWithModifier) -> bool {
+        if key.has_no_modifiers() {
+            match key.bare_key {
+                BareKey::Esc => {
+                    let cancel = self
+                        .ssh_wizard
+                        .as_mut()
+                        .is_some_and(|wizard| !wizard.back());
+                    if cancel {
+                        self.ssh_wizard = None;
+                    }
+                    return true;
+                },
+                BareKey::Enter => {
+                    let Some(mut wizard) = self.ssh_wizard.take() else {
+                        return false;
+                    };
+                    match wizard.advance(&self.ssh_hosts) {
+                        Some(finished) => {
+                            self.ssh_hosts = ssh::apply_wizard(
+                                &self.ssh_hosts,
+                                finished,
+                                wizard.editing.as_deref(),
+                            );
+                            ssh::save_hosts(&self.ssh_hosts);
+                            self.reset_selection();
+                        },
+                        None => self.ssh_wizard = Some(wizard),
+                    }
+                    return true;
+                },
+                BareKey::Backspace => {
+                    if let Some(wizard) = self.ssh_wizard.as_mut() {
+                        wizard.field_mut().pop();
+                        wizard.error = None;
+                    }
+                    return true;
+                },
+                BareKey::Char(character) => {
+                    if let Some(wizard) = self.ssh_wizard.as_mut() {
+                        wizard.field_mut().push(character);
+                        wizard.error = None;
+                    }
+                    return true;
+                },
+                _ => return false,
+            }
+        }
+        if key.has_modifiers(&[KeyModifier::Ctrl]) {
+            match key.bare_key {
+                BareKey::Char('u') => {
+                    if let Some(wizard) = self.ssh_wizard.as_mut() {
+                        wizard.field_mut().clear();
+                        wizard.error = None;
+                    }
+                    return true;
+                },
+                BareKey::Char('w') => {
+                    if let Some(wizard) = self.ssh_wizard.as_mut() {
+                        let value = wizard.field_mut();
+                        let trimmed = value.trim_end();
+                        match trimmed.rfind(char::is_whitespace) {
+                            Some(index) => value.truncate(index + 1),
+                            None => value.clear(),
+                        }
+                        wizard.error = None;
+                    }
+                    return true;
+                },
+                BareKey::Char('c') => {
+                    self.ssh_wizard = None;
+                    return true;
+                },
+                _ => return false,
+            }
+        }
+        false
+    }
+
+    /// Open the selected saved host: switch to its bound session if one is
+    /// live, otherwise bootstrap the remote binary over ssh and create a bound
+    /// session on success (mirrors the Coder flow).
+    fn confirm_ssh_selection(&mut self) {
+        if !self.config.ssh_enabled {
+            return;
+        }
+        let Some(host) = self.selected_ssh_host() else {
+            return;
+        };
+        let action = ssh::resolve_open(&host, &self.existing_ssh_sessions());
+        let current_session_name = self
+            .sessions
+            .iter()
+            .find(|session| session.is_current_session)
+            .map(|session| session.name.clone());
+        match action {
+            coder::OpenAction::Switch { name } if Some(&name) == current_session_name.as_ref() => {
+            },
+            coder::OpenAction::Switch { name } => {
+                switch_session(Some(&name));
+                self.discard_throwaway_session(current_session_name.as_deref());
+            },
+            coder::OpenAction::Create { name } => {
+                self.ssh_error = None;
+                self.ssh_notice = Some(format!(
+                    "Preparing persistent session on {}…",
+                    host.destination
+                ));
+                let argv = ssh::bootstrap_argv(&host, self.remote_agent_binary.as_deref());
+                let refs: Vec<&str> = argv.iter().map(String::as_str).collect();
+                run_command(&refs, ssh::bootstrap_context(&host.destination));
+                self.pending_ssh_open = Some(PendingSshOpen {
+                    host,
+                    session_name: name,
+                    previous_session: current_session_name,
+                });
+                return;
+            },
+        }
+        close_self();
+    }
+
     /// Open the selected project: switch to its session if one already roots at
     /// that folder, otherwise create a new session there with the configured
     /// `session_layout`. Bumps the frecency db on the open, then closes the
@@ -1440,6 +1817,10 @@ impl State {
             },
             PickerMode::Coder => {
                 self.confirm_coder_selection();
+                return;
+            },
+            PickerMode::Ssh => {
+                self.confirm_ssh_selection();
                 return;
             },
             PickerMode::Projects => {},
@@ -1464,6 +1845,16 @@ impl State {
         // carries a `.devcontainer` marker. The prompt takes over the
         // keyboard; the picker closes when the flow resolves.
         let action = session::resolve_open(&path, &self.existing_sessions());
+        // Switching back into a bound devcontainer session fires the
+        // idempotent bootstrap as a fire-and-forget repair: a container
+        // rebuild wipes the installed flock binary, and reopening from the
+        // picker is the designated way to reinstall it.
+        if self.config.devcontainers_enabled
+            && matches!(action, OpenAction::Switch { .. })
+            && self.project_has_devcontainer(&path)
+        {
+            self.fire_devcontainer_bootstrap(&path);
+        }
         if self.config.devcontainers_enabled
             && matches!(action, OpenAction::Create { .. })
             && self.project_has_devcontainer(&path)
@@ -1542,6 +1933,7 @@ impl State {
                     &path,
                     &self.config.sidebar_args,
                     self.remote_layout_base.as_deref(),
+                    self.flock_executable.as_deref(),
                 ));
                 switch_session_with_layout(Some(&name), layout, Some(path));
                 self.discard_throwaway_session(current_session_name.as_deref());
@@ -1584,15 +1976,17 @@ impl State {
                 // Swallow everything else — the list underneath is frozen.
                 _ => true,
             },
-            DevcontainerPhase::Starting => match key.bare_key {
-                // Esc abandons the picker but not the up: with no session
-                // created yet there is nothing to unwind, and a finished up
-                // just makes the next pick instant.
-                BareKey::Esc => {
-                    close_self();
-                    false
-                },
-                _ => true,
+            DevcontainerPhase::Starting | DevcontainerPhase::Bootstrapping => {
+                match key.bare_key {
+                    // Esc abandons the picker but not the up/bootstrap: with
+                    // no session created yet there is nothing to unwind, and a
+                    // finished up just makes the next pick instant.
+                    BareKey::Esc => {
+                        close_self();
+                        false
+                    },
+                    _ => true,
+                }
             },
             DevcontainerPhase::Failed(_) => {
                 // Any key dismisses the error back to the normal picker.
@@ -1602,9 +1996,10 @@ impl State {
         }
     }
 
-    /// Route a `devcontainer up` result: create/switch on success, show the
-    /// classified error on failure. Ignores results that no longer match the
-    /// pending state (the user may have Esc'd and re-picked while it ran).
+    /// Route a `devcontainer up` result: bootstrap flock into the container on
+    /// success, show the classified error on failure. Ignores results that no
+    /// longer match the pending state (the user may have Esc'd and re-picked
+    /// while it ran).
     fn handle_devcontainer_up_result(
         &mut self,
         path_str: &str,
@@ -1618,6 +2013,39 @@ impl State {
             return false;
         }
         if exit_code == Some(0) {
+            let path = self
+                .pending_devcontainer
+                .as_ref()
+                .map(|pending| pending.path.clone())
+                .expect("checked above");
+            if let Some(pending) = self.pending_devcontainer.as_mut() {
+                pending.phase = DevcontainerPhase::Bootstrapping;
+            }
+            self.fire_devcontainer_bootstrap(&path);
+        } else if let Some(pending) = self.pending_devcontainer.as_mut() {
+            pending.phase =
+                DevcontainerPhase::Failed(devcontainers::classify_error(exit_code, stderr));
+        }
+        true
+    }
+
+    /// Route an in-container bootstrap result: create/switch the bound
+    /// session on success. A result with no matching pending state is a
+    /// fire-and-forget repair bootstrap (fired when switching to an existing
+    /// bound session) and is ignored.
+    fn handle_devcontainer_bootstrap_result(
+        &mut self,
+        path_str: &str,
+        exit_code: Option<i32>,
+        stderr: &str,
+    ) -> bool {
+        let matches_pending = self.pending_devcontainer.as_ref().is_some_and(|p| {
+            p.phase == DevcontainerPhase::Bootstrapping && p.path.to_string_lossy() == path_str
+        });
+        if !matches_pending {
+            return false;
+        }
+        if exit_code == Some(0) {
             let pending = self.pending_devcontainer.take().expect("checked above");
             self.open_project_in_devcontainer(pending.path);
         } else if let Some(pending) = self.pending_devcontainer.as_mut() {
@@ -1625,6 +2053,14 @@ impl State {
                 DevcontainerPhase::Failed(devcontainers::classify_error(exit_code, stderr));
         }
         true
+    }
+
+    /// Fire the idempotent in-container flock install. Cheap when already
+    /// installed; after a container rebuild it is the repair action.
+    fn fire_devcontainer_bootstrap(&self, path: &Path) {
+        let argv = devcontainers::bootstrap_argv(path, self.remote_agent_binary.as_deref());
+        let argv_refs: Vec<&str> = argv.iter().map(|s| s.as_str()).collect();
+        run_command(&argv_refs, devcontainers::bootstrap_context(path));
     }
 
     /// Whether `path` (a project folder) carries a `.devcontainer` marker,
