@@ -14,7 +14,7 @@ pub const TEMPLATE_LIST_CONTEXT_KEY: &str = "flock_coder_template_list";
 pub const CREATE_CONTEXT_KEY: &str = "flock_coder_create";
 pub const BOOTSTRAP_CONTEXT_KEY: &str = "flock_coder_bootstrap";
 
-pub const RELEASE_TAG: &str = "v26.3.0";
+pub const RELEASE_TAG: &str = "v26.4.0";
 pub const RELEASE_BASE_URL: &str = "https://github.com/abeljim8am/flock/releases/download";
 
 const CACHE_PATH: &str = "/data/coder-workspaces.json";

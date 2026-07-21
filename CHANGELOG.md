@@ -5,6 +5,8 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
 
 ## [Unreleased]
+
+## [26.4.0] - 2026-07-21
 * refactor(coder)!: remove the legacy `coder ssh` gateway (nested remote Flock, snapshot polling, tracker-only sidebar, flock-coder-remote layout); native remote-agent sessions are the only Coder integration
 * fix(coder): publish native Coder session agent state to the cross-session bus so other sessions' sidebars stay live
 * feat: allow tabs to have different sizes if clients aren't focused on the same one (https://github.com/zellij-org/zellij/pull/5133)
