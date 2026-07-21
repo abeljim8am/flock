@@ -26,6 +26,9 @@ layout {
                 // root_dirs "/path/to/projects;/path/to/work"
                 // session_layout "default"
                 // coder_enabled "true"
+                // Saved-SSH-hosts tab (Ctrl-o adds a host; key/agent auth is
+                // required — the transport runs ssh with BatchMode=yes).
+                // ssh_enabled "true"
                 // Optional, applied only when the selected Coder template
                 // exposes this conventional parameter.
                 // coder_dotfiles_uri "https://github.com/example/dotfiles.git"

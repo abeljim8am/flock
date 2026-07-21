@@ -1778,8 +1778,8 @@ impl Pty {
         match id {
             PaneId::Terminal(id) => {
                 if !self.is_shutting_down {
-                    if let Some(workspace) = self.coder_workspace_for_pane(id) {
-                        self.request_remote_pane_close(id, &workspace);
+                    if let Some(transport) = self.remote_transport_for_pane(id) {
+                        self.request_remote_pane_close(id, &transport);
                     }
                 }
                 if let Some(handle) = self.task_handles.remove(&id) {
@@ -1816,19 +1816,44 @@ impl Pty {
         Ok(())
     }
 
-    fn coder_workspace_for_pane(&self, id: u32) -> Option<String> {
-        let from_argv = |argv: &[String]| -> Option<String> {
-            argv.windows(3).find_map(|window| match window {
-                [coder_pty, workspace_flag, workspace]
-                    if coder_pty == "coder-pty" && workspace_flag == "--workspace" =>
-                {
-                    Some(workspace.clone())
-                },
-                [coder, ssh, workspace] if coder.ends_with("coder") && ssh == "ssh" => {
-                    Some(workspace.clone())
-                },
+    fn remote_transport_for_pane(
+        &self,
+        id: u32,
+    ) -> Option<zellij_utils::remote_session_cleanup::RemoteCloseTransport> {
+        use zellij_utils::remote_session_cleanup::RemoteCloseTransport;
+        let from_argv = |argv: &[String]| -> Option<RemoteCloseTransport> {
+            let subcommand = argv
+                .windows(2)
+                .position(|pair| pair[0] == "remote-agent" && pair[1] == "remote-pty")?;
+            let mut provider = None;
+            let mut workspace = None;
+            let mut destination = None;
+            let mut ssh_args = Vec::new();
+            let mut workspace_folder = None;
+            let mut words = argv[subcommand + 2..].iter();
+            while let Some(word) = words.next() {
+                match word.as_str() {
+                    "--provider" => provider = words.next(),
+                    "--workspace" => workspace = words.next(),
+                    "--destination" => destination = words.next(),
+                    "--ssh-arg" => ssh_args.extend(words.next().cloned()),
+                    "--workspace-folder" => workspace_folder = words.next(),
+                    _ => {},
+                }
+            }
+            match provider.map(String::as_str) {
+                Some("coder") => Some(RemoteCloseTransport::Coder {
+                    workspace: workspace?.clone(),
+                }),
+                Some("ssh") => Some(RemoteCloseTransport::Ssh {
+                    destination: destination?.clone(),
+                    extra_args: ssh_args,
+                }),
+                Some("devcontainer") => Some(RemoteCloseTransport::Devcontainer {
+                    workspace_folder: workspace_folder?.clone(),
+                }),
                 _ => None,
-            })
+            }
         };
         self.id_to_child_pid
             .get(&id)
@@ -1851,8 +1876,8 @@ impl Pty {
     }
 
     fn remote_cwd_for_pane(&self, id: u32) -> Option<PathBuf> {
-        let workspace = self.coder_workspace_for_pane(id)?;
-        let pane_uuid = self.remote_uuid_for_pane(id, &workspace)?;
+        let transport = self.remote_transport_for_pane(id)?;
+        let pane_uuid = self.remote_uuid_for_pane(id, transport.identity())?;
         let root = std::env::var_os("XDG_CACHE_HOME")
             .map(PathBuf::from)
             .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".cache")))?;
@@ -1870,7 +1895,7 @@ impl Pty {
         if let Some(remote_cwd) = self.remote_cwd_for_pane(id) {
             return Some(remote_cwd);
         }
-        if self.coder_workspace_for_pane(id).is_some() {
+        if self.remote_transport_for_pane(id).is_some() {
             return self.terminal_cwds.get(&id).cloned();
         }
         self.id_to_child_pid
@@ -1884,9 +1909,13 @@ impl Pty {
             .or_else(|| self.terminal_cwds.get(&id).cloned())
     }
 
-    fn request_remote_pane_close(&self, id: u32, workspace: &str) {
-        if let Some(pane_uuid) = self.remote_uuid_for_pane(id, workspace) {
-            let _ = zellij_utils::remote_session_cleanup::queue_coder_close(workspace, &pane_uuid);
+    fn request_remote_pane_close(
+        &self,
+        id: u32,
+        transport: &zellij_utils::remote_session_cleanup::RemoteCloseTransport,
+    ) {
+        if let Some(pane_uuid) = self.remote_uuid_for_pane(id, transport.identity()) {
+            let _ = zellij_utils::remote_session_cleanup::queue_remote_close(transport, &pane_uuid);
         }
     }
 
@@ -2042,17 +2071,17 @@ impl Pty {
         for terminal_id in terminal_ids {
             let process_id = self.id_to_child_pid.get(&terminal_id);
             let remote_cwd = self.remote_cwd_for_pane(terminal_id);
-            let coder_workspace = self.coder_workspace_for_pane(terminal_id);
-            let cwd = if coder_workspace.is_some() {
+            let remote_transport = self.remote_transport_for_pane(terminal_id);
+            let cwd = if remote_transport.is_some() {
                 remote_cwd.as_ref()
             } else {
                 process_id.and_then(|pid| pids_to_cwds.get(pid))
             };
             let cmd_sysinfo = process_id.and_then(|pid| pids_to_cmds.get(pid));
             let cmd_ps = process_id.and_then(|pid| ppids_to_cmds.get(&format!("{}", pid)));
-            if let Some(workspace) = coder_workspace.as_deref() {
+            if let Some(transport) = remote_transport.as_ref() {
                 if let Some(mut command) = self.terminal_cmds.get(&terminal_id).cloned() {
-                    // A serialized Coder pane must name its remote UUID
+                    // A serialized remote pane must name its remote UUID
                     // explicitly. Local terminal allocation is usually stable,
                     // but the saved UUID is the durable identity and must win if
                     // allocation order changes during resurrection.
@@ -2062,7 +2091,7 @@ impl Pty {
                         command.extend([
                             "--pane-id".into(),
                             zellij_utils::data::stable_remote_pane_uuid(
-                                workspace,
+                                transport.identity(),
                                 &session,
                                 PaneId::Terminal(terminal_id).into(),
                             ),
@@ -2144,7 +2173,7 @@ impl Pty {
         Ok(())
     }
     fn capture_initial_cwd(&mut self, terminal_id: u32, child_pid: u32) {
-        if self.coder_workspace_for_pane(terminal_id).is_some() {
+        if self.remote_transport_for_pane(terminal_id).is_some() {
             if let Some(cwd) = self.remote_cwd_for_pane(terminal_id) {
                 self.terminal_cwds.insert(terminal_id, cwd);
             }
@@ -2192,7 +2221,7 @@ impl Pty {
         for terminal_id in &active_terminal_ids {
             let process_id = self.id_to_child_pid.get(terminal_id);
             let remote_cwd = self.remote_cwd_for_pane(*terminal_id);
-            let cwd = if self.coder_workspace_for_pane(*terminal_id).is_some() {
+            let cwd = if self.remote_transport_for_pane(*terminal_id).is_some() {
                 remote_cwd.as_ref()
             } else {
                 process_id.and_then(|pid| pids_to_cwds.get(pid))

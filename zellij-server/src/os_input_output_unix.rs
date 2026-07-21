@@ -198,7 +198,7 @@ fn handle_openpty(
     let pid_primary = open_pty_res.master;
     let pid_secondary = open_pty_res.slave;
 
-    forward_coder_cwd(&mut cmd);
+    forward_remote_cwd(&mut cmd);
 
     if !command_exists(&cmd) {
         return Err(ZellijError::CommandNotFound {
@@ -251,19 +251,17 @@ fn handle_openpty(
     Ok((pid_primary, child_id as RawFd))
 }
 
-/// A provider-backed shell interprets pane cwd in the workspace, not on the
+/// A provider-backed shell interprets pane cwd on the remote host, not on the
 /// laptop. Carry it as a bridge argument and prevent Command from trying to
 /// chdir into a path that may not exist locally.
-fn forward_coder_cwd(cmd: &mut RunCommand) {
+fn forward_remote_cwd(cmd: &mut RunCommand) {
     let is_flock = cmd.command == std::path::Path::new("flock") || cmd.command.is_absolute();
-    let is_coder_pty = matches!(
+    let is_remote_pty = matches!(
         cmd.args.as_slice(),
-        [remote_agent, coder_pty, workspace_flag, _, ..]
-            if remote_agent == "remote-agent"
-                && coder_pty == "coder-pty"
-                && workspace_flag == "--workspace"
+        [remote_agent, remote_pty, ..]
+            if remote_agent == "remote-agent" && remote_pty == "remote-pty"
     );
-    if is_flock && is_coder_pty {
+    if is_flock && is_remote_pty {
         if let Some(cwd) = cmd.cwd.take() {
             cmd.args.push("--cwd".into());
             cmd.args.push(cwd.to_string_lossy().into_owned());
@@ -484,12 +482,14 @@ mod tests {
     use std::io::Read;
 
     #[test]
-    fn coder_bridge_forwards_remote_cwd_as_an_argument() {
+    fn remote_bridge_forwards_remote_cwd_as_an_argument() {
         let mut command = RunCommand {
             command: "/tmp/custom-flock".into(),
             args: vec![
                 "remote-agent".into(),
-                "coder-pty".into(),
+                "remote-pty".into(),
+                "--provider".into(),
+                "coder".into(),
                 "--workspace".into(),
                 "alice/api".into(),
             ],
@@ -497,11 +497,11 @@ mod tests {
             ..Default::default()
         };
 
-        forward_coder_cwd(&mut command);
+        forward_remote_cwd(&mut command);
 
         assert_eq!(command.cwd, None);
         assert_eq!(
-            &command.args[4..],
+            &command.args[6..],
             &["--cwd".to_owned(), "/workspace/api".to_owned()]
         );
     }

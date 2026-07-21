@@ -7,15 +7,13 @@ use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::fuzzy::fuzzy_match;
+use crate::remote_bootstrap;
 
 pub const LIST_CONTEXT_KEY: &str = "flock_coder_list";
 pub const STOP_CONTEXT_KEY: &str = "flock_coder_stop";
 pub const TEMPLATE_LIST_CONTEXT_KEY: &str = "flock_coder_template_list";
 pub const CREATE_CONTEXT_KEY: &str = "flock_coder_create";
 pub const BOOTSTRAP_CONTEXT_KEY: &str = "flock_coder_bootstrap";
-
-pub const RELEASE_TAG: &str = "v26.4.0";
-pub const RELEASE_BASE_URL: &str = "https://github.com/abeljim8am/flock/releases/download";
 
 const CACHE_PATH: &str = "/data/coder-workspaces.json";
 const FALLBACK_NAME: &str = "coder";
@@ -92,7 +90,9 @@ pub fn remote_pty_argv(
     let mut argv = vec![
         executable.unwrap_or("flock").into(),
         "remote-agent".into(),
-        "coder-pty".into(),
+        "remote-pty".into(),
+        "--provider".into(),
+        "coder".into(),
         "--workspace".into(),
         identifier.into(),
     ];
@@ -104,10 +104,10 @@ pub fn remote_pty_argv(
 
 pub fn parse_gateway(argv: &[String]) -> Option<&str> {
     match argv {
-        [flock, remote_agent, coder_pty, args @ ..]
+        [flock, remote_agent, remote_pty, args @ ..]
             if is_flock_executable(flock)
                 && remote_agent == "remote-agent"
-                && coder_pty == "coder-pty" =>
+                && remote_pty == "remote-pty" =>
         {
             parse_remote_pty_args(args)
         },
@@ -116,13 +116,14 @@ pub fn parse_gateway(argv: &[String]) -> Option<&str> {
 }
 
 fn parse_remote_pty_args(args: &[String]) -> Option<&str> {
-    if let [workspace] = args {
-        return valid_identifier(workspace).then_some(workspace);
-    }
     let mut chunks = args.chunks_exact(2);
+    let mut provider = None;
     let mut workspace = None;
     for chunk in &mut chunks {
         match chunk {
+            [flag, value] if flag == "--provider" && provider.is_none() => {
+                provider = Some(value.as_str());
+            },
             [flag, value] if flag == "--workspace" && workspace.is_none() => {
                 workspace = Some(value.as_str());
             },
@@ -133,6 +134,9 @@ fn parse_remote_pty_args(args: &[String]) -> Option<&str> {
     if !chunks.remainder().is_empty() {
         return None;
     }
+    if provider != Some("coder") {
+        return None;
+    }
     workspace.filter(|workspace| valid_identifier(workspace))
 }
 
@@ -140,41 +144,12 @@ fn is_flock_executable(executable: &str) -> bool {
     executable == "flock" || (Path::new(executable).is_absolute() && !executable.is_empty())
 }
 
-/// Bootstrap the fork into a versioned user directory in the workspace. The
-/// static musl build is intentionally Linux/x86_64-only for v1. Installation is
-/// atomic and checksum verified; repeated calls are cheap.
+/// Bootstrap the fork into a versioned user directory in the workspace using
+/// the shared arch-detecting install script (Linux x86_64 + aarch64).
 pub fn bootstrap_argv(identifier: &str, debug_binary: Option<&str>) -> Vec<String> {
     if let Some(debug_binary) = debug_binary {
         return debug_bootstrap_argv(identifier, debug_binary);
     }
-    let script = format!(
-        r#"set -eu
-[ "$(uname -s)" = Linux ] && [ "$(uname -m)" = x86_64 ] || {{ echo "flock: persistent Coder sessions currently require Linux x86_64" >&2; exit 65; }}
-root="$HOME/.local/share/flock"
-dest="$root/{tag}"
-[ -x "$dest/flock" ] && {{ mkdir -p "$root" "$HOME/.local/bin"; ln -sfn "$dest" "$root/current"; ln -sfn "$dest/flock" "$HOME/.local/bin/flock"; exit 0; }}
-tmp="$root/.bootstrap.$$"
-mkdir -p "$tmp" "$dest"
-trap "rm -rf \"$tmp\"" EXIT HUP INT TERM
-base="{base}/{tag}"
-archive="$tmp/flock.tar.gz"
-checksum="$tmp/flock.sha256sum"
-fetch() {{ if command -v curl >/dev/null 2>&1; then curl -fsSL "$1" -o "$2"; elif command -v wget >/dev/null 2>&1; then wget -qO "$2" "$1"; elif command -v python3 >/dev/null 2>&1; then python3 -c "import sys,urllib.request; urllib.request.urlretrieve(sys.argv[1],sys.argv[2])" "$1" "$2"; else echo "flock: curl, wget, or python3 is required to install remote Zellij" >&2; exit 69; fi; }}
-fetch "$base/flock-x86_64-unknown-linux-musl.tar.gz" "$archive"
-fetch "$base/flock-x86_64-unknown-linux-musl.sha256sum" "$checksum"
-tar -xzf "$archive" -C "$tmp"
-IFS=" " read -r expected _ < "$checksum"
-actual="$(sha256sum "$tmp/flock")"
-actual="${{actual%% *}}"
-[ -n "$expected" ] && [ "$expected" = "$actual" ] || {{ echo "flock: remote Zellij checksum verification failed" >&2; exit 74; }}
-install -m 0755 "$tmp/flock" "$dest/flock.new"
-mv -f "$dest/flock.new" "$dest/flock"
-mkdir -p "$HOME/.local/bin"
-ln -sfn "$dest" "$root/current"
-ln -sfn "$dest/flock" "$HOME/.local/bin/flock""#,
-        tag = RELEASE_TAG,
-        base = RELEASE_BASE_URL,
-    );
     vec![
         "coder".into(),
         "ssh".into(),
@@ -182,31 +157,15 @@ ln -sfn "$dest/flock" "$HOME/.local/bin/flock""#,
         "--".into(),
         "sh".into(),
         "-c".into(),
-        quote_coder_remote_arg(&script),
+        remote_bootstrap::quote_remote_script_arg(&remote_bootstrap::install_script()),
     ]
 }
 
-/// Stream an explicitly selected local Linux x86_64 binary over `coder ssh`.
-/// The binary path and workspace are positional shell arguments, never
-/// interpolated into either script. This keeps spaces and shell metacharacters
-/// inert while allowing the remote `cat` to receive the executable on stdin.
+/// Stream an explicitly selected local binary over `coder ssh`. The binary
+/// path and workspace are positional shell arguments, never interpolated into
+/// either script. This keeps spaces and shell metacharacters inert while
+/// allowing the remote `cat` to receive the executable on stdin.
 fn debug_bootstrap_argv(identifier: &str, debug_binary: &str) -> Vec<String> {
-    let remote_script = format!(
-        r#"set -eu
-[ "$(uname -s)" = Linux ] && [ "$(uname -m)" = x86_64 ] || {{ echo "flock: debug remote agent requires Linux x86_64" >&2; exit 65; }}
-root="$HOME/.local/share/flock"
-dest="$root/{tag}-debug"
-tmp="$dest/.flock.$$"
-mkdir -p "$dest" "$HOME/.local/bin"
-trap "rm -f \"$tmp\"" EXIT HUP INT TERM
-cat > "$tmp"
-chmod 0755 "$tmp"
-"$tmp" --version >/dev/null
-mv -f "$tmp" "$dest/flock"
-ln -sfn "$dest" "$root/current"
-ln -sfn "$dest/flock" "$HOME/.local/bin/flock""#,
-        tag = RELEASE_TAG,
-    );
     let local_script = format!(
         r#"set -eu
 binary="$1"
@@ -215,7 +174,7 @@ workspace="$2"
 remote={}
 remote="'"$remote"'"
 coder ssh "$workspace" -- sh -c "$remote" < "$binary""#,
-        quote_coder_remote_arg(&remote_script),
+        remote_bootstrap::quote_remote_script_arg(&remote_bootstrap::debug_install_script()),
     );
     vec![
         "sh".into(),
@@ -225,20 +184,6 @@ coder ssh "$workspace" -- sh -c "$remote" < "$binary""#,
         debug_binary.into(),
         identifier.into(),
     ]
-}
-
-/// `coder ssh` joins command arguments into a command line for the workspace's
-/// configured shell before invoking `sh`. A single-quoted argument is understood
-/// by both POSIX shells and Fish, but there is no shared way to escape a single
-/// quote inside it. Keep the generated bootstrap script free of single quotes
-/// and fail loudly if a future edit violates that transport invariant. Use a
-/// non-login `sh`: login-shell logout hooks can overwrite a successful exit code.
-fn quote_coder_remote_arg(value: &str) -> String {
-    assert!(
-        !value.contains('\''),
-        "Coder remote scripts must not contain single quotes"
-    );
-    format!("'{value}'")
 }
 
 pub fn bootstrap_context(identifier: &str) -> BTreeMap<String, String> {
@@ -1180,7 +1125,8 @@ mod tests {
         assert_eq!(parse_gateway(&gateway), Some("alice/api"));
         assert_eq!(gateway[0], "flock");
         assert_eq!(gateway[1], "remote-agent");
-        assert_eq!(gateway[2], "coder-pty");
+        assert_eq!(gateway[2], "remote-pty");
+        assert_eq!(&gateway[3..5], &["--provider", "coder"]);
         let debug_gateway =
             remote_pty_argv("alice/api", None, Some("/workspace/target/debug/flock"));
         assert_eq!(debug_gateway[0], "/workspace/target/debug/flock");
@@ -1195,12 +1141,19 @@ mod tests {
             .last()
             .unwrap()
             .contains("x86_64-unknown-linux-musl"));
+        assert!(bootstrap
+            .last()
+            .unwrap()
+            .contains("aarch64-unknown-linux-musl"));
+        assert!(bootstrap
+            .last()
+            .unwrap()
+            .contains(r#"case "$(uname -s)/$(uname -m)""#));
         assert!(bootstrap.last().unwrap().contains("sha256sum"));
         assert!(!bootstrap.last().unwrap().contains("alice/api"));
         assert!(bootstrap.last().unwrap().starts_with("'set -eu"));
         assert!(bootstrap.last().unwrap().ends_with('\''));
         assert_eq!(bootstrap.last().unwrap().matches('\'').count(), 2);
-        assert_eq!(quote_coder_remote_arg("printf %s"), "'printf %s'");
 
         let debug = bootstrap_argv(
             "alice/api",
@@ -1215,11 +1168,5 @@ mod tests {
         assert!(debug[2].contains("< \"$binary\""));
         assert!(!debug[2].contains("/workspace/target/debug"));
         assert!(!debug[2].contains("alice/api"));
-    }
-
-    #[test]
-    #[should_panic(expected = "Coder remote scripts must not contain single quotes")]
-    fn coder_remote_arg_rejects_fish_incompatible_single_quotes() {
-        quote_coder_remote_arg("printf '%s'");
     }
 }

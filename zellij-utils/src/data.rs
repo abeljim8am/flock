@@ -1935,6 +1935,20 @@ pub enum RemoteBackend {
         workspace: String,
         local_session_id: String,
     },
+    Ssh {
+        /// Display label from the saved host entry; identity keys on
+        /// `destination` so renaming a saved host never orphans panes.
+        name: String,
+        destination: String,
+        #[serde(default)]
+        extra_args: Vec<String>,
+        local_session_id: String,
+    },
+    Devcontainer {
+        /// Normalized absolute host path of the project folder.
+        workspace_folder: String,
+        local_session_id: String,
+    },
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]

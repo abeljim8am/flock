@@ -7563,6 +7563,20 @@ fn session_info_remote_backend_and_pane_cursor_round_trip() {
 }
 
 #[test]
+fn session_info_ssh_remote_backend_round_trips() {
+    let mut session_info = SessionInfo::new("dev-box".to_owned());
+    session_info.remote_backend = Some(RemoteBackend::Ssh {
+        name: "Dev Box".into(),
+        destination: "abel@dev.example.com".into(),
+        extra_args: vec!["-p".into(), "2222".into()],
+        local_session_id: "dev-box".into(),
+    });
+    let serialized = session_info.to_string();
+    let deserialized = SessionInfo::from_string(&serialized, "other").unwrap();
+    assert_eq!(deserialized.remote_backend, session_info.remote_backend);
+}
+
+#[test]
 fn config_options_to_string_with_comments() {
     let fake_config = r##"
         simplified_ui true

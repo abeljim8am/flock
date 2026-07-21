@@ -154,21 +154,39 @@ pub enum RemoteAgentCommand {
         #[clap(long, value_parser)]
         socket: Option<PathBuf>,
     },
-    /// Local terminal bridge for a Coder-owned remote PTY.
-    #[clap(name = "coder-pty", hide = true)]
-    CoderPty {
+    /// Local terminal bridge for a daemon-owned remote PTY.
+    #[clap(name = "remote-pty", hide = true)]
+    RemotePty {
+        /// Remote provider: "coder" (requires --workspace), "ssh" (requires
+        /// --destination), or "devcontainer" (requires --workspace-folder).
         #[clap(long, value_parser)]
-        workspace: String,
+        provider: String,
+        #[clap(long, value_parser)]
+        workspace: Option<String>,
+        #[clap(long, value_parser)]
+        destination: Option<String>,
+        #[clap(long = "ssh-arg", value_parser, multiple_occurrences = true)]
+        ssh_arg: Vec<String>,
+        #[clap(long, value_parser)]
+        workspace_folder: Option<String>,
         #[clap(long, value_parser)]
         pane_id: Option<String>,
         #[clap(long, value_parser)]
         cwd: Option<PathBuf>,
     },
-    /// Close a Coder-owned remote PTY after an explicit local pane close.
-    #[clap(name = "coder-close", hide = true)]
-    CoderClose {
+    /// Close a daemon-owned remote PTY after an explicit local pane close.
+    #[clap(name = "remote-close", hide = true)]
+    RemoteClose {
         #[clap(long, value_parser)]
-        workspace: String,
+        provider: String,
+        #[clap(long, value_parser)]
+        workspace: Option<String>,
+        #[clap(long, value_parser)]
+        destination: Option<String>,
+        #[clap(long = "ssh-arg", value_parser, multiple_occurrences = true)]
+        ssh_arg: Vec<String>,
+        #[clap(long, value_parser)]
+        workspace_folder: Option<String>,
         #[clap(long, value_parser)]
         pane_id: String,
     },
