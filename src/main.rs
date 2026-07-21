@@ -65,7 +65,7 @@ fn main() {
         #[cfg(not(unix))]
         {
             let _ = command;
-            eprintln!("flock remote-agent is only supported on Linux x86_64");
+            eprintln!("flock remote-agent is only supported on Linux");
             std::process::exit(65);
         }
     }

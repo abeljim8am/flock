@@ -36,6 +36,7 @@ mod fuzzy;
 mod live_sessions;
 mod palette;
 mod ranking;
+mod remote_bootstrap;
 mod session;
 mod ui;
 

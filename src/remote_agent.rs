@@ -1192,8 +1192,10 @@ fn local_terminal_size() -> (u16, u16) {
 }
 
 fn require_supported_platform() -> Result<()> {
-    if std::env::consts::OS != "linux" || std::env::consts::ARCH != "x86_64" {
-        bail!("unsupported platform: remote Coder workspaces require Linux x86_64");
+    if std::env::consts::OS != "linux"
+        || !matches!(std::env::consts::ARCH, "x86_64" | "aarch64")
+    {
+        bail!("unsupported platform: remote sessions require Linux x86_64 or aarch64");
     }
     Ok(())
 }
