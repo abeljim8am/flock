@@ -329,6 +329,12 @@ struct OutputChunk {
     data: Vec<u8>,
 }
 
+/// Grace before a hook-reported agent that has left the pane's foreground is
+/// considered gone. The foreground poll arrives roughly once per second, so
+/// this tolerates a few transitional polls (an agent handing the terminal to
+/// an interactive subprocess) without flapping to released.
+const AGENT_GONE_GRACE: Duration = Duration::from_secs(4);
+
 struct PaneState {
     id: Uuid,
     pid: libc::pid_t,
@@ -338,6 +344,7 @@ struct PaneState {
     next_sequence: Mutex<u64>,
     subscribers: Mutex<Vec<mpsc::Sender<ServerMessage>>>,
     latest_agent_state: Mutex<Option<RemoteAgentStateEvent>>,
+    agent_missing_since: Mutex<Option<Instant>>,
     exit_status: Mutex<Option<Option<i32>>>,
 }
 
@@ -417,9 +424,59 @@ impl PaneState {
     fn record_agent_state(&self, event: RemoteAgentStateEvent) {
         let mut subscribers = self.subscribers.lock().unwrap();
         *self.latest_agent_state.lock().unwrap() = Some(event.clone());
+        // A fresh report proves the agent is alive; close any pending
+        // gone-window so a transient foreground mismatch cannot release it.
+        *self.agent_missing_since.lock().unwrap() = None;
         let message = ServerMessage::AgentStateChanged { event };
         subscribers.retain(|subscriber| subscriber.send(message.clone()).is_ok());
     }
+
+    /// Hook channels only report working/idle/blocked — nothing fires when the
+    /// agent process exits, so without this the last reported state would be
+    /// replayed as live forever. Cross-check the report against the pane's
+    /// foreground argv and synthesize a release once the agent stays out of
+    /// the foreground past `grace` (pass `Duration::ZERO` when a stale state
+    /// must settle immediately, e.g. on attach after a long detach).
+    fn reconcile_agent_with_foreground(&self, argv: &[String], grace: Duration) {
+        if argv.is_empty() {
+            // No foreground information (pgrp leader already reaped, or a
+            // mid-transition read); leave the gone-window untouched rather
+            // than guessing in either direction.
+            return;
+        }
+        let Some(event) = self.latest_agent_state.lock().unwrap().clone() else {
+            return;
+        };
+        if event.state == RemoteAgentRunState::Release || agent_matches_argv(&event.agent, argv) {
+            *self.agent_missing_since.lock().unwrap() = None;
+            return;
+        }
+        {
+            let mut missing_since = self.agent_missing_since.lock().unwrap();
+            let since = *missing_since.get_or_insert_with(Instant::now);
+            if since.elapsed() < grace {
+                return;
+            }
+        }
+        self.record_agent_state(RemoteAgentStateEvent {
+            pane_id: self.id,
+            state: RemoteAgentRunState::Release,
+            agent: event.agent,
+        });
+    }
+}
+
+/// Whether the reported agent label still describes the foreground argv. The
+/// daemon cannot reuse the sidebar's full command detection, so it matches the
+/// label as a substring of any argv token — covering direct binaries
+/// (`opencode`), absolute paths, runtime wrappers (`node …/opencode/index.js`)
+/// and nix wrapper names (`.claude-unwrapped`). A false "still here" merely
+/// keeps today's behavior until the next signal; a false "gone" would close a
+/// live agent, so matching stays deliberately loose.
+fn agent_matches_argv(agent: &str, argv: &[String]) -> bool {
+    let agent = agent.to_ascii_lowercase();
+    argv.iter()
+        .any(|token| token.to_ascii_lowercase().contains(&agent))
 }
 
 type TransportWriter = Arc<Mutex<Box<dyn Write + Send>>>;
@@ -1454,6 +1511,11 @@ fn handle_client(stream: UnixStream, panes: Panes) -> Result<()> {
                     })?;
                     continue;
                 };
+                // The foreground poll only runs while a client is attached, so
+                // an agent closed during a detach would otherwise be replayed
+                // as still open; settle it before the replay.
+                let (argv, _) = foreground_process(pane.master.lock().unwrap().as_raw_fd());
+                pane.reconcile_agent_with_foreground(&argv, Duration::ZERO);
                 pane.subscribe_with_replay(after_sequence, &tx)?;
                 let exit_status = *pane.exit_status.lock().unwrap();
                 if let Some(status) = exit_status {
@@ -1478,6 +1540,7 @@ fn handle_client(stream: UnixStream, panes: Panes) -> Result<()> {
             ClientMessage::ForegroundProcess { pane_id } => {
                 with_pane(&panes, pane_id, &tx, |pane| {
                     let (argv, cwd) = foreground_process(pane.master.lock().unwrap().as_raw_fd());
+                    pane.reconcile_agent_with_foreground(&argv, AGENT_GONE_GRACE);
                     tx.send(ServerMessage::ForegroundProcess { pane_id, argv, cwd })?;
                     Ok(())
                 })?
@@ -1615,6 +1678,7 @@ fn spawn_pane_with_shell(
         next_sequence: Mutex::new(1),
         subscribers: Mutex::new(Vec::new()),
         latest_agent_state: Mutex::new(None),
+        agent_missing_since: Mutex::new(None),
         exit_status: Mutex::new(None),
     }))
 }
@@ -1790,6 +1854,7 @@ mod tests {
             next_sequence: Mutex::new(1),
             subscribers: Mutex::new(Vec::new()),
             latest_agent_state: Mutex::new(None),
+            agent_missing_since: Mutex::new(None),
             exit_status: Mutex::new(None),
         };
         pane.record_output(vec![1; HISTORY_LIMIT_BYTES]);
@@ -1815,6 +1880,7 @@ mod tests {
             next_sequence: Mutex::new(1),
             subscribers: Mutex::new(Vec::new()),
             latest_agent_state: Mutex::new(None),
+            agent_missing_since: Mutex::new(None),
             exit_status: Mutex::new(None),
         };
         pane.record_output(b"replay".to_vec());
@@ -1858,6 +1924,7 @@ mod tests {
             next_sequence: Mutex::new(1),
             subscribers: Mutex::new(Vec::new()),
             latest_agent_state: Mutex::new(None),
+            agent_missing_since: Mutex::new(None),
             exit_status: Mutex::new(None),
         };
         pane.record_agent_state(RemoteAgentStateEvent {
@@ -1887,6 +1954,95 @@ mod tests {
     }
 
     #[test]
+    fn agent_label_matches_common_foreground_argv_shapes() {
+        let argv = |args: &[&str]| args.iter().map(|arg| arg.to_string()).collect::<Vec<_>>();
+        assert!(agent_matches_argv("opencode", &argv(&["opencode"])));
+        assert!(agent_matches_argv(
+            "opencode",
+            &argv(&["/home/coder/.opencode/bin/opencode", "--continue"])
+        ));
+        assert!(agent_matches_argv(
+            "opencode",
+            &argv(&["node", "/usr/lib/opencode/index.js"])
+        ));
+        assert!(agent_matches_argv(
+            "claude",
+            &argv(&["/nix/store/abc123-claude-code/bin/.claude-unwrapped"])
+        ));
+        assert!(!agent_matches_argv("opencode", &argv(&["-fish"])));
+        assert!(!agent_matches_argv("opencode", &argv(&["vim", "notes.md"])));
+    }
+
+    #[test]
+    fn foreground_reconcile_releases_hook_agent_once_it_stays_gone() {
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open("/dev/null")
+            .unwrap();
+        let pane_id = Uuid::new_v4();
+        let pane = PaneState {
+            id: pane_id,
+            pid: 1,
+            master: Mutex::new(file),
+            history: Mutex::new(VecDeque::new()),
+            history_bytes: Mutex::new(0),
+            next_sequence: Mutex::new(1),
+            subscribers: Mutex::new(Vec::new()),
+            latest_agent_state: Mutex::new(None),
+            agent_missing_since: Mutex::new(None),
+            exit_status: Mutex::new(None),
+        };
+        let argv = |args: &[&str]| args.iter().map(|arg| arg.to_string()).collect::<Vec<_>>();
+
+        // No reported agent: reconcile is a no-op.
+        pane.reconcile_agent_with_foreground(&argv(&["-fish"]), Duration::ZERO);
+        assert!(pane.latest_agent_state.lock().unwrap().is_none());
+
+        pane.record_agent_state(RemoteAgentStateEvent {
+            pane_id,
+            state: RemoteAgentRunState::Working,
+            agent: "opencode".into(),
+        });
+        let (tx, rx) = mpsc::channel();
+        pane.subscribers.lock().unwrap().push(tx);
+
+        // Matching foreground and empty (inconclusive) reads keep the agent.
+        pane.reconcile_agent_with_foreground(&argv(&["opencode"]), Duration::ZERO);
+        pane.reconcile_agent_with_foreground(&[], Duration::ZERO);
+        assert!(rx.try_iter().next().is_none());
+
+        // A mismatch opens the gone-window but holds inside the grace.
+        pane.reconcile_agent_with_foreground(&argv(&["-fish"]), Duration::from_secs(3600));
+        assert!(rx.try_iter().next().is_none());
+        assert!(pane.agent_missing_since.lock().unwrap().is_some());
+
+        // A fresh hook report closes the window again.
+        pane.record_agent_state(RemoteAgentStateEvent {
+            pane_id,
+            state: RemoteAgentRunState::Idle,
+            agent: "opencode".into(),
+        });
+        assert!(pane.agent_missing_since.lock().unwrap().is_none());
+        let _ = rx.try_iter().count();
+
+        // Past the grace (zero, as on attach) the release is synthesized once.
+        pane.reconcile_agent_with_foreground(&argv(&["-fish"]), Duration::ZERO);
+        assert!(matches!(
+            rx.try_iter().next(),
+            Some(ServerMessage::AgentStateChanged {
+                event: RemoteAgentStateEvent {
+                    state: RemoteAgentRunState::Release,
+                    ref agent,
+                    ..
+                }
+            }) if agent == "opencode"
+        ));
+        pane.reconcile_agent_with_foreground(&argv(&["-fish"]), Duration::ZERO);
+        assert!(rx.try_iter().next().is_none());
+    }
+
+    #[test]
     fn daemon_acknowledges_and_broadcasts_agent_state_reports() {
         let file = OpenOptions::new()
             .read(true)
@@ -1903,6 +2059,7 @@ mod tests {
             next_sequence: Mutex::new(1),
             subscribers: Mutex::new(Vec::new()),
             latest_agent_state: Mutex::new(None),
+            agent_missing_since: Mutex::new(None),
             exit_status: Mutex::new(None),
         });
         let panes = Arc::new(Mutex::new(HashMap::from_iter([(pane_id, pane.clone())])));
