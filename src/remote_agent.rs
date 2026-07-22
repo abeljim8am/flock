@@ -329,6 +329,12 @@ struct OutputChunk {
     data: Vec<u8>,
 }
 
+/// Grace before a hook-reported agent that has left the pane's foreground is
+/// considered gone. The foreground poll arrives roughly once per second, so
+/// this tolerates a few transitional polls (an agent handing the terminal to
+/// an interactive subprocess) without flapping to released.
+const AGENT_GONE_GRACE: Duration = Duration::from_secs(4);
+
 struct PaneState {
     id: Uuid,
     pid: libc::pid_t,
@@ -338,6 +344,7 @@ struct PaneState {
     next_sequence: Mutex<u64>,
     subscribers: Mutex<Vec<mpsc::Sender<ServerMessage>>>,
     latest_agent_state: Mutex<Option<RemoteAgentStateEvent>>,
+    agent_missing_since: Mutex<Option<Instant>>,
     exit_status: Mutex<Option<Option<i32>>>,
 }
 
@@ -417,9 +424,59 @@ impl PaneState {
     fn record_agent_state(&self, event: RemoteAgentStateEvent) {
         let mut subscribers = self.subscribers.lock().unwrap();
         *self.latest_agent_state.lock().unwrap() = Some(event.clone());
+        // A fresh report proves the agent is alive; close any pending
+        // gone-window so a transient foreground mismatch cannot release it.
+        *self.agent_missing_since.lock().unwrap() = None;
         let message = ServerMessage::AgentStateChanged { event };
         subscribers.retain(|subscriber| subscriber.send(message.clone()).is_ok());
     }
+
+    /// Hook channels only report working/idle/blocked — nothing fires when the
+    /// agent process exits, so without this the last reported state would be
+    /// replayed as live forever. Cross-check the report against the pane's
+    /// foreground argv and synthesize a release once the agent stays out of
+    /// the foreground past `grace` (pass `Duration::ZERO` when a stale state
+    /// must settle immediately, e.g. on attach after a long detach).
+    fn reconcile_agent_with_foreground(&self, argv: &[String], grace: Duration) {
+        if argv.is_empty() {
+            // No foreground information (pgrp leader already reaped, or a
+            // mid-transition read); leave the gone-window untouched rather
+            // than guessing in either direction.
+            return;
+        }
+        let Some(event) = self.latest_agent_state.lock().unwrap().clone() else {
+            return;
+        };
+        if event.state == RemoteAgentRunState::Release || agent_matches_argv(&event.agent, argv) {
+            *self.agent_missing_since.lock().unwrap() = None;
+            return;
+        }
+        {
+            let mut missing_since = self.agent_missing_since.lock().unwrap();
+            let since = *missing_since.get_or_insert_with(Instant::now);
+            if since.elapsed() < grace {
+                return;
+            }
+        }
+        self.record_agent_state(RemoteAgentStateEvent {
+            pane_id: self.id,
+            state: RemoteAgentRunState::Release,
+            agent: event.agent,
+        });
+    }
+}
+
+/// Whether the reported agent label still describes the foreground argv. The
+/// daemon cannot reuse the sidebar's full command detection, so it matches the
+/// label as a substring of any argv token — covering direct binaries
+/// (`opencode`), absolute paths, runtime wrappers (`node …/opencode/index.js`)
+/// and nix wrapper names (`.claude-unwrapped`). A false "still here" merely
+/// keeps today's behavior until the next signal; a false "gone" would close a
+/// live agent, so matching stays deliberately loose.
+fn agent_matches_argv(agent: &str, argv: &[String]) -> bool {
+    let agent = agent.to_ascii_lowercase();
+    argv.iter()
+        .any(|token| token.to_ascii_lowercase().contains(&agent))
 }
 
 type TransportWriter = Arc<Mutex<Box<dyn Write + Send>>>;
@@ -1022,8 +1079,21 @@ fn run_remote_transport(
     match read_frame::<_, ServerMessage>(&mut child_stdout)? {
         ServerMessage::Hello {
             protocol: PROTOCOL_VERSION,
-            ..
-        } => {},
+            agent_version,
+        } => {
+            // Same protocol, different build: the daemon kept running because
+            // it still holds panes (an idle daemon retires itself at hello).
+            // Tell the user why the remote may lag behind local fixes, and
+            // report the mismatch to the sidebar so it can offer the upgrade.
+            if agent_version != env!("CARGO_PKG_VERSION") {
+                write!(
+                    io::stdout().lock(),
+                    "\r\n[flock: remote daemon is v{agent_version}, local is v{}; the remote upgrades once its last pane closes]\r\n",
+                    env!("CARGO_PKG_VERSION"),
+                )?;
+                report_daemon_version_to_local_plugin(&agent_version);
+            }
+        },
         ServerMessage::Error { message } => bail!("{message}"),
         message => bail!("unexpected handshake response: {message:?}"),
     }
@@ -1281,25 +1351,71 @@ fn forward_agent_state_to_local_plugin(
     event: &RemoteAgentStateEvent,
 ) -> Result<()> {
     let args = local_agent_state_args(pane_id, event);
+    publish_local_pipe(executable, "flock-state", &args)
+}
+
+/// The pipe name the sidebar listens on for remote daemon version reports —
+/// must stay in sync with `DAEMON_VERSION_PIPE_NAME` in
+/// `default-plugins/flock-sidebar/src/hook.rs`.
+const DAEMON_VERSION_PIPE_NAME: &str = "flock-daemon-version";
+
+/// Fire-and-forget report of the remote daemon's version to the sidebar, so
+/// it can offer closing this pane to let the daemon upgrade. Sent from the
+/// handshake path, so the pipe publisher runs on its own thread — a wedged
+/// local `flock pipe` must not stall the reconnect.
+fn report_daemon_version_to_local_plugin(agent_version: &str) {
+    // The version lands in a `key=value,` wire format; a daemon whose version
+    // string could split it is not worth reporting.
+    if agent_version.is_empty() || agent_version.contains([',', '=']) {
+        return;
+    }
+    let Some(pane_id) = std::env::var("FLOCK_PANE_ID")
+        .ok()
+        .filter(|id| id.parse::<u32>().is_ok())
+    else {
+        return;
+    };
+    let Some(executable) = std::env::var_os("FLOCK_EXECUTABLE")
+        .map(PathBuf::from)
+        .or_else(|| std::env::current_exe().ok())
+    else {
+        return;
+    };
+    let args = daemon_version_args(&pane_id, agent_version);
+    thread::spawn(move || {
+        if let Err(error) = publish_local_pipe(&executable, DAEMON_VERSION_PIPE_NAME, &args) {
+            eprintln!("flock: failed to report remote daemon version: {error:#}");
+        }
+    });
+}
+
+fn daemon_version_args(pane_id: &str, agent_version: &str) -> String {
+    format!(
+        "pane_id={pane_id},daemon_version={agent_version},local_version={}",
+        env!("CARGO_PKG_VERSION")
+    )
+}
+
+fn publish_local_pipe(executable: &Path, pipe_name: &str, args: &str) -> Result<()> {
     let mut child = Command::new(executable)
-        .args(["pipe", "--name", "flock-state", "--args", &args])
+        .args(["pipe", "--name", pipe_name, "--args", args])
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
-        .context("start local flock-state publisher")?;
+        .with_context(|| format!("start local {pipe_name} publisher"))?;
     let deadline = Instant::now() + Duration::from_secs(2);
     loop {
         if let Some(status) = child.try_wait()? {
             if status.success() {
                 return Ok(());
             }
-            bail!("local flock-state publisher exited with {status}");
+            bail!("local {pipe_name} publisher exited with {status}");
         }
         if Instant::now() >= deadline {
             let _ = child.kill();
             let _ = child.wait();
-            bail!("local flock-state publisher timed out");
+            bail!("local {pipe_name} publisher timed out");
         }
         thread::sleep(Duration::from_millis(20));
     }
@@ -1370,6 +1486,39 @@ fn daemon_is_live(socket: &Path) -> bool {
     UnixStream::connect(socket).is_ok()
 }
 
+/// Whether the bootstrap install (`~/.local/share/flock/current/flock`, the
+/// path every transport connects through) is a different file than the
+/// running daemon. Deliberately not a version-string comparison against the
+/// client: when the remote install is stale, retiring on a client mismatch
+/// would respawn the same old binary and retire again, forever. Comparing
+/// against the file on disk only retires when a respawn actually changes
+/// something. Device+inode identity survives the in-place `mv` replace that
+/// leaves `/proc/self/exe` pointing at a deleted path.
+fn installed_binary_differs() -> bool {
+    let Some(home) = std::env::var_os("HOME") else {
+        return false;
+    };
+    let installed = Path::new(&home)
+        .join(".local/share/flock")
+        .join("current")
+        .join("flock");
+    match (
+        file_identity(&installed),
+        file_identity(Path::new("/proc/self/exe")),
+    ) {
+        (Some(installed), Some(running)) => installed != running,
+        // Missing install symlink or unreadable self: unknown territory
+        // (dev daemons, non-bootstrap installs) — never retire on a guess.
+        _ => false,
+    }
+}
+
+fn file_identity(path: &Path) -> Option<(u64, u64)> {
+    use std::os::unix::fs::MetadataExt;
+    let metadata = fs::metadata(path).ok()?;
+    Some((metadata.dev(), metadata.ino()))
+}
+
 fn wait_for_socket(socket: &Path, timeout: Duration) -> Result<()> {
     let started = Instant::now();
     while started.elapsed() < timeout {
@@ -1388,6 +1537,22 @@ fn handle_client(stream: UnixStream, panes: Panes) -> Result<()> {
     let hello: ClientMessage = read_frame(&mut reader)?;
     match hello {
         ClientMessage::Hello { protocol, .. } if protocol == PROTOCOL_VERSION => {
+            // With no panes there is nothing to lose: retire so the client's
+            // reconnect respawns the daemon from the newly installed binary.
+            // A daemon with panes must keep running (its PTYs die with it);
+            // those clients get a version notice instead.
+            if panes.lock().unwrap().is_empty() && installed_binary_differs() {
+                let _ = write_frame(
+                    &mut direct_writer,
+                    &ServerMessage::Error {
+                        message: format!(
+                            "remote daemon v{} retiring: a different flock build is installed and reconnecting starts it",
+                            env!("CARGO_PKG_VERSION"),
+                        ),
+                    },
+                );
+                std::process::exit(0);
+            }
             write_frame(
                 &mut direct_writer,
                 &ServerMessage::Hello {
@@ -1454,6 +1619,11 @@ fn handle_client(stream: UnixStream, panes: Panes) -> Result<()> {
                     })?;
                     continue;
                 };
+                // The foreground poll only runs while a client is attached, so
+                // an agent closed during a detach would otherwise be replayed
+                // as still open; settle it before the replay.
+                let (argv, _) = foreground_process(pane.master.lock().unwrap().as_raw_fd());
+                pane.reconcile_agent_with_foreground(&argv, Duration::ZERO);
                 pane.subscribe_with_replay(after_sequence, &tx)?;
                 let exit_status = *pane.exit_status.lock().unwrap();
                 if let Some(status) = exit_status {
@@ -1478,6 +1648,7 @@ fn handle_client(stream: UnixStream, panes: Panes) -> Result<()> {
             ClientMessage::ForegroundProcess { pane_id } => {
                 with_pane(&panes, pane_id, &tx, |pane| {
                     let (argv, cwd) = foreground_process(pane.master.lock().unwrap().as_raw_fd());
+                    pane.reconcile_agent_with_foreground(&argv, AGENT_GONE_GRACE);
                     tx.send(ServerMessage::ForegroundProcess { pane_id, argv, cwd })?;
                     Ok(())
                 })?
@@ -1615,6 +1786,7 @@ fn spawn_pane_with_shell(
         next_sequence: Mutex::new(1),
         subscribers: Mutex::new(Vec::new()),
         latest_agent_state: Mutex::new(None),
+        agent_missing_since: Mutex::new(None),
         exit_status: Mutex::new(None),
     }))
 }
@@ -1790,6 +1962,7 @@ mod tests {
             next_sequence: Mutex::new(1),
             subscribers: Mutex::new(Vec::new()),
             latest_agent_state: Mutex::new(None),
+            agent_missing_since: Mutex::new(None),
             exit_status: Mutex::new(None),
         };
         pane.record_output(vec![1; HISTORY_LIMIT_BYTES]);
@@ -1815,6 +1988,7 @@ mod tests {
             next_sequence: Mutex::new(1),
             subscribers: Mutex::new(Vec::new()),
             latest_agent_state: Mutex::new(None),
+            agent_missing_since: Mutex::new(None),
             exit_status: Mutex::new(None),
         };
         pane.record_output(b"replay".to_vec());
@@ -1858,6 +2032,7 @@ mod tests {
             next_sequence: Mutex::new(1),
             subscribers: Mutex::new(Vec::new()),
             latest_agent_state: Mutex::new(None),
+            agent_missing_since: Mutex::new(None),
             exit_status: Mutex::new(None),
         };
         pane.record_agent_state(RemoteAgentStateEvent {
@@ -1887,6 +2062,109 @@ mod tests {
     }
 
     #[test]
+    fn file_identity_distinguishes_files_and_tolerates_missing_paths() {
+        let scratch = std::env::temp_dir().join(format!("flock-identity-{}", std::process::id()));
+        fs::write(&scratch, b"x").unwrap();
+        assert_eq!(file_identity(&scratch), file_identity(&scratch));
+        assert!(file_identity(&scratch).is_some());
+        assert_ne!(
+            file_identity(&scratch),
+            file_identity(Path::new("/dev/null"))
+        );
+        assert_eq!(file_identity(Path::new("/nonexistent/flock")), None);
+        fs::remove_file(&scratch).unwrap();
+    }
+
+    #[test]
+    fn agent_label_matches_common_foreground_argv_shapes() {
+        let argv = |args: &[&str]| args.iter().map(|arg| arg.to_string()).collect::<Vec<_>>();
+        assert!(agent_matches_argv("opencode", &argv(&["opencode"])));
+        assert!(agent_matches_argv(
+            "opencode",
+            &argv(&["/home/coder/.opencode/bin/opencode", "--continue"])
+        ));
+        assert!(agent_matches_argv(
+            "opencode",
+            &argv(&["node", "/usr/lib/opencode/index.js"])
+        ));
+        assert!(agent_matches_argv(
+            "claude",
+            &argv(&["/nix/store/abc123-claude-code/bin/.claude-unwrapped"])
+        ));
+        assert!(!agent_matches_argv("opencode", &argv(&["-fish"])));
+        assert!(!agent_matches_argv("opencode", &argv(&["vim", "notes.md"])));
+    }
+
+    #[test]
+    fn foreground_reconcile_releases_hook_agent_once_it_stays_gone() {
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open("/dev/null")
+            .unwrap();
+        let pane_id = Uuid::new_v4();
+        let pane = PaneState {
+            id: pane_id,
+            pid: 1,
+            master: Mutex::new(file),
+            history: Mutex::new(VecDeque::new()),
+            history_bytes: Mutex::new(0),
+            next_sequence: Mutex::new(1),
+            subscribers: Mutex::new(Vec::new()),
+            latest_agent_state: Mutex::new(None),
+            agent_missing_since: Mutex::new(None),
+            exit_status: Mutex::new(None),
+        };
+        let argv = |args: &[&str]| args.iter().map(|arg| arg.to_string()).collect::<Vec<_>>();
+
+        // No reported agent: reconcile is a no-op.
+        pane.reconcile_agent_with_foreground(&argv(&["-fish"]), Duration::ZERO);
+        assert!(pane.latest_agent_state.lock().unwrap().is_none());
+
+        pane.record_agent_state(RemoteAgentStateEvent {
+            pane_id,
+            state: RemoteAgentRunState::Working,
+            agent: "opencode".into(),
+        });
+        let (tx, rx) = mpsc::channel();
+        pane.subscribers.lock().unwrap().push(tx);
+
+        // Matching foreground and empty (inconclusive) reads keep the agent.
+        pane.reconcile_agent_with_foreground(&argv(&["opencode"]), Duration::ZERO);
+        pane.reconcile_agent_with_foreground(&[], Duration::ZERO);
+        assert!(rx.try_iter().next().is_none());
+
+        // A mismatch opens the gone-window but holds inside the grace.
+        pane.reconcile_agent_with_foreground(&argv(&["-fish"]), Duration::from_secs(3600));
+        assert!(rx.try_iter().next().is_none());
+        assert!(pane.agent_missing_since.lock().unwrap().is_some());
+
+        // A fresh hook report closes the window again.
+        pane.record_agent_state(RemoteAgentStateEvent {
+            pane_id,
+            state: RemoteAgentRunState::Idle,
+            agent: "opencode".into(),
+        });
+        assert!(pane.agent_missing_since.lock().unwrap().is_none());
+        let _ = rx.try_iter().count();
+
+        // Past the grace (zero, as on attach) the release is synthesized once.
+        pane.reconcile_agent_with_foreground(&argv(&["-fish"]), Duration::ZERO);
+        assert!(matches!(
+            rx.try_iter().next(),
+            Some(ServerMessage::AgentStateChanged {
+                event: RemoteAgentStateEvent {
+                    state: RemoteAgentRunState::Release,
+                    ref agent,
+                    ..
+                }
+            }) if agent == "opencode"
+        ));
+        pane.reconcile_agent_with_foreground(&argv(&["-fish"]), Duration::ZERO);
+        assert!(rx.try_iter().next().is_none());
+    }
+
+    #[test]
     fn daemon_acknowledges_and_broadcasts_agent_state_reports() {
         let file = OpenOptions::new()
             .read(true)
@@ -1903,6 +2181,7 @@ mod tests {
             next_sequence: Mutex::new(1),
             subscribers: Mutex::new(Vec::new()),
             latest_agent_state: Mutex::new(None),
+            agent_missing_since: Mutex::new(None),
             exit_status: Mutex::new(None),
         });
         let panes = Arc::new(Mutex::new(HashMap::from_iter([(pane_id, pane.clone())])));
@@ -1970,6 +2249,13 @@ mod tests {
         assert_eq!(
             local_agent_state_args("7", &event),
             "pane_id=7,state=idle,agent=opencode,source=flock:coder-remote"
+        );
+        assert_eq!(
+            daemon_version_args("7", "26.4.0"),
+            format!(
+                "pane_id=7,daemon_version=26.4.0,local_version={}",
+                env!("CARGO_PKG_VERSION")
+            )
         );
     }
 

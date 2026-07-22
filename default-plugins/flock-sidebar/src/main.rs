@@ -49,7 +49,10 @@ use std::collections::{BTreeMap, HashSet};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use detect::{detect_agent, identify_agent_from_command, identify_agent_from_screen, AgentState};
-use hook::{parse_hook_report, HookReport, HOOK_PIPE_NAME};
+use hook::{
+    parse_daemon_version_report, parse_hook_report, DaemonVersionReport, HookReport,
+    DAEMON_VERSION_PIPE_NAME, HOOK_PIPE_NAME,
+};
 use palette::Theme;
 use sessionizer::SessionizerConfig;
 use state::PaneAgentState;
@@ -128,6 +131,15 @@ struct State {
     command_synced: HashSet<PaneId>,
     /// Per-pane agent detection + arbitrated state, keyed by pane id.
     agents: BTreeMap<PaneId, PaneAgentState>,
+    /// Remote daemon version mismatches reported by local `remote-pty` bridges
+    /// over the `flock-daemon-version` pipe, keyed by the reporting pane.
+    daemon_mismatches: BTreeMap<PaneId, DaemonVersionReport>,
+    /// Whether the upgrade banner's first click has armed the confirm; the
+    /// second click closes the reported panes. Any other activation disarms.
+    upgrade_confirm_armed: bool,
+    /// The row the upgrade banner occupied in the last frame, for mouse
+    /// hit-testing (mirrors `click_map`).
+    banner_row: Option<usize>,
     /// The last per-pane agent status we published to the cross-session bus
     /// (Phase 7). Diffed against the freshly-built status on each update so we
     /// only `publish_agent_state` — and thus only re-serialize the session
@@ -344,7 +356,16 @@ impl ZellijPlugin for State {
                 },
                 Mouse::LeftClick(line, _) => {
                     if line >= 0 {
-                        if let Some(index) = ui::index_at_row(&self.click_map, line as usize) {
+                        if self.banner_row == Some(line as usize)
+                            && !self.daemon_mismatches.is_empty()
+                        {
+                            self.activate_upgrade_banner();
+                            should_render = true;
+                        } else if let Some(index) = ui::index_at_row(&self.click_map, line as usize)
+                        {
+                            // Clicking anywhere else backs out of a pending
+                            // upgrade confirm.
+                            self.upgrade_confirm_armed = false;
                             self.selected = index;
                             self.activate_selected();
                             should_render = true;
@@ -396,6 +417,19 @@ impl ZellijPlugin for State {
             self.publish_sidebar_state_if_changed();
             return false; // the resize itself triggers a re-render
         }
+        // Local remote-pty bridges report remote daemon build mismatches here;
+        // the render turns them into the upgrade banner.
+        if pipe_message.name == DAEMON_VERSION_PIPE_NAME {
+            return match parse_daemon_version_report(&pipe_message.args) {
+                Ok(report) => self.apply_daemon_version_report(report),
+                Err(reason) => {
+                    eprintln!(
+                        "flock-sidebar: ignoring {DAEMON_VERSION_PIPE_NAME} report: {reason}"
+                    );
+                    false
+                },
+            };
+        }
         // Only the agent self-report channel concerns us otherwise; ignore the
         // rest so we don't claim pipes meant for other plugins.
         if pipe_message.name != HOOK_PIPE_NAME {
@@ -435,11 +469,13 @@ impl ZellijPlugin for State {
             spinner_tick: self.spinner_tick,
             rows,
             cols,
+            upgrade_banner: self.upgrade_banner(),
         });
         self.selected = output.selected;
         self.scroll_sessions = output.scroll_sessions;
         self.scroll_agents = output.scroll_agents;
         self.click_map = output.click_map;
+        self.banner_row = output.banner_row;
         print!("{}", output.ansi);
     }
 }
@@ -571,6 +607,21 @@ impl State {
                 false
             },
         }
+    }
+
+    /// The upgrade banner for the current mismatch picture, if any. Multiple
+    /// panes can report (even against different daemons); the banner shows the
+    /// first report's versions and the total pane count.
+    fn upgrade_banner(&self) -> Option<ui::UpgradeBanner> {
+        self.daemon_mismatches
+            .values()
+            .next()
+            .map(|report| ui::UpgradeBanner {
+                daemon_version: report.daemon_version.clone(),
+                local_version: report.local_version.clone(),
+                pane_count: self.daemon_mismatches.len(),
+                armed: self.upgrade_confirm_armed,
+            })
     }
 
     /// The ordered navigable targets (sessions then agents). Rebuilt on demand;
@@ -803,6 +854,44 @@ impl State {
                 None => false,
             },
         }
+    }
+
+    /// Track a remote daemon version report from a local bridge. Matching
+    /// versions clear the pane's entry (the daemon upgraded); a mismatch shows
+    /// the upgrade banner. Returns whether the sidebar needs a repaint.
+    fn apply_daemon_version_report(&mut self, report: DaemonVersionReport) -> bool {
+        let pane_id = report.pane_id;
+        let changed = if report.daemon_version == report.local_version {
+            self.daemon_mismatches.remove(&pane_id).is_some()
+        } else {
+            self.daemon_mismatches
+                .insert(pane_id, report.clone())
+                .as_ref()
+                != Some(&report)
+        };
+        if self.daemon_mismatches.is_empty() {
+            self.upgrade_confirm_armed = false;
+        }
+        changed
+    }
+
+    /// Act on an upgrade-banner click: the first arms the confirm, the second
+    /// closes every reported remote pane. Closing the local pane triggers the
+    /// server's remote close-pending cleanup, so the daemon-side pane closes
+    /// too; once the daemon holds no panes, the next connect retires it onto
+    /// the newly installed binary (reopen the session from the picker).
+    fn activate_upgrade_banner(&mut self) {
+        if !self.upgrade_confirm_armed {
+            self.upgrade_confirm_armed = true;
+            return;
+        }
+        for pane_id in self.daemon_mismatches.keys() {
+            if let PaneId::Terminal(id) = pane_id {
+                close_terminal_pane(*id);
+            }
+        }
+        self.daemon_mismatches.clear();
+        self.upgrade_confirm_armed = false;
     }
 
     /// Build this session's per-pane agent status from the live tracked state
@@ -1075,6 +1164,13 @@ impl State {
         // Pane ids are reused; forgetting closed panes lets the manifest sync
         // re-query a fresh pane that takes over an old id.
         self.command_synced.retain(|pane_id| live.contains(pane_id));
+        // A closed pane's daemon mismatch is moot (its bridge is gone; a
+        // successor pane re-reports if the daemon is still outdated).
+        self.daemon_mismatches
+            .retain(|pane_id, _| live.contains(pane_id));
+        if self.daemon_mismatches.is_empty() {
+            self.upgrade_confirm_armed = false;
+        }
     }
 }
 

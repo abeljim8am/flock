@@ -326,6 +326,35 @@ pub struct ClickTarget {
     pub index: usize,
 }
 
+/// The remote-daemon upgrade prompt, drawn over the sidebar's top padding row
+/// when a bridge reports a version mismatch. Two-step: an unarmed banner
+/// invites the click; the armed banner asks for the confirming second click.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UpgradeBanner {
+    pub daemon_version: String,
+    pub local_version: String,
+    pub pane_count: usize,
+    pub armed: bool,
+}
+
+/// The banner's one-line text; the confirm wording spells out the cost
+/// (closing panes) because the action restarts every affected remote shell.
+pub fn upgrade_banner_text(banner: &UpgradeBanner) -> String {
+    if banner.armed {
+        let panes = if banner.pane_count == 1 {
+            "1 remote pane".to_string()
+        } else {
+            format!("{} remote panes", banner.pane_count)
+        };
+        format!(" ⇪ close {panes} to upgrade? click again")
+    } else {
+        format!(
+            " ⇪ remote flock v{} (local v{}) — click to upgrade",
+            banner.daemon_version, banner.local_version
+        )
+    }
+}
+
 /// Build the agent list for the *current* session from its live panes, in tab
 /// then pane order, one entry per pane that detection has tagged as an agent.
 pub fn build_entries(
@@ -631,6 +660,9 @@ pub struct RenderInput<'a> {
     pub spinner_tick: u32,
     pub rows: usize,
     pub cols: usize,
+    /// Remote-daemon upgrade prompt to draw over the top padding row (open
+    /// mode only; the thin rail has no room for it).
+    pub upgrade_banner: Option<UpgradeBanner>,
 }
 
 /// The full sidebar render output.
@@ -645,6 +677,9 @@ pub struct RenderOutput {
     pub scroll_agents: usize,
     /// Click targets for the rows drawn this frame.
     pub click_map: Vec<ClickTarget>,
+    /// The absolute row the upgrade banner occupies this frame, for mouse
+    /// hit-testing (None when no banner was drawn).
+    pub banner_row: Option<usize>,
 }
 
 /// Render the whole sidebar to a raw-ANSI string plus the click map.
@@ -680,6 +715,7 @@ pub fn render(input: RenderInput) -> RenderOutput {
             scroll_sessions: 0,
             scroll_agents: 0,
             click_map,
+            banner_row: None,
         };
     }
 
@@ -695,6 +731,28 @@ pub fn render(input: RenderInput) -> RenderOutput {
 
     let divider_x = cols.saturating_sub(1);
     let content_cols = divider_x;
+
+    // The upgrade prompt rides the top padding row (RAIL_VPAD keeps it blank
+    // otherwise), so it never disturbs the section layout below.
+    let mut banner_row = None;
+    if let Some(banner) = &input.upgrade_banner {
+        if rows > 0 {
+            let color = if banner.armed { p.red } else { p.yellow };
+            render_row(
+                &mut out,
+                0,
+                0,
+                content_cols,
+                None,
+                &[Span::new(
+                    truncate_text(&upgrade_banner_text(banner), content_cols),
+                    color,
+                )
+                .bold()],
+            );
+            banner_row = Some(0);
+        }
+    }
 
     // Match the thin rail's breathing room: keep RAIL_VPAD blank rows above and
     // below the content, so the full view and the rail line up at the same top
@@ -798,6 +856,7 @@ pub fn render(input: RenderInput) -> RenderOutput {
         scroll_sessions,
         scroll_agents,
         click_map,
+        banner_row,
     }
 }
 
@@ -1064,6 +1123,7 @@ fn render_thin(
         scroll_sessions: scroll,
         scroll_agents: input.scroll_agents,
         click_map,
+        banner_row: None,
     }
 }
 
@@ -1165,6 +1225,30 @@ mod tests {
         assert_eq!(index_at_row(&map, 1), Some(0));
         assert_eq!(index_at_row(&map, 5), Some(3));
         assert_eq!(index_at_row(&map, 2), None);
+    }
+
+    #[test]
+    fn upgrade_banner_text_covers_both_steps() {
+        let mut banner = UpgradeBanner {
+            daemon_version: "26.5.0".into(),
+            local_version: "26.6.0".into(),
+            pane_count: 1,
+            armed: false,
+        };
+        assert_eq!(
+            upgrade_banner_text(&banner),
+            " ⇪ remote flock v26.5.0 (local v26.6.0) — click to upgrade"
+        );
+        banner.armed = true;
+        assert_eq!(
+            upgrade_banner_text(&banner),
+            " ⇪ close 1 remote pane to upgrade? click again"
+        );
+        banner.pane_count = 3;
+        assert_eq!(
+            upgrade_banner_text(&banner),
+            " ⇪ close 3 remote panes to upgrade? click again"
+        );
     }
 
     #[test]
@@ -1304,6 +1388,7 @@ mod tests {
             spinner_tick: 0,
             rows: 8,
             cols: 40,
+            upgrade_banner: None,
         });
 
         assert!(!output.ansi.contains("workspaces"));
@@ -1334,9 +1419,70 @@ mod tests {
             spinner_tick: 0,
             rows: 8,
             cols: 40,
+            upgrade_banner: None,
         });
 
         assert!(output.ansi.contains("│"));
+    }
+
+    #[test]
+    fn open_sidebar_draws_upgrade_banner_on_top_row() {
+        let panes = PaneManifest::default();
+        let tabs = Vec::new();
+        let agents = BTreeMap::new();
+        let sessions = vec![sess("workspace-a", "/home/u/proj")];
+        let palette = Theme::default();
+
+        let output = render(RenderInput {
+            permissions_granted: true,
+            panes: &panes,
+            tabs: &tabs,
+            agents: &agents,
+            sessions: &sessions,
+            palette: &palette,
+            sidebar_mode: SidebarMode::Open,
+            focused: false,
+            selected: 0,
+            scroll_sessions: 0,
+            scroll_agents: 0,
+            spinner_tick: 0,
+            rows: 8,
+            cols: 60,
+            upgrade_banner: Some(UpgradeBanner {
+                daemon_version: "26.5.0".into(),
+                local_version: "26.6.0".into(),
+                pane_count: 2,
+                armed: false,
+            }),
+        });
+
+        assert_eq!(output.banner_row, Some(0));
+        assert!(output.ansi.contains("click to upgrade"));
+
+        // The thin rail has no room for the banner.
+        let thin = render(RenderInput {
+            permissions_granted: true,
+            panes: &panes,
+            tabs: &tabs,
+            agents: &agents,
+            sessions: &sessions,
+            palette: &palette,
+            sidebar_mode: SidebarMode::Closed,
+            focused: false,
+            selected: 0,
+            scroll_sessions: 0,
+            scroll_agents: 0,
+            spinner_tick: 0,
+            rows: 8,
+            cols: 60,
+            upgrade_banner: Some(UpgradeBanner {
+                daemon_version: "26.5.0".into(),
+                local_version: "26.6.0".into(),
+                pane_count: 2,
+                armed: false,
+            }),
+        });
+        assert_eq!(thin.banner_row, None);
     }
 
     #[test]
@@ -1383,6 +1529,7 @@ mod tests {
             spinner_tick: 0,
             rows: 8,
             cols: 40,
+            upgrade_banner: None,
         });
 
         assert_eq!(output.selected, 0);
