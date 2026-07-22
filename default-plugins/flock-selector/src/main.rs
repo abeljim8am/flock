@@ -68,6 +68,11 @@ const REFRESH_SECS: f64 = 10.0;
 const CODESPACE_REFRESH_TICKS: u8 = 3;
 const CODER_REFRESH_TICKS: u8 = 3;
 
+/// Cadence of the progress spinner shown while a remote bootstrap is in
+/// flight. Timer events carry their elapsed seconds, which is how these fast
+/// ticks are told apart from the slow [`REFRESH_SECS`] refresh timer.
+const SPINNER_SECS: f64 = 0.12;
+
 /// Session name used by the cold-shell entry layout (its `session_name` arg).
 /// Sessions with this name are selector throwaways, not project sessions: their
 /// `workspace_root` is whatever folder zellij happened to be launched from, so
@@ -104,6 +109,11 @@ struct State {
     row_map: Vec<(usize, usize)>,
     /// Whether the refresh timer is currently armed.
     timer_running: bool,
+    /// Whether the fast spinner timer is currently armed (only while a remote
+    /// bootstrap is in flight).
+    spinner_timer_running: bool,
+    /// Monotonic spinner animation counter; the glyph is `tick % frames`.
+    spinner_tick: usize,
     /// Which enabled list is showing (Sessions and Projects are always present).
     mode: PickerMode,
     /// The latest codespace list — the `/data` cache at load, then live `gh`
@@ -474,7 +484,18 @@ impl ZellijPlugin for State {
                 self.update_sessions(session_infos);
                 should_render = true;
             },
-            Event::Timer(_) => {
+            Event::Timer(elapsed) => {
+                // Fast ticks belong to the spinner timer: advance the
+                // animation and re-arm without touching the refresh cadence.
+                if elapsed < REFRESH_SECS / 2.0 {
+                    self.spinner_timer_running = false;
+                    if self.remote_open_in_flight() {
+                        self.spinner_tick = self.spinner_tick.wrapping_add(1);
+                        self.arm_spinner_timer();
+                        should_render = true;
+                    }
+                    return should_render;
+                }
                 self.timer_running = false;
                 if self.pending_coder_open.is_none() {
                     self.coder_create_notice = None;
@@ -785,6 +806,9 @@ impl ZellijPlugin for State {
             ssh_notice: self.ssh_notice.as_deref(),
             pending_ssh_delete: self.pending_ssh_delete.as_deref(),
             pending_devcontainer: self.pending_devcontainer.as_ref(),
+            spinner_frame: self
+                .remote_open_in_flight()
+                .then(|| ui::spinner_glyph(self.spinner_tick)),
             palette: &self.palette,
             selected: self.selected,
             scroll: self.scroll,
@@ -859,6 +883,21 @@ impl State {
         if !self.timer_running {
             set_timeout(REFRESH_SECS);
             self.timer_running = true;
+        }
+    }
+
+    /// Whether a remote bootstrap (Coder or SSH) is waiting on its
+    /// `run_command` — the window the progress spinner animates over.
+    fn remote_open_in_flight(&self) -> bool {
+        self.pending_coder_open.is_some() || self.pending_ssh_open.is_some()
+    }
+
+    /// (Re)arm the fast spinner timer if it isn't already running. It stops
+    /// re-arming on its own once no bootstrap is in flight.
+    fn arm_spinner_timer(&mut self) {
+        if !self.spinner_timer_running {
+            set_timeout(SPINNER_SECS);
+            self.spinner_timer_running = true;
         }
     }
 
@@ -1550,11 +1589,14 @@ impl State {
                     session_name: name,
                     previous_session: current_session_name,
                 });
-                self.coder_create_notice =
-                    Some(format!("Preparing persistent session in {}…", identifier));
+                self.coder_create_notice = Some(format!(
+                    "Preparing persistent session in {} — waiting for workspace setup…",
+                    identifier
+                ));
                 let argv = coder::bootstrap_argv(&identifier, self.remote_agent_binary.as_deref());
                 let refs: Vec<&str> = argv.iter().map(String::as_str).collect();
                 run_command(&refs, coder::bootstrap_context(&identifier));
+                self.arm_spinner_timer();
                 return;
             },
         }
@@ -1798,6 +1840,7 @@ impl State {
                     session_name: name,
                     previous_session: current_session_name,
                 });
+                self.arm_spinner_timer();
                 return;
             },
         }

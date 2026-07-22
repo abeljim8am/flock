@@ -30,6 +30,14 @@ use crate::ssh::{HostPhase, HostWizard, RankedSshHost};
 /// The badge glyph marking a project/codespace that already has a live session.
 const OPEN_BADGE: &str = "●";
 
+/// Braille spinner frames animating in-flight remote bootstraps.
+const SPINNER_FRAMES: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+
+/// The spinner glyph for an animation tick.
+pub fn spinner_glyph(tick: usize) -> char {
+    SPINNER_FRAMES[tick % SPINNER_FRAMES.len()]
+}
+
 /// Which list the picker is showing. Tab cycles through them; each keeps the
 /// same reverse-layout fuzzy list, differing only in rows and data source.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -119,6 +127,9 @@ pub struct RenderInput<'a> {
     /// The devcontainer prompt/up owning the picker, if any — rendered as a
     /// full-width notice row just above the input.
     pub pending_devcontainer: Option<&'a PendingDevcontainer>,
+    /// The current spinner glyph while a remote bootstrap is in flight;
+    /// `None` renders the static notice badges instead.
+    pub spinner_frame: Option<char>,
     pub palette: &'a Theme,
     /// Selection cursor: absolute index into the active results (0 = best,
     /// bottom-most).
@@ -169,6 +180,7 @@ pub fn render(input: RenderInput) -> RenderOutput {
         ssh_notice,
         pending_ssh_delete,
         pending_devcontainer,
+        spinner_frame,
         palette: p,
         rows,
         cols,
@@ -403,13 +415,19 @@ pub fn render(input: RenderInput) -> RenderOutput {
     }
     if mode == PickerMode::Coder {
         if let Some(notice) = coder_create_notice {
+            // A live spinner marks an in-flight bootstrap; the green check is
+            // reserved for completed actions (e.g. a fired-off create).
+            let badge = match spinner_frame {
+                Some(glyph) => Span::new(format!(" {} ", glyph), p.yellow),
+                None => Span::new(" ✓ ", p.green),
+            };
             render_row(
                 &mut out,
                 0,
                 input_y.saturating_sub(1),
                 cols,
                 None,
-                &[Span::new(" ✓ ", p.green), Span::new(notice, p.text).bold()],
+                &[badge, Span::new(notice, p.text).bold()],
             );
         } else if total > 0 {
             if let Some(error) = coder_error {
@@ -439,13 +457,17 @@ pub fn render(input: RenderInput) -> RenderOutput {
                 ],
             );
         } else if let Some(notice) = ssh_notice {
+            let badge = match spinner_frame {
+                Some(glyph) => format!(" {} ", glyph),
+                None => " ◌ ".to_owned(),
+            };
             render_row(
                 &mut out,
                 0,
                 input_y.saturating_sub(1),
                 cols,
                 None,
-                &[Span::new(" ◌ ", p.yellow), Span::new(notice, p.text).bold()],
+                &[Span::new(badge, p.yellow), Span::new(notice, p.text).bold()],
             );
         } else if total > 0 {
             if let Some(error) = ssh_error {
@@ -1605,6 +1627,7 @@ mod tests {
             ssh_notice: None,
             pending_ssh_delete: None,
             pending_devcontainer: None,
+            spinner_frame: None,
             palette: &theme,
             selected: 0,
             scroll: 0,
@@ -1671,6 +1694,7 @@ mod tests {
             ssh_notice: None,
             pending_ssh_delete: None,
             pending_devcontainer: None,
+            spinner_frame: None,
             palette: &theme,
             selected: 0,
             scroll: 0,
@@ -1717,6 +1741,7 @@ mod tests {
                 ssh_notice: None,
                 pending_ssh_delete: None,
                 pending_devcontainer: None,
+                spinner_frame: None,
                 palette: &theme,
                 selected: 0,
                 scroll: 0,
@@ -1777,6 +1802,7 @@ mod tests {
                 ssh_notice: None,
                 pending_ssh_delete: None,
                 pending_devcontainer: None,
+                spinner_frame: None,
                 palette: &theme,
                 selected: 0,
                 scroll: 0,

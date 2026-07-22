@@ -200,8 +200,20 @@ impl RemoteTransport {
         let remote = r#"exec "$HOME/.local/share/flock/current/flock" remote-agent connect"#;
         match self {
             Self::Coder { workspace } => {
+                // `--wait yes` holds the connect until the workspace's startup
+                // scripts finish, so panes revived into a freshly auto-started
+                // workspace don't spawn shells into a half-set-up environment.
                 let mut command = Command::new("coder");
-                command.args(["ssh", workspace, "--", "sh", "-c", &format!("'{remote}'")]);
+                command.args([
+                    "ssh",
+                    "--wait",
+                    "yes",
+                    workspace,
+                    "--",
+                    "sh",
+                    "-c",
+                    &format!("'{remote}'"),
+                ]);
                 command
             },
             Self::Devcontainer { workspace_folder } => {

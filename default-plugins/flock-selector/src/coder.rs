@@ -146,6 +146,9 @@ fn is_flock_executable(executable: &str) -> bool {
 
 /// Bootstrap the fork into a versioned user directory in the workspace using
 /// the shared arch-detecting install script (Linux x86_64 + aarch64).
+/// `--wait yes` holds the connection until the workspace's startup scripts
+/// finish, so the session only opens once the workspace is fully set up —
+/// not merely running.
 pub fn bootstrap_argv(identifier: &str, debug_binary: Option<&str>) -> Vec<String> {
     if let Some(debug_binary) = debug_binary {
         return debug_bootstrap_argv(identifier, debug_binary);
@@ -153,6 +156,8 @@ pub fn bootstrap_argv(identifier: &str, debug_binary: Option<&str>) -> Vec<Strin
     vec![
         "coder".into(),
         "ssh".into(),
+        "--wait".into(),
+        "yes".into(),
         identifier.into(),
         "--".into(),
         "sh".into(),
@@ -173,7 +178,7 @@ workspace="$2"
 [ -f "$binary" ] || {{ echo "flock: debug remote agent binary not found: $binary" >&2; exit 66; }}
 remote={}
 remote="'"$remote"'"
-coder ssh "$workspace" -- sh -c "$remote" < "$binary""#,
+coder ssh --wait yes "$workspace" -- sh -c "$remote" < "$binary""#,
         remote_bootstrap::quote_remote_script_arg(&remote_bootstrap::debug_install_script()),
     );
     vec![
@@ -1135,8 +1140,11 @@ mod tests {
         gateway_with_cwd.extend(["--cwd".into(), "/workspace/api".into()]);
         assert_eq!(parse_gateway(&gateway_with_cwd), Some("alice/api"));
         let bootstrap = bootstrap_argv("alice/api", None);
-        assert_eq!(&bootstrap[..3], &["coder", "ssh", "alice/api"]);
-        assert_eq!(&bootstrap[3..6], &["--", "sh", "-c"]);
+        assert_eq!(
+            &bootstrap[..5],
+            &["coder", "ssh", "--wait", "yes", "alice/api"]
+        );
+        assert_eq!(&bootstrap[5..8], &["--", "sh", "-c"]);
         assert!(bootstrap
             .last()
             .unwrap()
@@ -1163,7 +1171,7 @@ mod tests {
         assert_eq!(debug[3], "flock-debug-bootstrap");
         assert_eq!(debug[4], "/workspace/target/debug/flock with spaces");
         assert_eq!(debug[5], "alice/api");
-        assert!(debug[2].contains("coder ssh \"$workspace\""));
+        assert!(debug[2].contains("coder ssh --wait yes \"$workspace\""));
         assert!(debug[2].contains("remote=\"'\"$remote\"'\""));
         assert!(debug[2].contains("< \"$binary\""));
         assert!(!debug[2].contains("/workspace/target/debug"));
