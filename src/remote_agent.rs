@@ -1083,13 +1083,15 @@ fn run_remote_transport(
         } => {
             // Same protocol, different build: the daemon kept running because
             // it still holds panes (an idle daemon retires itself at hello).
-            // Tell the user why the remote may lag behind local fixes.
+            // Tell the user why the remote may lag behind local fixes, and
+            // report the mismatch to the sidebar so it can offer the upgrade.
             if agent_version != env!("CARGO_PKG_VERSION") {
                 write!(
                     io::stdout().lock(),
                     "\r\n[flock: remote daemon is v{agent_version}, local is v{}; the remote upgrades once its last pane closes]\r\n",
                     env!("CARGO_PKG_VERSION"),
                 )?;
+                report_daemon_version_to_local_plugin(&agent_version);
             }
         },
         ServerMessage::Error { message } => bail!("{message}"),
@@ -1349,25 +1351,71 @@ fn forward_agent_state_to_local_plugin(
     event: &RemoteAgentStateEvent,
 ) -> Result<()> {
     let args = local_agent_state_args(pane_id, event);
+    publish_local_pipe(executable, "flock-state", &args)
+}
+
+/// The pipe name the sidebar listens on for remote daemon version reports —
+/// must stay in sync with `DAEMON_VERSION_PIPE_NAME` in
+/// `default-plugins/flock-sidebar/src/hook.rs`.
+const DAEMON_VERSION_PIPE_NAME: &str = "flock-daemon-version";
+
+/// Fire-and-forget report of the remote daemon's version to the sidebar, so
+/// it can offer closing this pane to let the daemon upgrade. Sent from the
+/// handshake path, so the pipe publisher runs on its own thread — a wedged
+/// local `flock pipe` must not stall the reconnect.
+fn report_daemon_version_to_local_plugin(agent_version: &str) {
+    // The version lands in a `key=value,` wire format; a daemon whose version
+    // string could split it is not worth reporting.
+    if agent_version.is_empty() || agent_version.contains([',', '=']) {
+        return;
+    }
+    let Some(pane_id) = std::env::var("FLOCK_PANE_ID")
+        .ok()
+        .filter(|id| id.parse::<u32>().is_ok())
+    else {
+        return;
+    };
+    let Some(executable) = std::env::var_os("FLOCK_EXECUTABLE")
+        .map(PathBuf::from)
+        .or_else(|| std::env::current_exe().ok())
+    else {
+        return;
+    };
+    let args = daemon_version_args(&pane_id, agent_version);
+    thread::spawn(move || {
+        if let Err(error) = publish_local_pipe(&executable, DAEMON_VERSION_PIPE_NAME, &args) {
+            eprintln!("flock: failed to report remote daemon version: {error:#}");
+        }
+    });
+}
+
+fn daemon_version_args(pane_id: &str, agent_version: &str) -> String {
+    format!(
+        "pane_id={pane_id},daemon_version={agent_version},local_version={}",
+        env!("CARGO_PKG_VERSION")
+    )
+}
+
+fn publish_local_pipe(executable: &Path, pipe_name: &str, args: &str) -> Result<()> {
     let mut child = Command::new(executable)
-        .args(["pipe", "--name", "flock-state", "--args", &args])
+        .args(["pipe", "--name", pipe_name, "--args", args])
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
-        .context("start local flock-state publisher")?;
+        .with_context(|| format!("start local {pipe_name} publisher"))?;
     let deadline = Instant::now() + Duration::from_secs(2);
     loop {
         if let Some(status) = child.try_wait()? {
             if status.success() {
                 return Ok(());
             }
-            bail!("local flock-state publisher exited with {status}");
+            bail!("local {pipe_name} publisher exited with {status}");
         }
         if Instant::now() >= deadline {
             let _ = child.kill();
             let _ = child.wait();
-            bail!("local flock-state publisher timed out");
+            bail!("local {pipe_name} publisher timed out");
         }
         thread::sleep(Duration::from_millis(20));
     }
@@ -2201,6 +2249,13 @@ mod tests {
         assert_eq!(
             local_agent_state_args("7", &event),
             "pane_id=7,state=idle,agent=opencode,source=flock:coder-remote"
+        );
+        assert_eq!(
+            daemon_version_args("7", "26.4.0"),
+            format!(
+                "pane_id=7,daemon_version=26.4.0,local_version={}",
+                env!("CARGO_PKG_VERSION")
+            )
         );
     }
 

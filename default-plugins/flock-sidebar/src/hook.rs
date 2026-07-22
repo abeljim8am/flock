@@ -99,6 +99,46 @@ pub fn parse_hook_report(args: &BTreeMap<String, String>) -> Result<HookReport, 
     })
 }
 
+/// The pipe name local `remote-pty` bridges publish remote daemon versions
+/// under when a handshake reveals a build mismatch — must stay in sync with
+/// `DAEMON_VERSION_PIPE_NAME` in `src/remote_agent.rs`.
+pub const DAEMON_VERSION_PIPE_NAME: &str = "flock-daemon-version";
+
+/// A remote daemon version mismatch reported by a local `remote-pty` bridge.
+/// The plugin crate is not workspace-versioned, so both versions must arrive
+/// over the wire; the sidebar cannot derive its own.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DaemonVersionReport {
+    pub pane_id: PaneId,
+    pub daemon_version: String,
+    pub local_version: String,
+}
+
+/// Parse a `flock-daemon-version` pipe message. Required: `pane_id` (the
+/// reporting remote pane), `daemon_version`, and `local_version`. Malformed
+/// reports are dropped by the caller, like malformed hook reports.
+pub fn parse_daemon_version_report(
+    args: &BTreeMap<String, String>,
+) -> Result<DaemonVersionReport, String> {
+    let pane_id = args
+        .get("pane_id")
+        .or_else(|| args.get("pane"))
+        .ok_or_else(|| "missing pane_id".to_string())
+        .and_then(|raw| parse_pane_id(raw))?;
+    let version = |key: &str| -> Result<String, String> {
+        args.get(key)
+            .map(|value| value.trim())
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+            .ok_or_else(|| format!("missing {key}"))
+    };
+    Ok(DaemonVersionReport {
+        pane_id,
+        daemon_version: version("daemon_version")?,
+        local_version: version("local_version")?,
+    })
+}
+
 /// Parse the `pane_id` arg into a terminal [`PaneId`].
 ///
 /// Flock exports the running pane's id as `$FLOCK_PANE_ID` (a bare integer;
@@ -255,6 +295,44 @@ mod tests {
             HookReport::State { state, .. } => assert_eq!(state, AgentState::Working),
             other => panic!("expected a state report, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn parses_a_daemon_version_report() {
+        let report = parse_daemon_version_report(&args(&[
+            ("pane_id", "4"),
+            ("daemon_version", "26.5.0"),
+            ("local_version", "26.6.0"),
+        ]))
+        .expect("valid report");
+        assert_eq!(
+            report,
+            DaemonVersionReport {
+                pane_id: PaneId::Terminal(4),
+                daemon_version: "26.5.0".into(),
+                local_version: "26.6.0".into(),
+            }
+        );
+    }
+
+    #[test]
+    fn daemon_version_report_requires_all_fields() {
+        assert!(parse_daemon_version_report(&args(&[
+            ("pane_id", "4"),
+            ("daemon_version", "26.5.0"),
+        ]))
+        .is_err());
+        assert!(parse_daemon_version_report(&args(&[
+            ("pane_id", "4"),
+            ("daemon_version", "  "),
+            ("local_version", "26.6.0"),
+        ]))
+        .is_err());
+        assert!(parse_daemon_version_report(&args(&[
+            ("daemon_version", "26.5.0"),
+            ("local_version", "26.6.0"),
+        ]))
+        .is_err());
     }
 
     #[test]
