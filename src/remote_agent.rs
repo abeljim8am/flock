@@ -1079,8 +1079,19 @@ fn run_remote_transport(
     match read_frame::<_, ServerMessage>(&mut child_stdout)? {
         ServerMessage::Hello {
             protocol: PROTOCOL_VERSION,
-            ..
-        } => {},
+            agent_version,
+        } => {
+            // Same protocol, different build: the daemon kept running because
+            // it still holds panes (an idle daemon retires itself at hello).
+            // Tell the user why the remote may lag behind local fixes.
+            if agent_version != env!("CARGO_PKG_VERSION") {
+                write!(
+                    io::stdout().lock(),
+                    "\r\n[flock: remote daemon is v{agent_version}, local is v{}; the remote upgrades once its last pane closes]\r\n",
+                    env!("CARGO_PKG_VERSION"),
+                )?;
+            }
+        },
         ServerMessage::Error { message } => bail!("{message}"),
         message => bail!("unexpected handshake response: {message:?}"),
     }
@@ -1427,6 +1438,39 @@ fn daemon_is_live(socket: &Path) -> bool {
     UnixStream::connect(socket).is_ok()
 }
 
+/// Whether the bootstrap install (`~/.local/share/flock/current/flock`, the
+/// path every transport connects through) is a different file than the
+/// running daemon. Deliberately not a version-string comparison against the
+/// client: when the remote install is stale, retiring on a client mismatch
+/// would respawn the same old binary and retire again, forever. Comparing
+/// against the file on disk only retires when a respawn actually changes
+/// something. Device+inode identity survives the in-place `mv` replace that
+/// leaves `/proc/self/exe` pointing at a deleted path.
+fn installed_binary_differs() -> bool {
+    let Some(home) = std::env::var_os("HOME") else {
+        return false;
+    };
+    let installed = Path::new(&home)
+        .join(".local/share/flock")
+        .join("current")
+        .join("flock");
+    match (
+        file_identity(&installed),
+        file_identity(Path::new("/proc/self/exe")),
+    ) {
+        (Some(installed), Some(running)) => installed != running,
+        // Missing install symlink or unreadable self: unknown territory
+        // (dev daemons, non-bootstrap installs) — never retire on a guess.
+        _ => false,
+    }
+}
+
+fn file_identity(path: &Path) -> Option<(u64, u64)> {
+    use std::os::unix::fs::MetadataExt;
+    let metadata = fs::metadata(path).ok()?;
+    Some((metadata.dev(), metadata.ino()))
+}
+
 fn wait_for_socket(socket: &Path, timeout: Duration) -> Result<()> {
     let started = Instant::now();
     while started.elapsed() < timeout {
@@ -1445,6 +1489,22 @@ fn handle_client(stream: UnixStream, panes: Panes) -> Result<()> {
     let hello: ClientMessage = read_frame(&mut reader)?;
     match hello {
         ClientMessage::Hello { protocol, .. } if protocol == PROTOCOL_VERSION => {
+            // With no panes there is nothing to lose: retire so the client's
+            // reconnect respawns the daemon from the newly installed binary.
+            // A daemon with panes must keep running (its PTYs die with it);
+            // those clients get a version notice instead.
+            if panes.lock().unwrap().is_empty() && installed_binary_differs() {
+                let _ = write_frame(
+                    &mut direct_writer,
+                    &ServerMessage::Error {
+                        message: format!(
+                            "remote daemon v{} retiring: a different flock build is installed and reconnecting starts it",
+                            env!("CARGO_PKG_VERSION"),
+                        ),
+                    },
+                );
+                std::process::exit(0);
+            }
             write_frame(
                 &mut direct_writer,
                 &ServerMessage::Hello {
@@ -1951,6 +2011,20 @@ mod tests {
                 }
             } if agent == "opencode"
         ));
+    }
+
+    #[test]
+    fn file_identity_distinguishes_files_and_tolerates_missing_paths() {
+        let scratch = std::env::temp_dir().join(format!("flock-identity-{}", std::process::id()));
+        fs::write(&scratch, b"x").unwrap();
+        assert_eq!(file_identity(&scratch), file_identity(&scratch));
+        assert!(file_identity(&scratch).is_some());
+        assert_ne!(
+            file_identity(&scratch),
+            file_identity(Path::new("/dev/null"))
+        );
+        assert_eq!(file_identity(Path::new("/nonexistent/flock")), None);
+        fs::remove_file(&scratch).unwrap();
     }
 
     #[test]
