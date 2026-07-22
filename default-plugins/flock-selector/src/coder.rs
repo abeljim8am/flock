@@ -278,7 +278,7 @@ pub fn layout_doc_for(
     })
     .to_string();
     let options = format!(
-        "remote_backend {}\nsession_serialization true\nshow_startup_tips false\nshow_release_notes false\n",
+        "remote_backend {}\nshow_startup_tips false\nshow_release_notes false\n",
         kdl_quote(&backend)
     );
     crate::codespaces::layout_doc_with_options(&command, sidebar_args, base_layout, &options)
@@ -1099,7 +1099,8 @@ mod tests {
                 ..
             }) if workspace == "alice/api"
         ));
-        assert_eq!(config.options.session_serialization, Some(true));
+        // Serialization is left unset so the user's local config wins.
+        assert_eq!(config.options.session_serialization, None);
         assert_eq!(config.options.show_startup_tips, Some(false));
         assert_eq!(config.options.show_release_notes, Some(false));
         assert!(doc.contains("coder_enabled \"true\""));
@@ -1121,7 +1122,7 @@ mod tests {
             config.options.default_command.as_deref(),
             Some(gateway_argv("alice/api").as_slice())
         );
-        assert_eq!(config.options.session_serialization, Some(true));
+        assert_eq!(config.options.session_serialization, None);
     }
 
     #[test]
