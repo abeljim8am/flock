@@ -173,10 +173,11 @@ pub fn up_context(workspace_folder: &Path) -> BTreeMap<String, String> {
 
 /// The generated stringified layout a bound session is created from — the same
 /// chrome (user `remote_session_layout` base or the built-in flock mirror) as
-/// a coder/ssh session, with the remote-pty binding, the typed
-/// `remote_backend`, and serialization ON (resurrected panes reattach to the
-/// in-container daemon by stable UUID; the bridge revives a stopped container
-/// with `devcontainer up` on its reconnect path).
+/// a coder/ssh session, with the remote-pty binding and the typed
+/// `remote_backend`. Serialization is left to the user's local config (server
+/// default: on); when on, resurrected panes reattach to the in-container
+/// daemon by stable UUID and the bridge revives a stopped container with
+/// `devcontainer up` on its reconnect path.
 pub fn layout_doc_for(
     workspace_folder: &Path,
     sidebar_args: &[(String, String)],
@@ -191,7 +192,7 @@ pub fn layout_doc_for(
     })
     .to_string();
     let options = format!(
-        "remote_backend {}\nsession_serialization true\nshow_startup_tips false\nshow_release_notes false\n",
+        "remote_backend {}\nshow_startup_tips false\nshow_release_notes false\n",
         kdl_quote(&backend)
     );
     crate::codespaces::layout_doc_with_options(&command, sidebar_args, base_layout, &options)
@@ -506,7 +507,8 @@ mod tests {
 
     /// The generated doc must survive the exact parse the server runs on a
     /// stringified layout — including a workspace path with spaces — and must
-    /// carry the typed backend with serialization ON.
+    /// carry the typed backend without forcing serialization (the user's
+    /// local config decides).
     #[test]
     fn layout_doc_parses_with_the_server_side_parser() {
         let path = Path::new("/Users/me/my proj");
@@ -532,7 +534,7 @@ mod tests {
                 ..
             }) if workspace_folder == "/Users/me/my proj"
         ));
-        assert_eq!(config.options.session_serialization, Some(true));
+        assert_eq!(config.options.session_serialization, None);
     }
 
     #[test]

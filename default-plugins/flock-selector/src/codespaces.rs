@@ -277,11 +277,9 @@ pub fn layout_doc_for(
     layout_doc_with_binding(&ssh_argv(codespace_name), sidebar_args, base_layout)
 }
 
-/// Build a bound session's layout doc for an arbitrary binding argv — the
-/// shared mechanics behind [`layout_doc_for`] and the devcontainer variant
-/// ([`crate::devcontainers::layout_doc_for`]): the user's base layout (or the
-/// built-in flock chrome mirror with the sidebar args injected), with the
-/// binding + no-resurrection options appended.
+/// Build a bound session's layout doc for an arbitrary binding argv: the
+/// user's base layout (or the built-in flock chrome mirror with the sidebar
+/// args injected), with the binding + no-resurrection options appended.
 pub fn layout_doc_with_binding(
     binding_argv: &[String],
     sidebar_args: &[(String, String)],
@@ -291,13 +289,20 @@ pub fn layout_doc_with_binding(
         binding_argv,
         sidebar_args,
         base_layout,
+        // Codespaces deliberately forces serialization OFF, overriding even an
+        // explicit local `session_serialization true`: these sessions are never
+        // resurrectable (the gh ssh binding can't reattach panes after the
+        // codespace stops), so serializing them would only produce broken
+        // resurrection candidates. The other providers omit the option entirely
+        // and let the user's local config decide (server default: on).
         "session_serialization false\n",
     )
 }
 
 /// Compose the shared remote-session chrome with a provider binding and the
-/// provider-specific session options. Coder uses this too, but keeps
-/// resurrection enabled and records its typed remote backend.
+/// provider-specific session options. The coder/devcontainer/ssh providers use
+/// this too, recording their typed remote backend and leaving serialization to
+/// the user's local config.
 pub fn layout_doc_with_options(
     binding_argv: &[String],
     sidebar_args: &[(String, String)],
