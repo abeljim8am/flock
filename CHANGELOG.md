@@ -6,6 +6,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
 
 ## [Unreleased]
 
+## [26.6.0] - 2026-07-22
+* feat(coder): wait for full workspace setup and show progress spinner
+* feat(remote-agent): retire idle daemon when a newer build is installed
+* feat(sidebar): offer closing outdated remote panes to upgrade the daemon
+* fix(remote-agent): release hook-reported agents that leave the foreground
+* fix(flock-selector): respect local session_serialization for remote providers
+
 ## [26.5.0] - 2026-07-21
 * refactor(remote)!: generalize the coder transport into a provider-generic remote engine (unified `remote-pty`/`remote-close` driven by a `RemoteTransport` enum; provider-tagged JSON close-pending files; no backwards compatibility)
 * feat(devcontainer)!: migrate devcontainer sessions onto the remote-agent engine (persistent daemon-owned PTYs, UUID-based serialization/resurrection, self-healing `up` on reconnect, report-state agent channel replacing docker exec-polling)
