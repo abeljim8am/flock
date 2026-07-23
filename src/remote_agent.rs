@@ -434,10 +434,19 @@ impl PaneState {
     /// Hook channels only report working/idle/blocked — nothing fires when the
     /// agent process exits, so without this the last reported state would be
     /// replayed as live forever. Cross-check the report against the pane's
-    /// foreground argv and synthesize a release once the agent stays out of
-    /// the foreground past `grace` (pass `Duration::ZERO` when a stale state
-    /// must settle immediately, e.g. on attach after a long detach).
-    fn reconcile_agent_with_foreground(&self, argv: &[String], grace: Duration) {
+    /// foreground process tree and synthesize a release once the agent stays
+    /// out of the foreground past `grace` (pass `Duration::ZERO` when a stale
+    /// state must settle immediately, e.g. on attach after a long detach).
+    ///
+    /// The ancestry check matters while an agent runs an interactive or
+    /// long-lived tool: the tool owns the terminal's foreground process group,
+    /// but the still-live agent remains one of its parents.
+    fn reconcile_agent_with_foreground(
+        &self,
+        foreground_pid: libc::pid_t,
+        argv: &[String],
+        grace: Duration,
+    ) {
         if argv.is_empty() {
             // No foreground information (pgrp leader already reaped, or a
             // mid-transition read); leave the gone-window untouched rather
@@ -447,9 +456,31 @@ impl PaneState {
         let Some(event) = self.latest_agent_state.lock().unwrap().clone() else {
             return;
         };
-        if event.state == RemoteAgentRunState::Release || agent_matches_argv(&event.agent, argv) {
+        if event.state == RemoteAgentRunState::Release {
             *self.agent_missing_since.lock().unwrap() = None;
             return;
+        }
+        if agent_matches_argv(&event.agent, argv) {
+            *self.agent_missing_since.lock().unwrap() = None;
+            return;
+        }
+        match process_ancestry_matches_agent(
+            &event.agent,
+            foreground_pid,
+            self.pid,
+            read_process_info,
+        ) {
+            Some(true) => {
+                *self.agent_missing_since.lock().unwrap() = None;
+                return;
+            },
+            // We reached the pane's shell without finding the reported agent:
+            // this is an authoritative mismatch and may open/expire the grace.
+            Some(false) => {},
+            // A process disappeared or /proc was unreadable mid-walk. Treat
+            // that like an empty foreground read instead of falsely releasing
+            // a live agent from a partial process-tree snapshot.
+            None => return,
         }
         {
             let mut missing_since = self.agent_missing_since.lock().unwrap();
@@ -477,6 +508,62 @@ fn agent_matches_argv(agent: &str, argv: &[String]) -> bool {
     let agent = agent.to_ascii_lowercase();
     argv.iter()
         .any(|token| token.to_ascii_lowercase().contains(&agent))
+}
+
+/// Walk from the terminal's foreground process-group leader back to the pane
+/// shell. `Some(true)` means the reported agent is still in that foreground
+/// tree, `Some(false)` means the complete walk reached the shell without it,
+/// and `None` means the snapshot was inconclusive.
+///
+/// Keeping the process lookup injectable makes the ancestry behavior
+/// deterministic in unit tests without fabricating a `/proc` tree.
+fn process_ancestry_matches_agent<F>(
+    agent: &str,
+    mut pid: libc::pid_t,
+    pane_pid: libc::pid_t,
+    mut process_info: F,
+) -> Option<bool>
+where
+    F: FnMut(libc::pid_t) -> Option<(libc::pid_t, Vec<String>)>,
+{
+    // A valid pane tree is shallow; the bound also protects against malformed
+    // parent cycles in a racing or synthetic process snapshot.
+    for _ in 0..64 {
+        let (parent_pid, argv) = process_info(pid)?;
+        if agent_matches_argv(agent, &argv) {
+            return Some(true);
+        }
+        if pid == pane_pid {
+            return Some(false);
+        }
+        if parent_pid <= 0 || parent_pid == pid {
+            return None;
+        }
+        pid = parent_pid;
+    }
+    None
+}
+
+fn read_process_info(pid: libc::pid_t) -> Option<(libc::pid_t, Vec<String>)> {
+    let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    // `/proc/<pid>/stat` wraps comm in parentheses and comm itself may contain
+    // spaces or `)`, so split at the final close-paren. The suffix begins with
+    // field 3 (state), followed by field 4 (parent pid).
+    let (_, suffix) = stat.rsplit_once(')')?;
+    let parent_pid = suffix.split_whitespace().nth(1)?.parse().ok()?;
+    Some((parent_pid, read_process_argv(pid)))
+}
+
+fn read_process_argv(pid: libc::pid_t) -> Vec<String> {
+    fs::read(format!("/proc/{pid}/cmdline"))
+        .map(|bytes| {
+            bytes
+                .split(|byte| *byte == 0)
+                .filter(|part| !part.is_empty())
+                .map(|part| String::from_utf8_lossy(part).into_owned())
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 type TransportWriter = Arc<Mutex<Box<dyn Write + Send>>>;
@@ -1622,8 +1709,9 @@ fn handle_client(stream: UnixStream, panes: Panes) -> Result<()> {
                 // The foreground poll only runs while a client is attached, so
                 // an agent closed during a detach would otherwise be replayed
                 // as still open; settle it before the replay.
-                let (argv, _) = foreground_process(pane.master.lock().unwrap().as_raw_fd());
-                pane.reconcile_agent_with_foreground(&argv, Duration::ZERO);
+                let (foreground_pid, argv, _) =
+                    foreground_process(pane.master.lock().unwrap().as_raw_fd());
+                pane.reconcile_agent_with_foreground(foreground_pid, &argv, Duration::ZERO);
                 pane.subscribe_with_replay(after_sequence, &tx)?;
                 let exit_status = *pane.exit_status.lock().unwrap();
                 if let Some(status) = exit_status {
@@ -1647,8 +1735,9 @@ fn handle_client(stream: UnixStream, panes: Panes) -> Result<()> {
             ClientMessage::Acknowledge { .. } => {},
             ClientMessage::ForegroundProcess { pane_id } => {
                 with_pane(&panes, pane_id, &tx, |pane| {
-                    let (argv, cwd) = foreground_process(pane.master.lock().unwrap().as_raw_fd());
-                    pane.reconcile_agent_with_foreground(&argv, AGENT_GONE_GRACE);
+                    let (foreground_pid, argv, cwd) =
+                        foreground_process(pane.master.lock().unwrap().as_raw_fd());
+                    pane.reconcile_agent_with_foreground(foreground_pid, &argv, AGENT_GONE_GRACE);
                     tx.send(ServerMessage::ForegroundProcess { pane_id, argv, cwd })?;
                     Ok(())
                 })?
@@ -1855,24 +1944,16 @@ fn set_winsize(fd: i32, cols: u16, rows: u16) -> Result<()> {
     Ok(())
 }
 
-fn foreground_process(fd: i32) -> (Vec<String>, Option<String>) {
+fn foreground_process(fd: i32) -> (libc::pid_t, Vec<String>, Option<String>) {
     let pgrp = unsafe { libc::tcgetpgrp(fd) };
     if pgrp <= 0 {
-        return (Vec::new(), None);
+        return (pgrp, Vec::new(), None);
     }
-    let argv = fs::read(format!("/proc/{pgrp}/cmdline"))
-        .map(|bytes| {
-            bytes
-                .split(|byte| *byte == 0)
-                .filter(|part| !part.is_empty())
-                .map(|part| String::from_utf8_lossy(part).into_owned())
-                .collect()
-        })
-        .unwrap_or_default();
+    let argv = read_process_argv(pgrp);
     let cwd = fs::read_link(format!("/proc/{pgrp}/cwd"))
         .ok()
         .map(|cwd| cwd.to_string_lossy().into_owned());
-    (argv, cwd)
+    (pgrp, argv, cwd)
 }
 
 pub fn write_frame<W: Write, T: Serialize>(writer: &mut W, message: &T) -> Result<()> {
@@ -2096,6 +2177,38 @@ mod tests {
     }
 
     #[test]
+    fn agent_in_foreground_process_ancestry_stays_detected() {
+        let argv = |args: &[&str]| args.iter().map(|arg| arg.to_string()).collect::<Vec<_>>();
+        let processes = HashMap::from([
+            (300, (200, argv(&["cargo", "test"]))),
+            (
+                200,
+                (100, argv(&["node", "/home/coder/.opencode/bin/opencode"])),
+            ),
+            (100, (1, argv(&["-fish"]))),
+        ]);
+
+        assert_eq!(
+            process_ancestry_matches_agent("opencode", 300, 100, |pid| {
+                processes.get(&pid).cloned()
+            }),
+            Some(true)
+        );
+        assert_eq!(
+            process_ancestry_matches_agent("claude", 300, 100, |pid| {
+                processes.get(&pid).cloned()
+            }),
+            Some(false)
+        );
+        assert_eq!(
+            process_ancestry_matches_agent("opencode", 400, 100, |pid| {
+                processes.get(&pid).cloned()
+            }),
+            None
+        );
+    }
+
+    #[test]
     fn foreground_reconcile_releases_hook_agent_once_it_stays_gone() {
         let file = OpenOptions::new()
             .read(true)
@@ -2118,7 +2231,7 @@ mod tests {
         let argv = |args: &[&str]| args.iter().map(|arg| arg.to_string()).collect::<Vec<_>>();
 
         // No reported agent: reconcile is a no-op.
-        pane.reconcile_agent_with_foreground(&argv(&["-fish"]), Duration::ZERO);
+        pane.reconcile_agent_with_foreground(1, &argv(&["-fish"]), Duration::ZERO);
         assert!(pane.latest_agent_state.lock().unwrap().is_none());
 
         pane.record_agent_state(RemoteAgentStateEvent {
@@ -2130,12 +2243,12 @@ mod tests {
         pane.subscribers.lock().unwrap().push(tx);
 
         // Matching foreground and empty (inconclusive) reads keep the agent.
-        pane.reconcile_agent_with_foreground(&argv(&["opencode"]), Duration::ZERO);
-        pane.reconcile_agent_with_foreground(&[], Duration::ZERO);
+        pane.reconcile_agent_with_foreground(1, &argv(&["opencode"]), Duration::ZERO);
+        pane.reconcile_agent_with_foreground(0, &[], Duration::ZERO);
         assert!(rx.try_iter().next().is_none());
 
         // A mismatch opens the gone-window but holds inside the grace.
-        pane.reconcile_agent_with_foreground(&argv(&["-fish"]), Duration::from_secs(3600));
+        pane.reconcile_agent_with_foreground(1, &argv(&["-fish"]), Duration::from_secs(3600));
         assert!(rx.try_iter().next().is_none());
         assert!(pane.agent_missing_since.lock().unwrap().is_some());
 
@@ -2149,7 +2262,7 @@ mod tests {
         let _ = rx.try_iter().count();
 
         // Past the grace (zero, as on attach) the release is synthesized once.
-        pane.reconcile_agent_with_foreground(&argv(&["-fish"]), Duration::ZERO);
+        pane.reconcile_agent_with_foreground(1, &argv(&["-fish"]), Duration::ZERO);
         assert!(matches!(
             rx.try_iter().next(),
             Some(ServerMessage::AgentStateChanged {
@@ -2160,7 +2273,7 @@ mod tests {
                 }
             }) if agent == "opencode"
         ));
-        pane.reconcile_agent_with_foreground(&argv(&["-fish"]), Duration::ZERO);
+        pane.reconcile_agent_with_foreground(1, &argv(&["-fish"]), Duration::ZERO);
         assert!(rx.try_iter().next().is_none());
     }
 
