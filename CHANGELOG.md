@@ -6,6 +6,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
 
 ## [Unreleased]
 
+## [26.6.1] - 2026-07-22
+* fix(remote-agent): keep agents detected through foreground tools
+
 ## [26.6.0] - 2026-07-22
 * feat(coder): wait for full workspace setup and show progress spinner
 * feat(remote-agent): retire idle daemon when a newer build is installed

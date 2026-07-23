@@ -1074,7 +1074,7 @@ dependencies = [
 
 [[package]]
 name = "flock"
-version = "26.6.0"
+version = "26.6.1"
 dependencies = [
  "anyhow",
  "clap",
@@ -4840,7 +4840,7 @@ dependencies = [
 
 [[package]]
 name = "zellij-client"
-version = "26.6.0"
+version = "26.6.1"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -4888,7 +4888,7 @@ dependencies = [
 
 [[package]]
 name = "zellij-server"
-version = "26.6.0"
+version = "26.6.1"
 dependencies = [
  "ansi_term",
  "anyhow",
@@ -4938,7 +4938,7 @@ dependencies = [
 
 [[package]]
 name = "zellij-tile"
-version = "26.6.0"
+version = "26.6.1"
 dependencies = [
  "clap",
  "prost",
@@ -4951,14 +4951,14 @@ dependencies = [
 
 [[package]]
 name = "zellij-tile-utils"
-version = "26.6.0"
+version = "26.6.1"
 dependencies = [
  "ansi_term",
 ]
 
 [[package]]
 name = "zellij-utils"
-version = "26.6.0"
+version = "26.6.1"
 dependencies = [
  "anyhow",
  "backtrace",

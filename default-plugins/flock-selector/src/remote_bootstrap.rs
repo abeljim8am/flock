@@ -2,7 +2,7 @@
 //! provider (coder, ssh, later devcontainer) wraps these scripts in its own
 //! transport argv; the script bodies never change per provider.
 
-pub const RELEASE_TAG: &str = "v26.6.0";
+pub const RELEASE_TAG: &str = "v26.6.1";
 pub const RELEASE_BASE_URL: &str = "https://github.com/abeljim8am/flock/releases/download";
 
 /// Detect the remote architecture and pick the matching static musl release
