@@ -441,12 +441,15 @@ impl PaneState {
     /// The ancestry check matters while an agent runs an interactive or
     /// long-lived tool: the tool owns the terminal's foreground process group,
     /// but the still-live agent remains one of its parents.
-    fn reconcile_agent_with_foreground(
+    fn reconcile_agent_with_foreground<F>(
         &self,
         foreground_pid: libc::pid_t,
         argv: &[String],
         grace: Duration,
-    ) {
+        process_info: F,
+    ) where
+        F: FnMut(libc::pid_t) -> Option<(libc::pid_t, Vec<String>)>,
+    {
         if argv.is_empty() {
             // No foreground information (pgrp leader already reaped, or a
             // mid-transition read); leave the gone-window untouched rather
@@ -464,12 +467,7 @@ impl PaneState {
             *self.agent_missing_since.lock().unwrap() = None;
             return;
         }
-        match process_ancestry_matches_agent(
-            &event.agent,
-            foreground_pid,
-            self.pid,
-            read_process_info,
-        ) {
+        match process_ancestry_matches_agent(&event.agent, foreground_pid, self.pid, process_info) {
             Some(true) => {
                 *self.agent_missing_since.lock().unwrap() = None;
                 return;
@@ -1711,7 +1709,12 @@ fn handle_client(stream: UnixStream, panes: Panes) -> Result<()> {
                 // as still open; settle it before the replay.
                 let (foreground_pid, argv, _) =
                     foreground_process(pane.master.lock().unwrap().as_raw_fd());
-                pane.reconcile_agent_with_foreground(foreground_pid, &argv, Duration::ZERO);
+                pane.reconcile_agent_with_foreground(
+                    foreground_pid,
+                    &argv,
+                    Duration::ZERO,
+                    read_process_info,
+                );
                 pane.subscribe_with_replay(after_sequence, &tx)?;
                 let exit_status = *pane.exit_status.lock().unwrap();
                 if let Some(status) = exit_status {
@@ -1737,7 +1740,12 @@ fn handle_client(stream: UnixStream, panes: Panes) -> Result<()> {
                 with_pane(&panes, pane_id, &tx, |pane| {
                     let (foreground_pid, argv, cwd) =
                         foreground_process(pane.master.lock().unwrap().as_raw_fd());
-                    pane.reconcile_agent_with_foreground(foreground_pid, &argv, AGENT_GONE_GRACE);
+                    pane.reconcile_agent_with_foreground(
+                        foreground_pid,
+                        &argv,
+                        AGENT_GONE_GRACE,
+                        read_process_info,
+                    );
                     tx.send(ServerMessage::ForegroundProcess { pane_id, argv, cwd })?;
                     Ok(())
                 })?
@@ -2210,6 +2218,10 @@ mod tests {
 
     #[test]
     fn foreground_reconcile_releases_hook_agent_once_it_stays_gone() {
+        fn pane_shell_process_info(pid: libc::pid_t) -> Option<(libc::pid_t, Vec<String>)> {
+            (pid == 1).then(|| (0, vec!["test-shell".into()]))
+        }
+
         let file = OpenOptions::new()
             .read(true)
             .write(true)
@@ -2231,7 +2243,12 @@ mod tests {
         let argv = |args: &[&str]| args.iter().map(|arg| arg.to_string()).collect::<Vec<_>>();
 
         // No reported agent: reconcile is a no-op.
-        pane.reconcile_agent_with_foreground(1, &argv(&["-fish"]), Duration::ZERO);
+        pane.reconcile_agent_with_foreground(
+            1,
+            &argv(&["test-shell"]),
+            Duration::ZERO,
+            pane_shell_process_info,
+        );
         assert!(pane.latest_agent_state.lock().unwrap().is_none());
 
         pane.record_agent_state(RemoteAgentStateEvent {
@@ -2243,12 +2260,22 @@ mod tests {
         pane.subscribers.lock().unwrap().push(tx);
 
         // Matching foreground and empty (inconclusive) reads keep the agent.
-        pane.reconcile_agent_with_foreground(1, &argv(&["opencode"]), Duration::ZERO);
-        pane.reconcile_agent_with_foreground(0, &[], Duration::ZERO);
+        pane.reconcile_agent_with_foreground(
+            1,
+            &argv(&["opencode"]),
+            Duration::ZERO,
+            pane_shell_process_info,
+        );
+        pane.reconcile_agent_with_foreground(0, &[], Duration::ZERO, pane_shell_process_info);
         assert!(rx.try_iter().next().is_none());
 
         // A mismatch opens the gone-window but holds inside the grace.
-        pane.reconcile_agent_with_foreground(1, &argv(&["-fish"]), Duration::from_secs(3600));
+        pane.reconcile_agent_with_foreground(
+            1,
+            &argv(&["test-shell"]),
+            Duration::from_secs(3600),
+            pane_shell_process_info,
+        );
         assert!(rx.try_iter().next().is_none());
         assert!(pane.agent_missing_since.lock().unwrap().is_some());
 
@@ -2262,7 +2289,12 @@ mod tests {
         let _ = rx.try_iter().count();
 
         // Past the grace (zero, as on attach) the release is synthesized once.
-        pane.reconcile_agent_with_foreground(1, &argv(&["-fish"]), Duration::ZERO);
+        pane.reconcile_agent_with_foreground(
+            1,
+            &argv(&["test-shell"]),
+            Duration::ZERO,
+            pane_shell_process_info,
+        );
         assert!(matches!(
             rx.try_iter().next(),
             Some(ServerMessage::AgentStateChanged {
@@ -2273,7 +2305,12 @@ mod tests {
                 }
             }) if agent == "opencode"
         ));
-        pane.reconcile_agent_with_foreground(1, &argv(&["-fish"]), Duration::ZERO);
+        pane.reconcile_agent_with_foreground(
+            1,
+            &argv(&["test-shell"]),
+            Duration::ZERO,
+            pane_shell_process_info,
+        );
         assert!(rx.try_iter().next().is_none());
     }
 
