@@ -23,7 +23,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 use uuid::Uuid;
 
-pub const PROTOCOL_VERSION: u16 = 2;
+pub const PROTOCOL_VERSION: u16 = 3;
 const MAX_FRAME_BYTES: usize = 16 * 1024 * 1024;
 const HISTORY_LIMIT_BYTES: usize = 4 * 1024 * 1024;
 
@@ -76,6 +76,13 @@ pub enum ClientMessage {
         pane_id: Uuid,
         state: RemoteAgentRunState,
         agent: String,
+        /// The agent's own process id, when the integration can name it exactly
+        /// (the OpenCode plugin runs in-process, so it reports `process.pid`).
+        /// The daemon watches this pid for exit — that is how it learns the
+        /// agent is gone. Absent for integrations that cannot know it; the
+        /// daemon then resolves the pid from the reporter's ancestry.
+        #[serde(default)]
+        agent_pid: Option<u32>,
     },
 }
 
@@ -116,6 +123,13 @@ pub struct RemoteAgentStateEvent {
     pub pane_id: Uuid,
     pub state: RemoteAgentRunState,
     pub agent: String,
+    /// Whether this event is the daemon re-asserting an unchanged picture
+    /// rather than the agent reporting a transition. Consumers must treat a
+    /// heartbeat as proof the agent is still present without letting it count
+    /// as a fresh report — otherwise the periodic re-assertion would keep
+    /// resetting the screen-veto windows that arbitrate a stale hook.
+    #[serde(default)]
+    pub heartbeat: bool,
 }
 
 /// Provider-specific carrier for the framed remote-agent protocol. Everything
@@ -329,11 +343,39 @@ struct OutputChunk {
     data: Vec<u8>,
 }
 
-/// Grace before a hook-reported agent that has left the pane's foreground is
-/// considered gone. The foreground poll arrives roughly once per second, so
-/// this tolerates a few transitional polls (an agent handing the terminal to
-/// an interactive subprocess) without flapping to released.
-const AGENT_GONE_GRACE: Duration = Duration::from_secs(4);
+/// How often the daemon checks each tracked agent process for exit. A release is
+/// edge-triggered off process death, so this only bounds how quickly the agent
+/// leaving is noticed — it costs one `/proc` read per tracked agent.
+const PRESENCE_TICK: Duration = Duration::from_secs(2);
+/// How many [`PRESENCE_TICK`]s between presence re-assertions.
+///
+/// Deliberately much slower than the liveness check. A release must be prompt,
+/// but a heartbeat is only a safety net for a client that lost the agent, and
+/// every heartbeat costs a `flock pipe` process on the *local* host — the
+/// bridge forwards each event to the sidebar by spawning one. Re-asserting
+/// every tick would be 30 spawns a minute per remote pane to say nothing new.
+const HEARTBEAT_EVERY_TICKS: u32 = 5;
+
+/// The agent occupying a pane, as last reported by its integration hook.
+///
+/// `pid` is the whole point of this struct: presence is the liveness of a
+/// specific process, not an inference from the pane's foreground process group.
+/// Process death is a fact and is observed exactly once, which is what makes
+/// presence stable — the previous design guessed from `tcgetpgrp` plus argv
+/// matching and flapped whenever the agent was alive but not the foreground
+/// group's leader or ancestor (nested PTYs, `setsid`-ing tools, reaped group
+/// leaders).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TrackedAgent {
+    label: String,
+    /// Never `Release` — a released agent is represented by no tracked agent.
+    state: RemoteAgentRunState,
+    /// The process to watch. `None` when resolution failed, in which case the
+    /// agent is only ever released by an explicit `release` report. Holding a
+    /// stale agent is the safe failure: it shows a finished agent until the
+    /// pane closes, where guessing would blink a live one out of existence.
+    pid: Option<libc::pid_t>,
+}
 
 struct PaneState {
     id: Uuid,
@@ -343,8 +385,7 @@ struct PaneState {
     history_bytes: Mutex<usize>,
     next_sequence: Mutex<u64>,
     subscribers: Mutex<Vec<mpsc::Sender<ServerMessage>>>,
-    latest_agent_state: Mutex<Option<RemoteAgentStateEvent>>,
-    agent_missing_since: Mutex<Option<Instant>>,
+    agent: Mutex<Option<TrackedAgent>>,
     exit_status: Mutex<Option<Option<i32>>>,
 }
 
@@ -414,131 +455,276 @@ impl PaneState {
             pane_id: self.id,
             next_sequence: *next_sequence,
         })?;
-        if let Some(event) = self.latest_agent_state.lock().unwrap().clone() {
+        // Replay presence as a heartbeat: the attaching client needs the
+        // current picture, but this is a re-assertion of an existing report,
+        // not a fresh transition.
+        if let Some(event) = self.presence_event(true) {
             tx.send(ServerMessage::AgentStateChanged { event })?;
         }
         subscribers.push(tx.clone());
         Ok(())
     }
 
-    fn record_agent_state(&self, event: RemoteAgentStateEvent) {
-        let mut subscribers = self.subscribers.lock().unwrap();
-        *self.latest_agent_state.lock().unwrap() = Some(event.clone());
-        // A fresh report proves the agent is alive; close any pending
-        // gone-window so a transient foreground mismatch cannot release it.
-        *self.agent_missing_since.lock().unwrap() = None;
-        let message = ServerMessage::AgentStateChanged { event };
-        subscribers.retain(|subscriber| subscriber.send(message.clone()).is_ok());
+    /// Record an agent self-report. A `release` clears the tracked agent;
+    /// anything else installs (or refreshes) it, resolving the process to watch
+    /// from the explicit pid the integration supplied or, failing that, from the
+    /// reporting process's ancestry.
+    ///
+    /// `reporter_pid` comes from the socket's peer credentials, so it is the
+    /// kernel's answer rather than the caller's claim.
+    fn record_agent_state(
+        &self,
+        state: RemoteAgentRunState,
+        label: String,
+        reporter_pid: Option<libc::pid_t>,
+        explicit_pid: Option<libc::pid_t>,
+    ) {
+        if state == RemoteAgentRunState::Release {
+            self.clear_agent(label);
+            return;
+        }
+        let event = {
+            let mut tracked = self.agent.lock().unwrap();
+            // Keep an already-resolved pid across state transitions: only the
+            // first report of an agent needs to pay for the ancestry walk, and
+            // a later report from a short-lived helper must not overwrite a
+            // good answer with a worse one.
+            let pid = tracked
+                .as_ref()
+                .filter(|existing| existing.label == label)
+                .and_then(|existing| existing.pid)
+                .or_else(|| {
+                    resolve_agent_pid(&label, reporter_pid, explicit_pid, self.pid, |pid| {
+                        read_process_info(pid)
+                    })
+                });
+            *tracked = Some(TrackedAgent {
+                label: label.clone(),
+                state,
+                pid,
+            });
+            RemoteAgentStateEvent {
+                pane_id: self.id,
+                state,
+                agent: label,
+                heartbeat: false,
+            }
+        };
+        self.publish(ServerMessage::AgentStateChanged { event });
     }
 
-    /// Hook channels only report working/idle/blocked — nothing fires when the
-    /// agent process exits, so without this the last reported state would be
-    /// replayed as live forever. Cross-check the report against the pane's
-    /// foreground process tree and synthesize a release once the agent stays
-    /// out of the foreground past `grace` (pass `Duration::ZERO` when a stale
-    /// state must settle immediately, e.g. on attach after a long detach).
-    ///
-    /// The ancestry check matters while an agent runs an interactive or
-    /// long-lived tool: the tool owns the terminal's foreground process group,
-    /// but the still-live agent remains one of its parents.
-    fn reconcile_agent_with_foreground<F>(
-        &self,
-        foreground_pid: libc::pid_t,
-        argv: &[String],
-        grace: Duration,
-        process_info: F,
-    ) where
-        F: FnMut(libc::pid_t) -> Option<(libc::pid_t, Vec<String>)>,
-    {
-        if argv.is_empty() {
-            // No foreground information (pgrp leader already reaped, or a
-            // mid-transition read); leave the gone-window untouched rather
-            // than guessing in either direction.
-            return;
-        }
-        let Some(event) = self.latest_agent_state.lock().unwrap().clone() else {
-            return;
+    /// Drop the tracked agent and tell every subscriber. Idempotent: a release
+    /// for a pane with no agent still publishes, so a client that somehow holds
+    /// a stale agent converges.
+    fn clear_agent(&self, label: String) {
+        let label = match self.agent.lock().unwrap().take() {
+            Some(tracked) => tracked.label,
+            None => label,
         };
-        if event.state == RemoteAgentRunState::Release {
-            *self.agent_missing_since.lock().unwrap() = None;
-            return;
-        }
-        if agent_matches_argv(&event.agent, argv) {
-            *self.agent_missing_since.lock().unwrap() = None;
-            return;
-        }
-        match process_ancestry_matches_agent(&event.agent, foreground_pid, self.pid, process_info) {
-            Some(true) => {
-                *self.agent_missing_since.lock().unwrap() = None;
-                return;
+        self.publish(ServerMessage::AgentStateChanged {
+            event: RemoteAgentStateEvent {
+                pane_id: self.id,
+                state: RemoteAgentRunState::Release,
+                agent: label,
+                heartbeat: false,
             },
-            // We reached the pane's shell without finding the reported agent:
-            // this is an authoritative mismatch and may open/expire the grace.
-            Some(false) => {},
-            // A process disappeared or /proc was unreadable mid-walk. Treat
-            // that like an empty foreground read instead of falsely releasing
-            // a live agent from a partial process-tree snapshot.
-            None => return,
-        }
-        {
-            let mut missing_since = self.agent_missing_since.lock().unwrap();
-            let since = *missing_since.get_or_insert_with(Instant::now);
-            if since.elapsed() < grace {
-                return;
-            }
-        }
-        self.record_agent_state(RemoteAgentStateEvent {
-            pane_id: self.id,
-            state: RemoteAgentRunState::Release,
-            agent: event.agent,
         });
     }
+
+    /// The current presence picture as an event, or `None` when no agent is
+    /// tracked. Does not check liveness — call [`Self::settle_presence`] first
+    /// when that matters.
+    fn presence_event(&self, heartbeat: bool) -> Option<RemoteAgentStateEvent> {
+        self.agent
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|tracked| RemoteAgentStateEvent {
+                pane_id: self.id,
+                state: tracked.state,
+                agent: tracked.label.clone(),
+                heartbeat,
+            })
+    }
+
+    /// Reconcile the tracked agent against its process, releasing it if that
+    /// process is gone and otherwise re-asserting presence when
+    /// `broadcast_heartbeat` is set.
+    ///
+    /// This is the whole of presence maintenance. A watched process that has
+    /// exited releases the agent exactly once — always, regardless of
+    /// `broadcast_heartbeat`, because a release is news. The periodic
+    /// re-announcement is what makes the local side a projection rather than an
+    /// authority: a client that dropped the agent (plugin reload, a missed
+    /// frame, a reconnect) recovers on the next heartbeat instead of waiting for
+    /// the agent's next state transition, which for an idle agent may never come.
+    fn settle_presence(&self, broadcast_heartbeat: bool) {
+        let released = {
+            let mut tracked = self.agent.lock().unwrap();
+            match tracked.as_ref() {
+                Some(agent) => match agent.pid {
+                    Some(pid) if !process_is_alive(pid) => {
+                        let label = agent.label.clone();
+                        *tracked = None;
+                        Some(label)
+                    },
+                    _ => None,
+                },
+                None => None,
+            }
+        };
+        let event = match released {
+            Some(label) => RemoteAgentStateEvent {
+                pane_id: self.id,
+                state: RemoteAgentRunState::Release,
+                agent: label,
+                heartbeat: false,
+            },
+            None if broadcast_heartbeat => match self.presence_event(true) {
+                Some(event) => event,
+                None => return,
+            },
+            None => return,
+        };
+        self.publish(ServerMessage::AgentStateChanged { event });
+    }
 }
 
-/// Whether the reported agent label still describes the foreground argv. The
-/// daemon cannot reuse the sidebar's full command detection, so it matches the
-/// label as a substring of any argv token — covering direct binaries
-/// (`opencode`), absolute paths, runtime wrappers (`node …/opencode/index.js`)
-/// and nix wrapper names (`.claude-unwrapped`). A false "still here" merely
-/// keeps today's behavior until the next signal; a false "gone" would close a
-/// live agent, so matching stays deliberately loose.
-fn agent_matches_argv(agent: &str, argv: &[String]) -> bool {
-    let agent = agent.to_ascii_lowercase();
-    argv.iter()
-        .any(|token| token.to_ascii_lowercase().contains(&agent))
-}
-
-/// Walk from the terminal's foreground process-group leader back to the pane
-/// shell. `Some(true)` means the reported agent is still in that foreground
-/// tree, `Some(false)` means the complete walk reached the shell without it,
-/// and `None` means the snapshot was inconclusive.
+/// Resolve the process whose exit means "this agent is gone".
 ///
-/// Keeping the process lookup injectable makes the ancestry behavior
-/// deterministic in unit tests without fabricating a `/proc` tree.
-fn process_ancestry_matches_agent<F>(
-    agent: &str,
-    mut pid: libc::pid_t,
-    pane_pid: libc::pid_t,
+/// Preference order, most exact first:
+///
+/// 1. `explicit_pid` — the integration named its own process (OpenCode's plugin
+///    runs inside the agent, so it knows). Accepted only after confirming it
+///    really is the reporter or one of its ancestors inside this pane, so a
+///    wrong or stale claim cannot make the daemon watch an unrelated process.
+/// 2. The ancestor closest to the pane's shell whose argv looks like `label`.
+///    Argv matching is used *once*, to find a pid — not continuously to decide
+///    presence, which is what made the previous design flap. Searching from the
+///    shell end rather than from the reporter matters: an integration's own hook
+///    script is usually installed under a path named after the agent
+///    (`~/.claude/hooks/flock-agent-state.sh`), so a reporter-first search would
+///    match the short-lived wrapper that invoked it and release the agent as
+///    soon as that wrapper exited.
+/// 3. The last ancestor before the pane's shell, i.e. whatever the shell
+///    launched. Correct unless a resident wrapper (`devenv shell`, `nix
+///    develop`) sits between, in which case the agent reads as present until
+///    the pane closes.
+///
+/// `None` when the reporter is unknown or its ancestry never reaches the pane
+/// shell; the agent then relies on an explicit `release` report.
+fn resolve_agent_pid<F>(
+    label: &str,
+    reporter_pid: Option<libc::pid_t>,
+    explicit_pid: Option<libc::pid_t>,
+    shell_pid: libc::pid_t,
     mut process_info: F,
-) -> Option<bool>
+) -> Option<libc::pid_t>
 where
     F: FnMut(libc::pid_t) -> Option<(libc::pid_t, Vec<String>)>,
 {
-    // A valid pane tree is shallow; the bound also protects against malformed
-    // parent cycles in a racing or synthetic process snapshot.
+    let reporter_pid = reporter_pid?;
+    // Walk once and keep the chain; every candidate below is a position in it.
+    let mut chain: Vec<(libc::pid_t, Vec<String>)> = Vec::new();
+    let mut pid = reporter_pid;
+    let mut reached_shell = false;
+    // A pane's process tree is shallow. The bound also stops a malformed or
+    // racing snapshot with a parent cycle from spinning here.
     for _ in 0..64 {
+        if pid == shell_pid {
+            reached_shell = true;
+            break;
+        }
         let (parent_pid, argv) = process_info(pid)?;
-        if agent_matches_argv(agent, &argv) {
-            return Some(true);
-        }
-        if pid == pane_pid {
-            return Some(false);
-        }
-        if parent_pid <= 0 || parent_pid == pid {
-            return None;
+        chain.push((pid, argv));
+        if parent_pid <= 1 || parent_pid == pid {
+            break;
         }
         pid = parent_pid;
     }
+    if !reached_shell {
+        // The reporter is not inside this pane's tree — a stale hook from a
+        // previous pane, or a snapshot that raced process exit. Watching a pid
+        // we cannot place would be worse than watching none.
+        return None;
+    }
+    if let Some(explicit) = explicit_pid {
+        if chain.iter().any(|(pid, _)| *pid == explicit) {
+            return Some(explicit);
+        }
+    }
+    if let Some((pid, _)) = chain
+        .iter()
+        .rev()
+        .find(|(_, argv)| argv_looks_like_agent(label, argv))
+    {
+        return Some(*pid);
+    }
+    chain.last().map(|(pid, _)| *pid)
+}
+
+/// Whether an argv looks like the named agent, used only to pick the pid to
+/// watch. Matches the label as a substring of any token, covering direct
+/// binaries (`opencode`), absolute paths, runtime wrappers (`node
+/// …/opencode/index.js`) and nix wrapper names (`.claude-unwrapped`).
+fn argv_looks_like_agent(label: &str, argv: &[String]) -> bool {
+    let label = label.to_ascii_lowercase();
+    argv.iter()
+        .any(|token| token.to_ascii_lowercase().contains(&label))
+}
+
+/// Whether a process still exists and has not become a zombie.
+///
+/// Prefers `/proc`, which distinguishes a zombie from a running process —
+/// `kill(pid, 0)` reports a reaped-but-unwaited child as alive. A missing
+/// `/proc` entry only means "gone" when `/proc` itself is readable, so an
+/// environment without it (a hardened container, a non-Linux host running the
+/// tests) falls back to signal probing rather than declaring every agent dead.
+/// Getting this wrong in the pessimistic direction would release live agents,
+/// which is the failure the whole redesign exists to remove.
+fn process_is_alive(pid: libc::pid_t) -> bool {
+    if let Ok(stat) = fs::read_to_string(format!("/proc/{pid}/stat")) {
+        return stat
+            .rsplit_once(')')
+            .and_then(|(_, suffix)| suffix.split_whitespace().next())
+            .is_none_or(|state| state != "Z");
+    }
+    if Path::new("/proc/self/stat").exists() {
+        // `/proc` works and this pid has no entry: the process is gone.
+        return false;
+    }
+    unsafe { libc::kill(pid, 0) == 0 }
+}
+
+/// The connecting process's pid, from the kernel's socket peer credentials.
+/// Unlike a pid the client sends, this cannot be forged or go stale.
+///
+/// `SO_PEERCRED` is Linux-only, which is also the only platform the daemon runs
+/// on (see [`require_supported_platform`]). The module still compiles for the
+/// local bridge and CLI on other hosts, so the lookup degrades to "unknown"
+/// there rather than failing the build.
+#[cfg(target_os = "linux")]
+fn peer_pid(stream: &UnixStream) -> Option<libc::pid_t> {
+    let mut credentials = libc::ucred {
+        pid: 0,
+        uid: 0,
+        gid: 0,
+    };
+    let mut length = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+    let result = unsafe {
+        libc::getsockopt(
+            stream.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_PEERCRED,
+            &mut credentials as *mut libc::ucred as *mut libc::c_void,
+            &mut length,
+        )
+    };
+    (result == 0 && credentials.pid > 0).then_some(credentials.pid)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn peer_pid(_stream: &UnixStream) -> Option<libc::pid_t> {
     None
 }
 
@@ -705,6 +891,7 @@ pub fn serve(socket: Option<PathBuf>, foreground: bool) -> Result<()> {
         eprintln!("flock remote-agent: could not install the OpenCode state plugin: {error:#}");
     }
     let panes: Panes = Arc::new(Mutex::new(HashMap::new()));
+    start_presence_ticker(panes.clone());
     for stream in listener.incoming() {
         match stream {
             Ok(stream) => {
@@ -909,6 +1096,7 @@ pub fn report_state(
     pane_id: &str,
     state: &str,
     agent: &str,
+    agent_pid: Option<u32>,
     socket: Option<PathBuf>,
 ) -> Result<()> {
     let pane_id = Uuid::parse_str(pane_id).context("invalid pane UUID")?;
@@ -939,6 +1127,7 @@ pub fn report_state(
             pane_id,
             state,
             agent: agent.to_owned(),
+            agent_pid,
         },
     )?;
     loop {
@@ -1424,9 +1613,16 @@ fn start_local_agent_state_forwarder() -> Option<mpsc::Sender<RemoteAgentStateEv
 
 fn local_agent_state_args(pane_id: &str, event: &RemoteAgentStateEvent) -> String {
     format!(
-        "pane_id={pane_id},state={},agent={},source=flock:coder-remote",
+        "pane_id={pane_id},state={},agent={},source=flock:coder-remote,presence={}",
         event.state.as_str(),
-        event.agent
+        event.agent,
+        // The sidebar must distinguish the daemon re-asserting an unchanged
+        // picture from the agent reporting a transition; see `HookReport`.
+        if event.heartbeat {
+            "heartbeat"
+        } else {
+            "report"
+        },
     )
 }
 
@@ -1617,6 +1813,10 @@ fn wait_for_socket(socket: &Path, timeout: Duration) -> Result<()> {
 
 fn handle_client(stream: UnixStream, panes: Panes) -> Result<()> {
     let mut reader = stream.try_clone()?;
+    // Captured before any framing: an agent state report identifies the process
+    // to watch by its own ancestry, and the kernel's answer for who is on the
+    // other end of this socket is the trustworthy starting point.
+    let reporter_pid = peer_pid(&stream);
     let mut direct_writer = stream;
 
     let hello: ClientMessage = read_frame(&mut reader)?;
@@ -1704,17 +1904,11 @@ fn handle_client(stream: UnixStream, panes: Panes) -> Result<()> {
                     })?;
                     continue;
                 };
-                // The foreground poll only runs while a client is attached, so
-                // an agent closed during a detach would otherwise be replayed
-                // as still open; settle it before the replay.
-                let (foreground_pid, argv, _) =
-                    foreground_process(pane.master.lock().unwrap().as_raw_fd());
-                pane.reconcile_agent_with_foreground(
-                    foreground_pid,
-                    &argv,
-                    Duration::ZERO,
-                    read_process_info,
-                );
+                // Settle presence against the agent's process before replaying
+                // it, so a client attaching after the agent exited is told the
+                // truth rather than the last state the agent managed to report.
+                // No heartbeat: `subscribe_with_replay` sends the picture below.
+                pane.settle_presence(false);
                 pane.subscribe_with_replay(after_sequence, &tx)?;
                 let exit_status = *pane.exit_status.lock().unwrap();
                 if let Some(status) = exit_status {
@@ -1736,16 +1930,12 @@ fn handle_client(stream: UnixStream, panes: Panes) -> Result<()> {
                 set_winsize(pane.master.lock().unwrap().as_raw_fd(), cols, rows)
             })?,
             ClientMessage::Acknowledge { .. } => {},
+            // Purely informational: the bridge persists the pane's argv and cwd
+            // so a reattach can restore them. Agent presence deliberately does
+            // not consult the foreground process group — see `settle_presence`.
             ClientMessage::ForegroundProcess { pane_id } => {
                 with_pane(&panes, pane_id, &tx, |pane| {
-                    let (foreground_pid, argv, cwd) =
-                        foreground_process(pane.master.lock().unwrap().as_raw_fd());
-                    pane.reconcile_agent_with_foreground(
-                        foreground_pid,
-                        &argv,
-                        AGENT_GONE_GRACE,
-                        read_process_info,
-                    );
+                    let (argv, cwd) = foreground_process(pane.master.lock().unwrap().as_raw_fd());
                     tx.send(ServerMessage::ForegroundProcess { pane_id, argv, cwd })?;
                     Ok(())
                 })?
@@ -1763,6 +1953,7 @@ fn handle_client(stream: UnixStream, panes: Panes) -> Result<()> {
                 pane_id,
                 state,
                 agent,
+                agent_pid,
             } => {
                 if let Err(error) = validate_agent_label(&agent) {
                     tx.send(ServerMessage::Error {
@@ -1771,11 +1962,12 @@ fn handle_client(stream: UnixStream, panes: Panes) -> Result<()> {
                     continue;
                 }
                 with_pane(&panes, pane_id, &tx, |pane| {
-                    pane.record_agent_state(RemoteAgentStateEvent {
-                        pane_id,
+                    pane.record_agent_state(
                         state,
                         agent,
-                    });
+                        reporter_pid,
+                        agent_pid.map(|pid| pid as libc::pid_t),
+                    );
                     tx.send(ServerMessage::AgentStateAccepted { pane_id })?;
                     Ok(())
                 })?
@@ -1882,10 +2074,33 @@ fn spawn_pane_with_shell(
         history_bytes: Mutex::new(0),
         next_sequence: Mutex::new(1),
         subscribers: Mutex::new(Vec::new()),
-        latest_agent_state: Mutex::new(None),
-        agent_missing_since: Mutex::new(None),
+        agent: Mutex::new(None),
         exit_status: Mutex::new(None),
     }))
+}
+
+/// Drive [`PaneState::settle_presence`] for every live pane.
+///
+/// One daemon-wide thread rather than one per pane: the work is a `/proc` stat
+/// per tracked agent, and a single loop cannot leak a thread when a pane is
+/// removed. Presence maintenance deliberately does *not* depend on a client
+/// being attached — an agent that exits during a detach is released here, so
+/// nothing stale is left to replay on the next attach.
+fn start_presence_ticker(panes: Panes) {
+    thread::spawn(move || {
+        let mut tick: u32 = 0;
+        loop {
+            thread::sleep(PRESENCE_TICK);
+            tick = tick.wrapping_add(1);
+            // Every pane heartbeats on the same tick, so the forwarding cost is
+            // one burst rather than a steady trickle.
+            let broadcast_heartbeat = tick % HEARTBEAT_EVERY_TICKS == 0;
+            let live: Vec<Arc<PaneState>> = panes.lock().unwrap().values().cloned().collect();
+            for pane in live {
+                pane.settle_presence(broadcast_heartbeat);
+            }
+        }
+    });
 }
 
 use std::os::unix::process::CommandExt;
@@ -1952,16 +2167,16 @@ fn set_winsize(fd: i32, cols: u16, rows: u16) -> Result<()> {
     Ok(())
 }
 
-fn foreground_process(fd: i32) -> (libc::pid_t, Vec<String>, Option<String>) {
+fn foreground_process(fd: i32) -> (Vec<String>, Option<String>) {
     let pgrp = unsafe { libc::tcgetpgrp(fd) };
     if pgrp <= 0 {
-        return (pgrp, Vec::new(), None);
+        return (Vec::new(), None);
     }
     let argv = read_process_argv(pgrp);
     let cwd = fs::read_link(format!("/proc/{pgrp}/cwd"))
         .ok()
         .map(|cwd| cwd.to_string_lossy().into_owned());
-    (pgrp, argv, cwd)
+    (argv, cwd)
 }
 
 pub fn write_frame<W: Write, T: Serialize>(writer: &mut W, message: &T) -> Result<()> {
@@ -1992,6 +2207,31 @@ mod tests {
     use super::*;
     use nix::sys::termios::{InputFlags, LocalFlags, OutputFlags};
     use std::fs::OpenOptions;
+
+    /// A `PaneState` with no real PTY behind it. `shell_pid` stands in for the
+    /// pane's login shell, the anchor every agent-pid resolution walks toward.
+    fn test_pane(id: Uuid, shell_pid: libc::pid_t) -> PaneState {
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open("/dev/null")
+            .unwrap();
+        PaneState {
+            id,
+            pid: shell_pid,
+            master: Mutex::new(file),
+            history: Mutex::new(VecDeque::new()),
+            history_bytes: Mutex::new(0),
+            next_sequence: Mutex::new(1),
+            subscribers: Mutex::new(Vec::new()),
+            agent: Mutex::new(None),
+            exit_status: Mutex::new(None),
+        }
+    }
+
+    fn argv(args: &[&str]) -> Vec<String> {
+        args.iter().map(|arg| arg.to_string()).collect()
+    }
 
     struct BrokenWriter;
 
@@ -2025,6 +2265,7 @@ mod tests {
                 pane_id: Uuid::new_v4(),
                 state: RemoteAgentRunState::Working,
                 agent: "opencode".into(),
+                heartbeat: false,
             },
         };
         let mut state_bytes = Vec::new();
@@ -2037,23 +2278,7 @@ mod tests {
 
     #[test]
     fn bounded_history_drops_oldest_complete_chunks() {
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open("/dev/null")
-            .unwrap();
-        let pane = PaneState {
-            id: Uuid::new_v4(),
-            pid: 1,
-            master: Mutex::new(file),
-            history: Mutex::new(VecDeque::new()),
-            history_bytes: Mutex::new(0),
-            next_sequence: Mutex::new(1),
-            subscribers: Mutex::new(Vec::new()),
-            latest_agent_state: Mutex::new(None),
-            agent_missing_since: Mutex::new(None),
-            exit_status: Mutex::new(None),
-        };
+        let pane = test_pane(Uuid::new_v4(), 1);
         pane.record_output(vec![1; HISTORY_LIMIT_BYTES]);
         pane.record_output(vec![2; 16]);
         let history = pane.history.lock().unwrap();
@@ -2063,23 +2288,7 @@ mod tests {
 
     #[test]
     fn replay_is_delivered_once_before_live_output() {
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open("/dev/null")
-            .unwrap();
-        let pane = PaneState {
-            id: Uuid::new_v4(),
-            pid: 1,
-            master: Mutex::new(file),
-            history: Mutex::new(VecDeque::new()),
-            history_bytes: Mutex::new(0),
-            next_sequence: Mutex::new(1),
-            subscribers: Mutex::new(Vec::new()),
-            latest_agent_state: Mutex::new(None),
-            agent_missing_since: Mutex::new(None),
-            exit_status: Mutex::new(None),
-        };
+        let pane = test_pane(Uuid::new_v4(), 1);
         pane.record_output(b"replay".to_vec());
         let (tx, rx) = mpsc::channel();
         pane.subscribe_with_replay(0, &tx).unwrap();
@@ -2105,49 +2314,109 @@ mod tests {
     }
 
     #[test]
-    fn latest_agent_state_and_release_are_replayed_after_attach() {
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open("/dev/null")
-            .unwrap();
+    fn a_released_agent_is_not_replayed_after_attach() {
         let pane_id = Uuid::new_v4();
-        let pane = PaneState {
-            id: pane_id,
-            pid: 1,
-            master: Mutex::new(file),
-            history: Mutex::new(VecDeque::new()),
-            history_bytes: Mutex::new(0),
-            next_sequence: Mutex::new(1),
-            subscribers: Mutex::new(Vec::new()),
-            latest_agent_state: Mutex::new(None),
-            agent_missing_since: Mutex::new(None),
-            exit_status: Mutex::new(None),
-        };
-        pane.record_agent_state(RemoteAgentStateEvent {
-            pane_id,
-            state: RemoteAgentRunState::Working,
-            agent: "opencode".into(),
-        });
-        pane.record_agent_state(RemoteAgentStateEvent {
-            pane_id,
-            state: RemoteAgentRunState::Release,
-            agent: "opencode".into(),
-        });
+        let pane = test_pane(pane_id, 1);
+        pane.record_agent_state(RemoteAgentRunState::Working, "opencode".into(), None, None);
+        pane.record_agent_state(RemoteAgentRunState::Release, "opencode".into(), None, None);
+
         let (tx, rx) = mpsc::channel();
         pane.subscribe_with_replay(0, &tx).unwrap();
         let messages: Vec<_> = rx.try_iter().collect();
         assert!(matches!(messages[0], ServerMessage::Attached { .. }));
+        // A release clears the tracked agent outright, so there is nothing left
+        // to replay — the old design kept `Release` as a sticky state and
+        // re-sent it on every attach.
+        assert_eq!(messages.len(), 1);
+    }
+
+    #[test]
+    fn a_live_agent_is_replayed_after_attach_as_a_heartbeat() {
+        let pane_id = Uuid::new_v4();
+        let pane = test_pane(pane_id, 1);
+        // No resolvable reporter, so no pid is watched: presence then rests on
+        // explicit reports alone and must never be released by inference.
+        pane.record_agent_state(RemoteAgentRunState::Blocked, "opencode".into(), None, None);
+
+        let (tx, rx) = mpsc::channel();
+        pane.subscribe_with_replay(0, &tx).unwrap();
+        let messages: Vec<_> = rx.try_iter().collect();
         assert!(matches!(
             &messages[1],
             ServerMessage::AgentStateChanged {
                 event: RemoteAgentStateEvent {
-                    state: RemoteAgentRunState::Release,
+                    state: RemoteAgentRunState::Blocked,
                     agent,
+                    heartbeat: true,
                     ..
                 }
             } if agent == "opencode"
         ));
+    }
+
+    #[test]
+    fn presence_survives_an_agent_that_is_not_in_the_foreground() {
+        // The failure the previous design could not express: the agent is alive
+        // but owns neither the foreground process group nor an ancestry path to
+        // it. Presence now watches the agent's own pid, so nothing about the
+        // foreground can release it.
+        let pane = test_pane(Uuid::new_v4(), 1);
+        let live_pid = std::process::id() as libc::pid_t;
+        *pane.agent.lock().unwrap() = Some(TrackedAgent {
+            label: "opencode".into(),
+            state: RemoteAgentRunState::Working,
+            pid: Some(live_pid),
+        });
+        let (tx, rx) = mpsc::channel();
+        pane.subscribers.lock().unwrap().push(tx);
+
+        pane.settle_presence(true);
+
+        assert!(matches!(
+            rx.try_iter().next(),
+            Some(ServerMessage::AgentStateChanged {
+                event: RemoteAgentStateEvent {
+                    state: RemoteAgentRunState::Working,
+                    heartbeat: true,
+                    ..
+                }
+            })
+        ));
+        assert!(pane.agent.lock().unwrap().is_some());
+    }
+
+    #[test]
+    fn a_dead_agent_process_releases_the_agent_exactly_once() {
+        let pane = test_pane(Uuid::new_v4(), 1);
+        // Reap a real child so the pid is genuinely gone rather than guessed at.
+        let mut child = Command::new("true").spawn().unwrap();
+        let dead_pid = child.id() as libc::pid_t;
+        child.wait().unwrap();
+        *pane.agent.lock().unwrap() = Some(TrackedAgent {
+            label: "opencode".into(),
+            state: RemoteAgentRunState::Working,
+            pid: Some(dead_pid),
+        });
+        let (tx, rx) = mpsc::channel();
+        pane.subscribers.lock().unwrap().push(tx);
+
+        pane.settle_presence(true);
+        assert!(matches!(
+            rx.try_iter().next(),
+            Some(ServerMessage::AgentStateChanged {
+                event: RemoteAgentStateEvent {
+                    state: RemoteAgentRunState::Release,
+                    heartbeat: false,
+                    ..
+                }
+            })
+        ));
+        assert!(pane.agent.lock().unwrap().is_none());
+
+        // Nothing is tracked any more, so further ticks are silent — no
+        // repeated release, and nothing for a client to flicker on.
+        pane.settle_presence(true);
+        assert!(rx.try_iter().next().is_none());
     }
 
     #[test]
@@ -2165,175 +2434,207 @@ mod tests {
     }
 
     #[test]
-    fn agent_label_matches_common_foreground_argv_shapes() {
-        let argv = |args: &[&str]| args.iter().map(|arg| arg.to_string()).collect::<Vec<_>>();
-        assert!(agent_matches_argv("opencode", &argv(&["opencode"])));
-        assert!(agent_matches_argv(
+    fn agent_label_matches_common_argv_shapes() {
+        assert!(argv_looks_like_agent("opencode", &argv(&["opencode"])));
+        assert!(argv_looks_like_agent(
             "opencode",
             &argv(&["/home/coder/.opencode/bin/opencode", "--continue"])
         ));
-        assert!(agent_matches_argv(
+        assert!(argv_looks_like_agent(
             "opencode",
             &argv(&["node", "/usr/lib/opencode/index.js"])
         ));
-        assert!(agent_matches_argv(
+        assert!(argv_looks_like_agent(
             "claude",
             &argv(&["/nix/store/abc123-claude-code/bin/.claude-unwrapped"])
         ));
-        assert!(!agent_matches_argv("opencode", &argv(&["-fish"])));
-        assert!(!agent_matches_argv("opencode", &argv(&["vim", "notes.md"])));
+        assert!(!argv_looks_like_agent("opencode", &argv(&["-fish"])));
+        assert!(!argv_looks_like_agent(
+            "opencode",
+            &argv(&["vim", "notes.md"])
+        ));
     }
 
     #[test]
-    fn agent_in_foreground_process_ancestry_stays_detected() {
-        let argv = |args: &[&str]| args.iter().map(|arg| arg.to_string()).collect::<Vec<_>>();
+    fn agent_pid_is_resolved_from_the_reporter_ancestry() {
+        // The shape a hook actually produces: the pane's shell launched the
+        // agent, and the agent spawned the short-lived reporter.
+        //   100 shell -> 200 opencode -> 300 report-state
         let processes = HashMap::from([
-            (300, (200, argv(&["cargo", "test"]))),
+            (300, (200, argv(&["flock", "remote-agent", "report-state"]))),
             (
                 200,
                 (100, argv(&["node", "/home/coder/.opencode/bin/opencode"])),
             ),
-            (100, (1, argv(&["-fish"]))),
         ]);
+        let info = |pid| processes.get(&pid).cloned();
+
+        // Named explicitly by an in-process integration: taken as-is once
+        // confirmed to sit in the reporter's chain.
+        assert_eq!(
+            resolve_agent_pid("opencode", Some(300), Some(200), 100, info),
+            Some(200)
+        );
+        // Not named: the label locates it in the chain.
+        assert_eq!(
+            resolve_agent_pid("opencode", Some(300), None, 100, info),
+            Some(200)
+        );
+        // An explicit pid outside the reporter's chain is not trusted; the
+        // label still finds the right process.
+        assert_eq!(
+            resolve_agent_pid("opencode", Some(300), Some(999), 100, info),
+            Some(200)
+        );
+        // An unrecognized label falls back to whatever the shell launched.
+        assert_eq!(
+            resolve_agent_pid("mystery", Some(300), None, 100, info),
+            Some(200)
+        );
+    }
+
+    #[test]
+    fn agent_pid_resolution_skips_the_hooks_own_wrapper() {
+        // Claude's hook is installed under a path named after the agent and is
+        // invoked through a shell, so several links in the chain match the
+        // label. Only the one that *is* claude outlives the report; picking the
+        // wrapper would release the agent as soon as the hook returned.
+        //   100 shell -> 150 devenv -> 200 claude -> 280 sh(hook) -> 300 python
+        let processes = HashMap::from([
+            (300, (280, argv(&["python3", "-"]))),
+            (
+                280,
+                (
+                    200,
+                    argv(&[
+                        "sh",
+                        "/home/coder/.claude/hooks/flock-agent-state.sh",
+                        "working",
+                    ]),
+                ),
+            ),
+            (
+                200,
+                (
+                    150,
+                    argv(&["/nix/store/abc-claude-code/bin/.claude-unwrapped"]),
+                ),
+            ),
+            (150, (100, argv(&["devenv", "shell"]))),
+        ]);
+        let info = |pid| processes.get(&pid).cloned();
 
         assert_eq!(
-            process_ancestry_matches_agent("opencode", 300, 100, |pid| {
-                processes.get(&pid).cloned()
-            }),
-            Some(true)
+            resolve_agent_pid("claude", Some(300), None, 100, info),
+            Some(200)
+        );
+    }
+
+    #[test]
+    fn agent_pid_resolution_declines_reporters_outside_the_pane() {
+        let processes = HashMap::from([
+            (300, (200, argv(&["report-state"]))),
+            (200, (7, argv(&["opencode"]))),
+        ]);
+        let info = |pid| processes.get(&pid).cloned();
+
+        // The chain terminates at pid 7, not the pane's shell (100): this
+        // reporter belongs to some other pane, so watching anything it names
+        // would attach presence to an unrelated process.
+        assert_eq!(
+            resolve_agent_pid("opencode", Some(300), None, 100, info),
+            None
+        );
+        // An unknown reporter is equally undecidable.
+        assert_eq!(
+            resolve_agent_pid("opencode", Some(400), None, 100, info),
+            None
         );
         assert_eq!(
-            process_ancestry_matches_agent("claude", 300, 100, |pid| {
-                processes.get(&pid).cloned()
-            }),
-            Some(false)
-        );
-        assert_eq!(
-            process_ancestry_matches_agent("opencode", 400, 100, |pid| {
-                processes.get(&pid).cloned()
-            }),
+            resolve_agent_pid("opencode", None, Some(200), 100, info),
             None
         );
     }
 
     #[test]
-    fn foreground_reconcile_releases_hook_agent_once_it_stays_gone() {
-        fn pane_shell_process_info(pid: libc::pid_t) -> Option<(libc::pid_t, Vec<String>)> {
-            (pid == 1).then(|| (0, vec!["test-shell".into()]))
-        }
-
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open("/dev/null")
-            .unwrap();
-        let pane_id = Uuid::new_v4();
-        let pane = PaneState {
-            id: pane_id,
-            pid: 1,
-            master: Mutex::new(file),
-            history: Mutex::new(VecDeque::new()),
-            history_bytes: Mutex::new(0),
-            next_sequence: Mutex::new(1),
-            subscribers: Mutex::new(Vec::new()),
-            latest_agent_state: Mutex::new(None),
-            agent_missing_since: Mutex::new(None),
-            exit_status: Mutex::new(None),
-        };
-        let argv = |args: &[&str]| args.iter().map(|arg| arg.to_string()).collect::<Vec<_>>();
-
-        // No reported agent: reconcile is a no-op.
-        pane.reconcile_agent_with_foreground(
-            1,
-            &argv(&["test-shell"]),
-            Duration::ZERO,
-            pane_shell_process_info,
-        );
-        assert!(pane.latest_agent_state.lock().unwrap().is_none());
-
-        pane.record_agent_state(RemoteAgentStateEvent {
-            pane_id,
+    fn a_resolved_agent_pid_survives_later_state_reports() {
+        // Only the first report of an agent pays for resolution. A later
+        // transition reported without a pid — or from a helper the daemon can no
+        // longer place — must not downgrade a good answer to `None`.
+        let pane = test_pane(Uuid::new_v4(), 1);
+        *pane.agent.lock().unwrap() = Some(TrackedAgent {
+            label: "opencode".into(),
             state: RemoteAgentRunState::Working,
-            agent: "opencode".into(),
+            pid: Some(4242),
+        });
+
+        pane.record_agent_state(RemoteAgentRunState::Idle, "opencode".into(), None, None);
+
+        let tracked = pane.agent.lock().unwrap().clone().unwrap();
+        assert_eq!(tracked.pid, Some(4242));
+        assert_eq!(tracked.state, RemoteAgentRunState::Idle);
+    }
+
+    #[test]
+    fn a_release_is_published_even_on_a_non_heartbeat_tick() {
+        // Liveness is checked far more often than presence is re-asserted, so
+        // the release path must not be gated behind the heartbeat cadence —
+        // otherwise a finished agent would linger for several ticks.
+        let pane = test_pane(Uuid::new_v4(), 1);
+        let mut child = Command::new("true").spawn().unwrap();
+        let dead_pid = child.id() as libc::pid_t;
+        child.wait().unwrap();
+        *pane.agent.lock().unwrap() = Some(TrackedAgent {
+            label: "opencode".into(),
+            state: RemoteAgentRunState::Working,
+            pid: Some(dead_pid),
         });
         let (tx, rx) = mpsc::channel();
         pane.subscribers.lock().unwrap().push(tx);
 
-        // Matching foreground and empty (inconclusive) reads keep the agent.
-        pane.reconcile_agent_with_foreground(
-            1,
-            &argv(&["opencode"]),
-            Duration::ZERO,
-            pane_shell_process_info,
-        );
-        pane.reconcile_agent_with_foreground(0, &[], Duration::ZERO, pane_shell_process_info);
-        assert!(rx.try_iter().next().is_none());
+        pane.settle_presence(false);
 
-        // A mismatch opens the gone-window but holds inside the grace.
-        pane.reconcile_agent_with_foreground(
-            1,
-            &argv(&["test-shell"]),
-            Duration::from_secs(3600),
-            pane_shell_process_info,
-        );
-        assert!(rx.try_iter().next().is_none());
-        assert!(pane.agent_missing_since.lock().unwrap().is_some());
-
-        // A fresh hook report closes the window again.
-        pane.record_agent_state(RemoteAgentStateEvent {
-            pane_id,
-            state: RemoteAgentRunState::Idle,
-            agent: "opencode".into(),
-        });
-        assert!(pane.agent_missing_since.lock().unwrap().is_none());
-        let _ = rx.try_iter().count();
-
-        // Past the grace (zero, as on attach) the release is synthesized once.
-        pane.reconcile_agent_with_foreground(
-            1,
-            &argv(&["test-shell"]),
-            Duration::ZERO,
-            pane_shell_process_info,
-        );
         assert!(matches!(
             rx.try_iter().next(),
             Some(ServerMessage::AgentStateChanged {
                 event: RemoteAgentStateEvent {
                     state: RemoteAgentRunState::Release,
-                    ref agent,
                     ..
                 }
-            }) if agent == "opencode"
+            })
         ));
-        pane.reconcile_agent_with_foreground(
-            1,
-            &argv(&["test-shell"]),
-            Duration::ZERO,
-            pane_shell_process_info,
-        );
+    }
+
+    #[test]
+    fn a_live_agent_is_silent_on_a_non_heartbeat_tick() {
+        let pane = test_pane(Uuid::new_v4(), 1);
+        *pane.agent.lock().unwrap() = Some(TrackedAgent {
+            label: "opencode".into(),
+            state: RemoteAgentRunState::Working,
+            pid: Some(std::process::id() as libc::pid_t),
+        });
+        let (tx, rx) = mpsc::channel();
+        pane.subscribers.lock().unwrap().push(tx);
+
+        pane.settle_presence(false);
+
+        assert!(rx.try_iter().next().is_none());
+        assert!(pane.agent.lock().unwrap().is_some());
+    }
+
+    #[test]
+    fn a_pane_with_no_agent_ticks_silently() {
+        let pane = test_pane(Uuid::new_v4(), 1);
+        let (tx, rx) = mpsc::channel();
+        pane.subscribers.lock().unwrap().push(tx);
+        pane.settle_presence(true);
         assert!(rx.try_iter().next().is_none());
     }
 
     #[test]
     fn daemon_acknowledges_and_broadcasts_agent_state_reports() {
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open("/dev/null")
-            .unwrap();
         let pane_id = Uuid::new_v4();
-        let pane = Arc::new(PaneState {
-            id: pane_id,
-            pid: 1,
-            master: Mutex::new(file),
-            history: Mutex::new(VecDeque::new()),
-            history_bytes: Mutex::new(0),
-            next_sequence: Mutex::new(1),
-            subscribers: Mutex::new(Vec::new()),
-            latest_agent_state: Mutex::new(None),
-            agent_missing_since: Mutex::new(None),
-            exit_status: Mutex::new(None),
-        });
+        let pane = Arc::new(test_pane(pane_id, 1));
         let panes = Arc::new(Mutex::new(HashMap::from_iter([(pane_id, pane.clone())])));
         let (mut client, server) = UnixStream::pair().unwrap();
         let daemon = thread::spawn(move || handle_client(server, panes));
@@ -2361,6 +2662,7 @@ mod tests {
                 pane_id,
                 state: RemoteAgentRunState::Blocked,
                 agent: "claude".into(),
+                agent_pid: None,
             },
         )
         .unwrap();
@@ -2395,10 +2697,21 @@ mod tests {
             pane_id: Uuid::new_v4(),
             state: RemoteAgentRunState::Idle,
             agent: "opencode".into(),
+            heartbeat: false,
         };
         assert_eq!(
             local_agent_state_args("7", &event),
-            "pane_id=7,state=idle,agent=opencode,source=flock:coder-remote"
+            "pane_id=7,state=idle,agent=opencode,source=flock:coder-remote,presence=report"
+        );
+        assert_eq!(
+            local_agent_state_args(
+                "7",
+                &RemoteAgentStateEvent {
+                    heartbeat: true,
+                    ..event
+                }
+            ),
+            "pane_id=7,state=idle,agent=opencode,source=flock:coder-remote,presence=heartbeat"
         );
         assert_eq!(
             daemon_version_args("7", "26.4.0"),

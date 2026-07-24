@@ -36,12 +36,6 @@ const STALE_HOOK_IDLE_GRACE: Duration = Duration::from_secs(2);
 /// detection inside the window cancels it. The host rescans about once a
 /// second, so this rides out ~3 missed scans.
 pub(crate) const AGENT_GONE_GRACE: Duration = Duration::from_secs(3);
-/// The release grace for *remote* panes (codespace SSH transports), whose
-/// "agent missing" signal is screen-derived — the agent's chrome stopped
-/// rendering — rather than a process-table answer. Screens flap more than
-/// process tables (scrolling output, redraws, transient overlays a detector
-/// doesn't know), so the window is wider before the agent is released.
-pub(crate) const REMOTE_AGENT_GONE_GRACE: Duration = Duration::from_secs(10);
 
 /// An agent's self-reported state, delivered via the Phase 5 hook channel
 /// (`zellij pipe`). This is the authority for the agent's internal state unless
@@ -87,11 +81,22 @@ pub struct PaneAgentState {
     /// a completion while focused is seen immediately; a completion while
     /// unfocused becomes Done-unseen until the user focuses the pane.
     focused: bool,
-    /// Whether this pane is a remote transport (a codespace `gh codespace ssh`
-    /// pane): its local argv carries no agent identity, so identification and
-    /// the agent-missing signal are screen-derived, and release uses the wider
-    /// [`REMOTE_AGENT_GONE_GRACE`]. Survives agent release — the transport
-    /// stays remote for whatever runs in it next.
+    /// Whether this pane is a remote transport: its local argv names the
+    /// transport, not the agent, so nothing the host process table says about
+    /// this pane bears on the agent running inside it. Survives agent release —
+    /// the transport stays remote for whatever runs in it next.
+    ///
+    /// Presence for a remote pane belongs to whichever source established it,
+    /// and only that source may revoke it:
+    ///
+    /// - **Hook-reported agents** (the remote daemon watches the agent's
+    ///   process and reports transitions, heartbeats and releases): the daemon
+    ///   is the sole authority. Screen scraping may refine *state* but can
+    ///   never revoke presence — that asymmetry is exactly what made agents
+    ///   blink in and out, because a frame without recognizable chrome would
+    ///   release an agent that only the agent's next transition could restore.
+    /// - **Screen-identified agents** (no hooks installed remotely): the screen
+    ///   is the only source, so it may both establish and revoke presence.
     pub remote: bool,
 }
 
@@ -150,6 +155,29 @@ impl PaneAgentState {
             })
     }
 
+    /// Which agent's screen detectors to run.
+    ///
+    /// A hook's label wins over the process/screen-identified agent, and
+    /// deliberately does *not* get written into `detected_agent`: that field
+    /// means "identified from argv or screen chrome", and conflating the two
+    /// would leave a hook-derived identity behind when the hook is released,
+    /// keeping a finished agent in the list. Reading the hook label here also
+    /// buys screen refinement for remote agents the screen cannot identify on
+    /// its own — a remote `opencode` pane can now be state-detected as opencode
+    /// instead of falling through to `Unknown`.
+    pub fn detection_agent(&self) -> Option<Agent> {
+        self.hook_authority
+            .as_ref()
+            .and_then(|authority| detect::parse_agent_label(&authority.agent_label))
+            .or(self.detected_agent)
+    }
+
+    /// Whether presence for this pane is owned by the remote daemon, in which
+    /// case no local signal may revoke it. See [`Self::remote`].
+    fn presence_is_remote_authoritative(&self) -> bool {
+        self.remote && self.hook_authority.is_some()
+    }
+
     /// Update the detected agent from a pane's running command. Clears the
     /// screen fallback when the agent changes (the old chrome no longer applies).
     /// Returns whether the arbitrated state or label changed.
@@ -178,20 +206,34 @@ impl PaneAgentState {
     /// Feed a fresh screen detection (from `PaneRenderReportWithAnsi`). Applies
     /// the Claude working-hold, records the visible signals, and re-arbitrates.
     /// Returns whether the arbitrated state or label changed.
-    pub fn observe_screen(
+    ///
+    /// Observing a screen never changes *which* agent this pane runs — identity
+    /// is set by [`set_detected_agent`](Self::set_detected_agent) (argv or
+    /// screen identification) or carried by a hook label. Keeping the two apart
+    /// is what lets a remote pane's hook own presence while the screen still
+    /// refines state.
+    /// Set the pane's identity and observe a screen in one step. Tests almost
+    /// always want both; production callers keep them apart because a remote
+    /// pane's identity may come from its hook rather than from the screen.
+    #[cfg(test)]
+    pub fn observe_screen_as(
         &mut self,
         agent: Option<Agent>,
         detection: AgentDetection,
         now: Instant,
     ) -> bool {
+        self.set_detected_agent(agent, now);
+        self.observe_screen(detection, now)
+    }
+
+    pub fn observe_screen(&mut self, detection: AgentDetection, now: Instant) -> bool {
         let snapshot = self.snapshot();
-        self.detected_agent = agent;
         self.last_detection = Some(detection);
         // An overlay screen (transcript viewer, model picker) carries no state
         // evidence — hold everything as-is until the live UI is back.
         if !detection.skip_state_update {
             let stabilized = stabilize_agent_state(
-                agent,
+                self.detection_agent(),
                 self.state,
                 detection.state,
                 now,
@@ -216,7 +258,49 @@ impl PaneAgentState {
             state,
             reported_at: now,
         });
+        self.agent_missing_since = None;
         self.stale_hook_idle_since = None;
+        self.recompute(now);
+        self.changed_since(&snapshot)
+    }
+
+    /// Apply the remote daemon's periodic re-assertion of an unchanged picture.
+    ///
+    /// This is what makes the local side a projection: the daemon knows the
+    /// agent is present because it is watching the agent's process, so a pane
+    /// that lost its hook authority for any reason (plugin reload, a dropped
+    /// pipe, a transport reconnect) recovers on the next heartbeat instead of
+    /// waiting for the agent's next state transition — which for an idle agent
+    /// may never come.
+    ///
+    /// Unlike [`set_hook_authority`](Self::set_hook_authority) it does not move
+    /// `reported_at` or reset the stale-hook-idle window, so re-asserting
+    /// presence every couple of seconds cannot defeat the screen vetoes that
+    /// exist to catch a hook which missed its stop event.
+    pub fn refresh_hook_authority(
+        &mut self,
+        agent_label: String,
+        state: AgentState,
+        now: Instant,
+    ) -> bool {
+        let snapshot = self.snapshot();
+        match self.hook_authority.as_mut() {
+            Some(authority) => {
+                authority.agent_label = agent_label;
+                authority.state = state;
+            },
+            // Nothing tracked locally: adopt it as a first report, which is what
+            // it effectively is from this side's point of view.
+            None => {
+                self.hook_authority = Some(HookAuthority {
+                    agent_label,
+                    state,
+                    reported_at: now,
+                });
+            },
+        }
+        self.agent_missing_since = None;
+        self.update_stale_hook_idle_window(now);
         self.recompute(now);
         self.changed_since(&snapshot)
     }
@@ -229,6 +313,14 @@ impl PaneAgentState {
     /// cancels it. Never changes visible state directly, so returns nothing.
     pub fn mark_agent_missing(&mut self, now: Instant) {
         if !self.is_agent() {
+            self.agent_missing_since = None;
+            return;
+        }
+        if self.presence_is_remote_authoritative() {
+            // The remote daemon watches the agent's process and is the only
+            // thing entitled to say it is gone. Nothing local — not the host's
+            // view of the transport process, not the absence of chrome on a
+            // torn frame — is evidence about a process on another machine.
             self.agent_missing_since = None;
             return;
         }
@@ -292,15 +384,12 @@ impl PaneAgentState {
     pub fn tick(&mut self, now: Instant) -> bool {
         // An expired agent-missing window wins over everything else: the last
         // screen detection belongs to a process that no longer exists, so
-        // re-applying it would only keep the ghost alive.
-        let gone_grace = if self.remote {
-            REMOTE_AGENT_GONE_GRACE
-        } else {
-            AGENT_GONE_GRACE
-        };
+        // re-applying it would only keep the ghost alive. The window is only
+        // ever open for panes whose presence a local signal owns — see
+        // `mark_agent_missing`.
         if self
             .agent_missing_since
-            .is_some_and(|since| now.duration_since(since) >= gone_grace)
+            .is_some_and(|since| now.duration_since(since) >= AGENT_GONE_GRACE)
         {
             return self.release_agent(now);
         }
@@ -308,9 +397,8 @@ impl PaneAgentState {
         match self.last_detection {
             // A skip-detection (overlay screen) carries no evidence to re-apply.
             Some(detection) if !detection.skip_state_update => {
-                let agent = self.detected_agent;
                 let stabilized = stabilize_agent_state(
-                    agent,
+                    self.detection_agent(),
                     self.state,
                     detection.state,
                     now,
@@ -348,7 +436,17 @@ impl PaneAgentState {
 
     /// A hook naming a *different* known agent than the one now detected is
     /// stale — drop it so screen detection takes over (mirrors herdr).
+    ///
+    /// Never applies to a remote pane. There the hook comes from the daemon that
+    /// owns the agent's process, while the competing identity comes from
+    /// `identify_agent_from_screen`, whose markers are shared enough between
+    /// TUIs to misread one agent as another. Letting the weaker source retire
+    /// the stronger one was the first link in the flicker: a misidentification
+    /// dropped the correct hook, and the pane was released a grace window later.
     fn maybe_clear_conflicting_hook(&mut self, agent: Option<Agent>, now: Instant) {
+        if self.remote {
+            return;
+        }
         if self.hook_authority_not_newer_than(now)
             && self.hook_authority_conflicts_with_detected_agent(agent)
         {
@@ -394,12 +492,18 @@ impl PaneAgentState {
         }
     }
 
+    // The screen may only veto a hook it agrees with about *who* is running, so
+    // that unrelated chrome cannot drive another agent's state. Comparing
+    // against `detection_agent` rather than `detected_agent` is what extends
+    // that refinement to remote hook-reported agents: their identity comes from
+    // the hook label, so a screen-unidentifiable agent like opencode used to
+    // fail this check on every frame and got no refinement at all.
     fn visible_blocker_overrides_hook(&self) -> bool {
         self.fallback_visible_blocker
             && self.fallback_not_older_than_hook()
             && self.hook_authority.as_ref().is_some_and(|authority| {
                 authority.state != AgentState::Blocked
-                    && detect::parse_agent_label(&authority.agent_label) == self.detected_agent
+                    && detect::parse_agent_label(&authority.agent_label) == self.detection_agent()
             })
     }
 
@@ -408,7 +512,7 @@ impl PaneAgentState {
             && self.fallback_not_older_than_hook()
             && self.hook_authority.as_ref().is_some_and(|authority| {
                 authority.state == AgentState::Idle
-                    && detect::parse_agent_label(&authority.agent_label) == self.detected_agent
+                    && detect::parse_agent_label(&authority.agent_label) == self.detection_agent()
             })
     }
 
@@ -422,7 +526,7 @@ impl PaneAgentState {
             && self.fallback_not_older_than_hook()
             && self.hook_authority.as_ref().is_some_and(|authority| {
                 authority.state == AgentState::Working
-                    && detect::parse_agent_label(&authority.agent_label) == self.detected_agent
+                    && detect::parse_agent_label(&authority.agent_label) == self.detection_agent()
             });
 
         if visible_idle_stales_hook {
@@ -608,7 +712,7 @@ mod tests {
     fn screen_fallback_drives_state_without_hook() {
         let now = Instant::now();
         let mut pane = PaneAgentState::new();
-        pane.observe_screen(Some(Agent::Pi), detection(AgentState::Working), now);
+        pane.observe_screen_as(Some(Agent::Pi), detection(AgentState::Working), now);
         assert_eq!(pane.state, AgentState::Working);
         assert_eq!(pane.effective_agent_label().as_deref(), Some("pi"));
         assert!(pane.is_agent());
@@ -618,7 +722,7 @@ mod tests {
     fn hook_authority_overrides_fallback_for_same_agent() {
         let now = Instant::now();
         let mut pane = PaneAgentState::new();
-        pane.observe_screen(Some(Agent::Pi), detection(AgentState::Idle), now);
+        pane.observe_screen_as(Some(Agent::Pi), detection(AgentState::Idle), now);
         pane.set_hook_authority("pi".into(), AgentState::Working, now);
 
         assert_eq!(pane.detected_agent, Some(Agent::Pi));
@@ -631,7 +735,7 @@ mod tests {
     fn hook_authority_can_override_with_unknown_agent_label() {
         let now = Instant::now();
         let mut pane = PaneAgentState::new();
-        pane.observe_screen(Some(Agent::Pi), detection(AgentState::Idle), now);
+        pane.observe_screen_as(Some(Agent::Pi), detection(AgentState::Idle), now);
         pane.set_hook_authority("custom-agent".into(), AgentState::Working, now);
 
         assert_eq!(pane.detected_agent, Some(Agent::Pi));
@@ -646,10 +750,10 @@ mod tests {
     fn visible_blocker_overrides_non_blocked_hook_for_same_agent() {
         let now = Instant::now();
         let mut pane = PaneAgentState::new();
-        pane.observe_screen(Some(Agent::Codex), detection(AgentState::Idle), now);
+        pane.observe_screen_as(Some(Agent::Codex), detection(AgentState::Idle), now);
         pane.set_hook_authority("codex".into(), AgentState::Working, now);
 
-        let changed = pane.observe_screen(
+        let changed = pane.observe_screen_as(
             Some(Agent::Codex),
             visible(AgentState::Blocked, true, false, false),
             now,
@@ -664,10 +768,10 @@ mod tests {
     fn weak_blocked_fallback_does_not_override_hook_authority() {
         let now = Instant::now();
         let mut pane = PaneAgentState::new();
-        pane.observe_screen(Some(Agent::Codex), detection(AgentState::Idle), now);
+        pane.observe_screen_as(Some(Agent::Codex), detection(AgentState::Idle), now);
         pane.set_hook_authority("codex".into(), AgentState::Working, now);
 
-        pane.observe_screen(
+        pane.observe_screen_as(
             Some(Agent::Codex),
             visible(AgentState::Blocked, false, false, false),
             now,
@@ -681,10 +785,10 @@ mod tests {
     fn hook_blocked_wins_over_visible_blocker() {
         let now = Instant::now();
         let mut pane = PaneAgentState::new();
-        pane.observe_screen(Some(Agent::Codex), detection(AgentState::Working), now);
+        pane.observe_screen_as(Some(Agent::Codex), detection(AgentState::Working), now);
         pane.set_hook_authority("codex".into(), AgentState::Blocked, now);
 
-        pane.observe_screen(
+        pane.observe_screen_as(
             Some(Agent::Codex),
             visible(AgentState::Blocked, true, false, false),
             now,
@@ -700,7 +804,7 @@ mod tests {
         let mut pane = PaneAgentState::new();
         pane.set_hook_authority("custom-agent".into(), AgentState::Working, now);
 
-        pane.observe_screen(
+        pane.observe_screen_as(
             Some(Agent::Codex),
             visible(AgentState::Blocked, true, false, false),
             now,
@@ -722,7 +826,7 @@ mod tests {
         let mut pane = PaneAgentState::new();
         pane.set_hook_authority("pi".into(), AgentState::Working, now);
         // Screen now shows a different known agent — the stale pi hook is dropped.
-        pane.observe_screen(Some(Agent::Codex), detection(AgentState::Idle), now);
+        pane.observe_screen_as(Some(Agent::Codex), detection(AgentState::Idle), now);
 
         assert!(pane.hook_authority.is_none());
         assert_eq!(pane.detected_agent, Some(Agent::Codex));
@@ -735,7 +839,7 @@ mod tests {
         let mut pane = PaneAgentState::new();
         pane.set_hook_authority("codex".into(), AgentState::Working, now);
         // Visible idle screen opens the stale-hook grace window but doesn't win yet.
-        pane.observe_screen(
+        pane.observe_screen_as(
             Some(Agent::Codex),
             visible(AgentState::Idle, false, true, false),
             now,
@@ -752,11 +856,11 @@ mod tests {
     fn visible_working_overrides_idle_hook() {
         let now = Instant::now();
         let mut pane = PaneAgentState::new();
-        pane.observe_screen(Some(Agent::Codex), detection(AgentState::Working), now);
+        pane.observe_screen_as(Some(Agent::Codex), detection(AgentState::Working), now);
         pane.set_hook_authority("codex".into(), AgentState::Idle, now);
         assert_eq!(pane.state, AgentState::Idle);
 
-        pane.observe_screen(
+        pane.observe_screen_as(
             Some(Agent::Codex),
             visible(AgentState::Working, false, false, true),
             now,
@@ -771,9 +875,9 @@ mod tests {
         let now = Instant::now();
         let mut pane = PaneAgentState::new();
         // Working in the background (not focused), then it finishes.
-        pane.observe_screen(Some(Agent::Codex), detection(AgentState::Working), now);
+        pane.observe_screen_as(Some(Agent::Codex), detection(AgentState::Working), now);
         assert!(pane.seen);
-        let changed = pane.observe_screen(Some(Agent::Codex), detection(AgentState::Idle), now);
+        let changed = pane.observe_screen_as(Some(Agent::Codex), detection(AgentState::Idle), now);
         assert!(changed);
         assert_eq!(pane.state, AgentState::Idle);
         assert!(
@@ -787,8 +891,8 @@ mod tests {
         let now = Instant::now();
         let mut pane = PaneAgentState::new();
         pane.set_focused(true);
-        pane.observe_screen(Some(Agent::Codex), detection(AgentState::Working), now);
-        pane.observe_screen(Some(Agent::Codex), detection(AgentState::Idle), now);
+        pane.observe_screen_as(Some(Agent::Codex), detection(AgentState::Working), now);
+        pane.observe_screen_as(Some(Agent::Codex), detection(AgentState::Idle), now);
         assert_eq!(pane.state, AgentState::Idle);
         assert!(
             pane.seen,
@@ -800,8 +904,8 @@ mod tests {
     fn focusing_clears_done_unseen() {
         let now = Instant::now();
         let mut pane = PaneAgentState::new();
-        pane.observe_screen(Some(Agent::Codex), detection(AgentState::Working), now);
-        pane.observe_screen(Some(Agent::Codex), detection(AgentState::Idle), now);
+        pane.observe_screen_as(Some(Agent::Codex), detection(AgentState::Working), now);
+        pane.observe_screen_as(Some(Agent::Codex), detection(AgentState::Idle), now);
         assert!(!pane.seen);
 
         // Focusing the pane clears the notification and reports the change.
@@ -818,7 +922,7 @@ mod tests {
         let mut pane = PaneAgentState::new();
         // First observation is already Idle (Unknown → Idle): not a completion,
         // so it must not raise a Done-unseen notification.
-        pane.observe_screen(Some(Agent::Codex), detection(AgentState::Idle), now);
+        pane.observe_screen_as(Some(Agent::Codex), detection(AgentState::Idle), now);
         assert_eq!(pane.state, AgentState::Idle);
         assert!(pane.seen);
     }
@@ -827,12 +931,12 @@ mod tests {
     fn restarting_work_after_unseen_clears_the_flag() {
         let now = Instant::now();
         let mut pane = PaneAgentState::new();
-        pane.observe_screen(Some(Agent::Codex), detection(AgentState::Working), now);
-        pane.observe_screen(Some(Agent::Codex), detection(AgentState::Idle), now);
+        pane.observe_screen_as(Some(Agent::Codex), detection(AgentState::Working), now);
+        pane.observe_screen_as(Some(Agent::Codex), detection(AgentState::Idle), now);
         assert!(!pane.seen);
 
         // The agent picks work back up — any non-idle state resets seen.
-        pane.observe_screen(Some(Agent::Codex), detection(AgentState::Working), now);
+        pane.observe_screen_as(Some(Agent::Codex), detection(AgentState::Working), now);
         assert_eq!(pane.state, AgentState::Working);
         assert!(pane.seen);
     }
@@ -841,11 +945,11 @@ mod tests {
     fn unseen_persists_across_idle_observations_until_focused() {
         let now = Instant::now();
         let mut pane = PaneAgentState::new();
-        pane.observe_screen(Some(Agent::Codex), detection(AgentState::Working), now);
-        pane.observe_screen(Some(Agent::Codex), detection(AgentState::Idle), now);
+        pane.observe_screen_as(Some(Agent::Codex), detection(AgentState::Working), now);
+        pane.observe_screen_as(Some(Agent::Codex), detection(AgentState::Idle), now);
         assert!(!pane.seen);
         // Repeated idle frames must not silently re-mark it seen.
-        pane.observe_screen(Some(Agent::Codex), detection(AgentState::Idle), now);
+        pane.observe_screen_as(Some(Agent::Codex), detection(AgentState::Idle), now);
         assert!(!pane.seen);
     }
 
@@ -855,11 +959,11 @@ mod tests {
     fn skip_detection_holds_previous_state() {
         let now = Instant::now();
         let mut pane = PaneAgentState::new();
-        pane.observe_screen(Some(Agent::Claude), detection(AgentState::Working), now);
+        pane.observe_screen_as(Some(Agent::Claude), detection(AgentState::Working), now);
         assert_eq!(pane.state, AgentState::Working);
 
         // The transcript viewer replaces the screen — state must hold.
-        let changed = pane.observe_screen(Some(Agent::Claude), skip_detection(), now);
+        let changed = pane.observe_screen_as(Some(Agent::Claude), skip_detection(), now);
         assert!(!changed);
         assert_eq!(pane.state, AgentState::Working);
 
@@ -872,8 +976,8 @@ mod tests {
     fn skip_detection_does_not_mark_completion() {
         let now = Instant::now();
         let mut pane = PaneAgentState::new();
-        pane.observe_screen(Some(Agent::Claude), detection(AgentState::Working), now);
-        pane.observe_screen(Some(Agent::Claude), skip_detection(), now);
+        pane.observe_screen_as(Some(Agent::Claude), detection(AgentState::Working), now);
+        pane.observe_screen_as(Some(Agent::Claude), skip_detection(), now);
         // No Working → Idle transition happened, so no Done-unseen notification.
         assert!(pane.seen);
     }
@@ -885,7 +989,7 @@ mod tests {
         let now = Instant::now();
         let mut pane = PaneAgentState::new();
         pane.set_detected_agent(Some(Agent::Claude), now);
-        pane.observe_screen(Some(Agent::Claude), detection(AgentState::Working), now);
+        pane.observe_screen_as(Some(Agent::Claude), detection(AgentState::Working), now);
         assert!(pane.is_agent());
 
         // The host reports the shell has no foreground child (claude exited).
@@ -950,21 +1054,111 @@ mod tests {
     }
 
     #[test]
-    fn remote_pane_uses_wider_gone_grace() {
+    fn remote_hook_reported_agent_is_never_released_locally() {
+        let now = Instant::now();
+        let mut pane = PaneAgentState::new();
+        pane.remote = true;
+        pane.set_hook_authority("opencode".into(), AgentState::Working, now);
+
+        // Every local "the agent is gone" signal at once: the host reporting no
+        // foreground child, and a screen with no recognizable agent chrome.
+        pane.mark_agent_missing(now);
+        pane.observe_screen_as(None, detection(AgentState::Unknown), now);
+        pane.mark_agent_missing(now);
+
+        // None of it is evidence about a process on another machine. Only the
+        // remote daemon, which watches that process, may release it.
+        assert!(!pane.tick(now + AGENT_GONE_GRACE * 100));
+        assert!(pane.is_agent());
+        assert_eq!(pane.state, AgentState::Working);
+        assert_eq!(pane.effective_agent_label().as_deref(), Some("opencode"));
+
+        // The daemon's release does land.
+        assert!(pane.clear_hook_authority(now));
+        assert!(!pane.is_agent());
+    }
+
+    #[test]
+    fn remote_screen_identified_agent_is_still_released_on_absence() {
+        // With no hook there is no other source, so the screen both establishes
+        // and revokes presence — otherwise a remote agent without integrations
+        // installed would stay listed forever.
         let now = Instant::now();
         let mut pane = PaneAgentState::new();
         pane.remote = true;
         pane.set_detected_agent(Some(Agent::Claude), now);
         pane.mark_agent_missing(now);
 
-        // The local grace elapsing must not release a remote pane — its
-        // missing signal is screen-derived and flappier.
-        assert!(!pane.tick(now + AGENT_GONE_GRACE));
+        assert!(!pane.tick(now + AGENT_GONE_GRACE - Duration::from_millis(1)));
         assert!(pane.is_agent());
+        assert!(pane.tick(now + AGENT_GONE_GRACE));
+        assert!(!pane.is_agent());
+    }
 
-        // The remote grace does.
-        let changed = pane.tick(now + REMOTE_AGENT_GONE_GRACE);
-        assert!(changed);
+    #[test]
+    fn a_heartbeat_restores_a_dropped_remote_agent() {
+        // The projection property: whatever made the local side lose the agent
+        // (plugin reload, a dropped pipe, a reconnect), the daemon's next
+        // re-assertion brings it back — instead of the row staying missing until
+        // the agent's next state transition, which for an idle agent may never
+        // come.
+        let now = Instant::now();
+        let mut pane = PaneAgentState::new();
+        pane.remote = true;
+        assert!(!pane.is_agent());
+
+        assert!(pane.refresh_hook_authority("opencode".into(), AgentState::Idle, now));
+        assert!(pane.is_agent());
+        assert_eq!(pane.state, AgentState::Idle);
+        assert_eq!(pane.effective_agent_label().as_deref(), Some("opencode"));
+    }
+
+    #[test]
+    fn heartbeats_do_not_reset_the_stale_hook_idle_window() {
+        // A heartbeat every couple of seconds must not defeat the screen veto
+        // that catches a hook which missed its stop event — that veto needs the
+        // idle screen to outlast a window measured from the last *report*.
+        let now = Instant::now();
+        let mut pane = PaneAgentState::new();
+        pane.set_hook_authority("codex".into(), AgentState::Working, now);
+        pane.observe_screen_as(
+            Some(Agent::Codex),
+            visible(AgentState::Idle, false, true, false),
+            now,
+        );
+        assert_eq!(pane.state, AgentState::Working);
+
+        // Re-assertions arrive throughout the window and change nothing.
+        let mut later = now;
+        for _ in 0..4 {
+            later += Duration::from_millis(500);
+            pane.refresh_hook_authority("codex".into(), AgentState::Working, later);
+        }
+
+        assert!(later >= now + STALE_HOOK_IDLE_GRACE);
+        assert_eq!(
+            pane.state,
+            AgentState::Idle,
+            "the visible idle screen should still have staled the hook"
+        );
+    }
+
+    #[test]
+    fn remote_hook_label_drives_screen_detection() {
+        // `identify_agent_from_screen` knows only Claude and Codex, so a remote
+        // opencode pane used to fall through to `Unknown` and got no screen
+        // refinement at all. The hook label supplies the identity instead —
+        // without being written into `detected_agent`, so releasing the hook
+        // still clears the pane.
+        let now = Instant::now();
+        let mut pane = PaneAgentState::new();
+        pane.remote = true;
+        pane.set_hook_authority("opencode".into(), AgentState::Idle, now);
+
+        assert_eq!(pane.detection_agent(), Some(Agent::OpenCode));
+        assert_eq!(pane.detected_agent, None);
+
+        pane.clear_hook_authority(now);
         assert!(!pane.is_agent());
     }
 
@@ -995,7 +1189,7 @@ mod tests {
     fn changing_detected_agent_clears_screen_fallback() {
         let now = Instant::now();
         let mut pane = PaneAgentState::new();
-        pane.observe_screen(Some(Agent::Pi), detection(AgentState::Working), now);
+        pane.observe_screen_as(Some(Agent::Pi), detection(AgentState::Working), now);
         assert_eq!(pane.state, AgentState::Working);
 
         // Agent goes away (shell returns) — state settles to Unknown.
