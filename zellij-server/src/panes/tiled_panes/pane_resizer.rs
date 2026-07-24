@@ -46,13 +46,21 @@ impl<'a> PaneResizer<'a> {
         }
     }
 
-    pub fn layout(&mut self, direction: SplitDirection, space: usize) -> Result<()> {
+    /// Solve pane sizes across `space` cells, laying them out starting at `origin`.
+    ///
+    /// `origin` is nonzero when a dock reserves a band the solver is not told
+    /// about: the caller passes the reduced `space` and the band width as
+    /// `origin`, so the solved panes tile `origin..origin + space` instead of
+    /// `0..space`. Without it, excluding the dock from the grid would simply
+    /// re-solve every content pane to fill the full width from 0 and slide them
+    /// underneath the dock.
+    pub fn layout(&mut self, direction: SplitDirection, space: usize, origin: usize) -> Result<()> {
         self.solver.reset();
         let grid = self
             .solve(direction, space)
             .map_err(|err| anyhow!("{}", err))?;
         let spans = self
-            .discretize_spans(grid, space)
+            .discretize_spans(grid, space, origin)
             .map_err(|err| anyhow!("{}", err))?;
 
         if self.is_layout_valid(&spans) {
@@ -80,7 +88,12 @@ impl<'a> PaneResizer<'a> {
         Ok(grid)
     }
 
-    fn discretize_spans(&mut self, mut grid: Grid, space: usize) -> Result<Vec<Span>, String> {
+    fn discretize_spans(
+        &mut self,
+        mut grid: Grid,
+        space: usize,
+        origin: usize,
+    ) -> Result<Vec<Span>, String> {
         let mut rounded_sizes: HashMap<_, _> = grid
             .iter()
             .flatten()
@@ -116,7 +129,7 @@ impl<'a> PaneResizer<'a> {
 
         // Update span positions based on their rounded sizes
         for spans in &mut grid {
-            let mut offset = 0;
+            let mut offset = origin;
             for span in spans {
                 span.pos = offset;
                 let sz = rounded_sizes[&span.size_var];

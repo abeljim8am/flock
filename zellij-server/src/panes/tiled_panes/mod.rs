@@ -162,6 +162,73 @@ impl TiledPanes {
     pub fn dock_mode(&self) -> Option<DockMode> {
         self.dock.as_ref().map(|dock| dock.mode)
     }
+    /// Columns the dock reserves, clamped so the content area always keeps at
+    /// least [`MIN_TERMINAL_WIDTH`] columns.
+    ///
+    /// The clamp is what makes a 40-column dock survivable on an 80-column client:
+    /// without it the swap-layout feasibility probe can fail every candidate and
+    /// return `None`, and `discretize_spans` can run out of room. It is the
+    /// server's job, not the plugin's — the plugin has no idea how wide the tab is
+    /// when it asks for a mode.
+    pub fn dock_band_cols(&self) -> usize {
+        self.dock_band_cols_for(self.display_area.borrow().cols)
+    }
+    /// As [`dock_band_cols`](Self::dock_band_cols), but against a display width
+    /// that isn't committed to `display_area` yet — needed on the terminal-resize
+    /// path, which computes the new band before it has updated the display area.
+    pub fn dock_band_cols_for(&self, display_cols: usize) -> usize {
+        let Some(dock) = self.dock.as_ref() else {
+            return 0;
+        };
+        if self.panes_to_hide.contains(&dock.pane_id) {
+            return 0;
+        }
+        let max_band = display_cols.saturating_sub(MIN_TERMINAL_WIDTH);
+        dock.desired_cols().min(max_band)
+    }
+    /// Write the dock's geometry and inset the viewport by its band.
+    ///
+    /// The dock spans the full display height and sits at x=0, to the left of the
+    /// tab-bar and status-bar. That makes every horizontal solve uniform — each
+    /// row band is missing the dock in exactly the same way — so a single
+    /// `(space, origin)` pair works for the whole grid.
+    ///
+    /// Deliberately a pure function of `(display_area, dock mode)` and therefore
+    /// idempotent: calling it twice must be indistinguishable from calling it
+    /// once, or a resize that triggers a relayout that re-reserves the band would
+    /// accumulate and oscillate.
+    pub fn reserve_dock_band(&mut self) {
+        let band = self.dock_band_cols();
+        let Some(dock_pane_id) = self.dock_pane_id() else {
+            return;
+        };
+        let display_area = *self.display_area.borrow();
+        if let Some(dock_pane) = self.panes.get_mut(&dock_pane_id) {
+            let mut geom = dock_pane.position_and_size();
+            geom.x = 0;
+            geom.y = 0;
+            geom.cols = Dimension::fixed(band);
+            geom.rows = Dimension::fixed(display_area.rows);
+            geom.is_pinned = false;
+            geom.stacked = None;
+            dock_pane.set_geom(geom);
+        }
+        let mut viewport = self.viewport.borrow_mut();
+        viewport.x = band;
+        viewport.cols = display_area.cols.saturating_sub(band);
+    }
+    /// `(space, origin)` for a solve along `direction`, accounting for the dock
+    /// band the grid was not told about.
+    fn solve_space(&self, direction: SplitDirection) -> (usize, usize) {
+        let display_area = *self.display_area.borrow();
+        match direction {
+            SplitDirection::Horizontal => {
+                let band = self.dock_band_cols();
+                (display_area.cols.saturating_sub(band), band)
+            },
+            SplitDirection::Vertical => (display_area.rows, 0),
+        }
+    }
     pub fn add_pane_with_existing_geom(&mut self, pane_id: PaneId, mut pane: Box<dyn Pane>) {
         if self.draw_pane_frames {
             pane.set_content_offset(Offset::frame(1));
@@ -595,6 +662,11 @@ impl TiledPanes {
     /// `direction`, returning the solver's error instead of swallowing it so
     /// callers can roll back geometry changes that turned out unsatisfiable.
     fn try_relayout(&mut self, direction: SplitDirection) -> Result<()> {
+        // Reserve the band before solving so the viewport and the space handed to
+        // the solver agree, and so the dock's own geometry never depends on what
+        // the solver decided.
+        self.reserve_dock_band();
+        let (space, origin) = self.solve_space(direction);
         let mut pane_grid = TiledPaneGrid::new(
             &mut self.panes,
             &self.panes_to_hide,
@@ -602,16 +674,10 @@ impl TiledPanes {
             *self.display_area.borrow(),
             *self.viewport.borrow(),
         );
-        let result = match direction {
-            SplitDirection::Horizontal => {
-                pane_grid.layout(direction, (*self.display_area.borrow()).cols)
-            },
-            SplitDirection::Vertical => {
-                pane_grid.layout(direction, (*self.display_area.borrow()).rows)
-            },
-        }
-        .or_else(|e| Err(anyError::msg(e)))
-        .with_context(|| format!("{:?} relayout of tab failed", direction));
+        let result = pane_grid
+            .layout(direction, space, origin)
+            .or_else(|e| Err(anyError::msg(e)))
+            .with_context(|| format!("{:?} relayout of tab failed", direction));
 
         self.set_pane_frames(self.draw_pane_frames);
         result
@@ -1336,6 +1402,10 @@ impl TiledPanes {
     }
 
     pub fn resize(&mut self, new_screen_size: Size) {
+        // Computed against the *new* width, before `display_area` is borrowed
+        // mutably below: the clamp in `dock_band_cols_for` means the band can shrink
+        // when the terminal does.
+        let dock_band = self.dock_band_cols_for(new_screen_size.cols);
         {
             if self.display_area_changed(new_screen_size) {
                 self.clear_tombstones();
@@ -1356,11 +1426,22 @@ impl TiledPanes {
                                        viewport: &mut Viewport,
                                        cols: usize|
              -> bool {
-                match pane_grid.layout(SplitDirection::Horizontal, cols) {
+                match pane_grid.layout(
+                    SplitDirection::Horizontal,
+                    cols.saturating_sub(dock_band),
+                    dock_band,
+                ) {
                     Ok(_) => {
                         let column_difference = cols as isize - display_area.cols as isize;
                         viewport.cols = (viewport.cols as isize + column_difference) as usize;
                         display_area.cols = cols;
+                        if dock_band > 0 || viewport.x > 0 {
+                            // Keep the horizontal inset exactly equal to the band
+                            // rather than accumulating a difference — the band can
+                            // change on resize because it is clamped.
+                            viewport.x = dock_band;
+                            viewport.cols = cols.saturating_sub(dock_band);
+                        }
                         true
                     },
                     Err(e) => match e.downcast_ref::<ZellijError>() {
@@ -1375,7 +1456,7 @@ impl TiledPanes {
                                      viewport: &mut Viewport,
                                      rows: usize|
              -> bool {
-                match pane_grid.layout(SplitDirection::Vertical, rows) {
+                match pane_grid.layout(SplitDirection::Vertical, rows, 0) {
                     Ok(_) => {
                         let row_difference = rows as isize - display_area.rows as isize;
                         viewport.rows = (viewport.rows as isize + row_difference) as usize;
@@ -1406,6 +1487,9 @@ impl TiledPanes {
             display_area.rows = rows;
             display_area.cols = cols;
         }
+        // The dock is not in the grid, so nothing above touched its geometry; re-fix
+        // it against the committed display area (its height follows the terminal).
+        self.reserve_dock_band();
         self.set_pane_frames(self.draw_pane_frames);
     }
 

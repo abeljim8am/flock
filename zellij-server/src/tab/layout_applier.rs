@@ -1040,6 +1040,13 @@ impl<'a> LayoutApplier<'a> {
             let mut viewport = viewport.borrow_mut();
             *viewport = (*display_area.borrow()).into();
         }
+        // A dock's band is reserved explicitly, before any geometry is inspected,
+        // and is therefore order-independent. The scan below cannot do this job:
+        // it only insets horizontally for a pane spanning the viewport's full
+        // height, which a left-edge pane only does *after* the top and bottom
+        // chrome have inset it — so whether it fired at all would depend on
+        // iteration order over the pane map.
+        tiled_panes.reserve_dock_band();
         let boundary_geoms = tiled_panes.non_selectable_pane_geoms_inside_viewport();
         {
             // curly braces here is so that we free viewport immediately when we're done
@@ -1119,8 +1126,19 @@ impl<'a> LayoutApplier<'a> {
             (display_area.cols, display_area.rows)
         };
 
+        // A dock is not a node in the layout, so the layout must be positioned in
+        // the space *beside* it. `split_space` honours `x` and resolves percentages
+        // against the geom it is given, so every layout percentage ends up relative
+        // to the content band. `SwapLayouts::swap_tiled_panes` subtracts the band
+        // identically — if its feasibility probe and this disagree, `flatten_layout`
+        // silently falls back to ignoring percent sizes.
+        let dock_band = self.tiled_panes.dock_band_cols();
+
         let mut free_space = PaneGeom::default();
-        free_space.cols.set_inner(display_area_cols);
+        free_space.x = dock_band;
+        free_space
+            .cols
+            .set_inner(display_area_cols.saturating_sub(dock_band));
         free_space.rows.set_inner(display_area_rows);
         free_space
     }

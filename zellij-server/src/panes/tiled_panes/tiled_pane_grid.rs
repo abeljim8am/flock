@@ -56,9 +56,22 @@ impl<'a> TiledPaneGrid<'a> {
         }
     }
 
-    pub fn layout(&mut self, direction: SplitDirection, space: usize) -> Result<()> {
+    /// `origin` is the coordinate the panes start tiling at along `direction` —
+    /// nonzero horizontally when a dock reserves a left-edge band that this grid
+    /// deliberately does not contain.
+    pub fn layout(&mut self, direction: SplitDirection, space: usize, origin: usize) -> Result<()> {
         let mut pane_resizer = PaneResizer::new(self.panes.clone());
-        pane_resizer.layout(direction, space)
+        pane_resizer.layout(direction, space, origin)
+    }
+    /// The x the tiled panes start at: the dock's band width, or 0. A dock is the
+    /// only thing that can inset the viewport horizontally, so `viewport.x` is
+    /// exactly that band.
+    fn horizontal_origin(&self) -> usize {
+        self.viewport.x
+    }
+    /// Columns the tiled panes have to share, i.e. the display minus a dock band.
+    fn horizontal_space(&self) -> usize {
+        self.display_area.cols.saturating_sub(self.viewport.x)
     }
     pub fn get_pane_geom(&self, pane_id: &PaneId) -> Option<PaneGeom> {
         let panes = self.panes.borrow();
@@ -393,11 +406,15 @@ impl<'a> TiledPaneGrid<'a> {
             let mut pane_resizer = PaneResizer::new(self.panes.clone());
             if direction.is_horizontal() {
                 pane_resizer
-                    .layout(SplitDirection::Horizontal, self.display_area.cols)
+                    .layout(
+                        SplitDirection::Horizontal,
+                        self.horizontal_space(),
+                        self.horizontal_origin(),
+                    )
                     .with_context(err_context)?;
             } else {
                 pane_resizer
-                    .layout(SplitDirection::Vertical, self.display_area.rows)
+                    .layout(SplitDirection::Vertical, self.display_area.rows, 0)
                     .with_context(err_context)?;
             }
         } else {
@@ -1341,13 +1358,15 @@ impl<'a> TiledPaneGrid<'a> {
         if let (Some(freed_width), Some(freed_height)) = (freed_width, freed_height) {
             if let Some((panes_to_grow, direction)) = self.find_panes_to_grow(id) {
                 self.grow_panes(&panes_to_grow, direction, (freed_width, freed_height));
-                let side_length = match direction {
-                    SplitDirection::Vertical => self.display_area.rows,
-                    SplitDirection::Horizontal => self.display_area.cols,
+                let (side_length, origin) = match direction {
+                    SplitDirection::Vertical => (self.display_area.rows, 0),
+                    SplitDirection::Horizontal => {
+                        (self.horizontal_space(), self.horizontal_origin())
+                    },
                 };
                 self.panes.borrow_mut().remove(&id);
                 let mut pane_resizer = PaneResizer::new(self.panes.clone());
-                let _ = pane_resizer.layout(direction, side_length);
+                let _ = pane_resizer.layout(direction, side_length, origin);
                 return true;
             }
         } else {
@@ -1355,8 +1374,12 @@ impl<'a> TiledPaneGrid<'a> {
             // this might happen if we are closing a fixed pane
             self.panes.borrow_mut().remove(&id);
             let mut pane_resizer = PaneResizer::new(self.panes.clone());
-            let _ = pane_resizer.layout(SplitDirection::Horizontal, self.display_area.cols);
-            let _ = pane_resizer.layout(SplitDirection::Vertical, self.display_area.rows);
+            let _ = pane_resizer.layout(
+                SplitDirection::Horizontal,
+                self.horizontal_space(),
+                self.horizontal_origin(),
+            );
+            let _ = pane_resizer.layout(SplitDirection::Vertical, self.display_area.rows, 0);
             return true;
         }
         false
