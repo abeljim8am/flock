@@ -270,6 +270,21 @@ pub trait Pane {
     fn set_should_render_boundaries(&mut self, _should_render: bool) {}
     fn selectable(&self) -> bool;
     fn set_selectable(&mut self, selectable: bool);
+    /// Whether this pane is a dock: chrome pinned to an edge that reserves a band
+    /// of the display and never takes part in tiling.
+    ///
+    /// Deliberately distinct from `!selectable()`. Unselectable only means "skip
+    /// me in focus navigation", which is also true of the tab-bar and status-bar —
+    /// and those *do* tile, get counted as panes, and occupy layout slots. A dock
+    /// does none of those things: `TiledPaneGrid` never sees it, pane counts
+    /// exclude it, and the server writes its geometry directly.
+    ///
+    /// `TiledPanes` holds the authoritative dock id; this exists for the iterators
+    /// that only have a `&dyn Pane` in hand (rendering, serialization, manifests).
+    fn is_dock(&self) -> bool {
+        false
+    }
+    fn set_is_dock(&mut self, _is_dock: bool) {}
     fn request_permissions_from_user(&mut self, _permissions: Option<PluginPermission>) {}
     fn render(
         &mut self,

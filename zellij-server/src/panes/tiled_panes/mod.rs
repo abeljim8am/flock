@@ -18,7 +18,7 @@ use crate::{
 };
 use stacked_panes::StackedPanes;
 use zellij_utils::{
-    data::{Direction, ModeInfo, PaneInfo, Resize, ResizeStrategy, Style, Styling},
+    data::{Direction, DockMode, ModeInfo, PaneInfo, Resize, ResizeStrategy, Style, Styling},
     errors::prelude::*,
     input::{
         command::RunCommand,
@@ -74,6 +74,34 @@ pub struct TiledPanes {
     client_id_to_boundaries: HashMap<ClientId, Boundaries>,
     tombstones_before_increase: Option<(PaneId, Vec<HashMap<PaneId, PaneGeom>>)>,
     tombstones_before_decrease: Option<(PaneId, Vec<HashMap<PaneId, PaneGeom>>)>,
+    dock: Option<DockedPane>,
+}
+
+/// The dock this tab materialized from the layout's `dock` declaration, if any.
+///
+/// The pane itself lives in `TiledPanes::panes` so that rendering, boundaries,
+/// mouse routing, pty/plugin resize, theming and pane manifests all keep working
+/// unmodified. Everything that *tiles* — the constraint solver, pane counts, swap
+/// layout constraints, relayout slot matching, focus navigation — excludes it by
+/// id via [`TiledPanes::dock_pane_id`].
+#[derive(Debug, Clone, Copy)]
+pub struct DockedPane {
+    pub pane_id: PaneId,
+    pub mode: DockMode,
+    /// Columns when open, from the layout's `size`.
+    pub open_cols: usize,
+    /// Columns when collapsed to a rail, from the layout's `closed_size`.
+    pub closed_cols: usize,
+}
+
+impl DockedPane {
+    /// The width this dock wants, before clamping against the display.
+    pub fn desired_cols(&self) -> usize {
+        match self.mode {
+            DockMode::Open => self.open_cols,
+            DockMode::Closed => self.closed_cols,
+        }
+    }
 }
 
 impl TiledPanes {
@@ -114,7 +142,25 @@ impl TiledPanes {
             client_id_to_boundaries: HashMap::new(),
             tombstones_before_increase: None,
             tombstones_before_decrease: None,
+            dock: None,
         }
+    }
+    /// The dock pane's id, if this tab has a dock. Every tiling code path that
+    /// must ignore the dock does so by comparing against this.
+    pub fn dock_pane_id(&self) -> Option<PaneId> {
+        self.dock.as_ref().map(|dock| dock.pane_id)
+    }
+    pub fn dock(&self) -> Option<DockedPane> {
+        self.dock
+    }
+    pub fn set_dock(&mut self, dock: DockedPane) {
+        if let Some(pane) = self.panes.get_mut(&dock.pane_id) {
+            pane.set_is_dock(true);
+        }
+        self.dock = Some(dock);
+    }
+    pub fn dock_mode(&self) -> Option<DockMode> {
+        self.dock.as_ref().map(|dock| dock.mode)
     }
     pub fn add_pane_with_existing_geom(&mut self, pane_id: PaneId, mut pane: Box<dyn Pane>) {
         if self.draw_pane_frames {
