@@ -444,8 +444,8 @@ fn host_run_plugin_command(mut caller: Caller<'_, PluginEnv>) {
                     PluginCommand::PublishAgentState(agent_states) => {
                         publish_agent_state(env, agent_states)
                     },
-                    PluginCommand::PublishFlockSidebarState(sidebar_state) => {
-                        publish_flock_sidebar_state(env, sidebar_state)
+                    PluginCommand::PublishDockState(dock_state) => {
+                        publish_dock_state(env, dock_state)
                     },
                     PluginCommand::ScanHostFolder(folder_to_scan) => {
                         scan_host_folder(env, folder_to_scan)
@@ -3309,14 +3309,11 @@ fn publish_agent_state(
         .context("failed to publish agent state");
 }
 
-fn publish_flock_sidebar_state(
-    env: &PluginEnv,
-    sidebar_state: zellij_utils::data::FlockSidebarState,
-) {
+fn publish_dock_state(env: &PluginEnv, dock_state: zellij_utils::data::DockState) {
     let _ = env
         .senders
-        .send_to_screen(ScreenInstruction::PublishFlockSidebarState(sidebar_state))
-        .context("failed to publish flock sidebar state");
+        .send_to_screen(ScreenInstruction::PublishDockState(dock_state))
+        .context("failed to publish dock state");
 }
 
 fn kill_sessions(session_names: Vec<String>) {
@@ -5524,7 +5521,7 @@ fn check_command_permission(
         | PluginCommand::HideFloatingPanes { .. }
         | PluginCommand::SetPaneRegexHighlights(..)
         | PluginCommand::PublishAgentState(..)
-        | PluginCommand::PublishFlockSidebarState(..)
+        | PluginCommand::PublishDockState(..)
         | PluginCommand::ClearPaneHighlights(..) => PermissionType::ChangeApplicationState,
         PluginCommand::UnblockCliPipeInput(..)
         | PluginCommand::BlockCliPipeInput(..)

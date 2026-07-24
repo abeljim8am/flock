@@ -158,7 +158,7 @@ struct State {
     sidebar_state_updated_at_millis: u64,
     /// The last sidebar mode state we published to the cross-session metadata
     /// bus. Diffed to avoid rewriting session metadata on every event.
-    last_published_sidebar_state: Option<FlockSidebarState>,
+    last_published_sidebar_state: Option<DockState>,
     /// Unified keyboard selection cursor over the sessions then the agents.
     selected: usize,
     /// Scroll offset into the workspaces (sessions) section.
@@ -729,7 +729,7 @@ impl State {
         let Some(sidebar_state) = self
             .sessions
             .iter()
-            .filter_map(|session| session.flock_sidebar_state)
+            .filter_map(|session| session.dock_state)
             .max_by_key(|state| state.updated_at_millis)
         else {
             return false;
@@ -945,13 +945,13 @@ impl State {
         if !self.permissions_granted {
             return;
         }
-        let state = FlockSidebarState {
+        let state = DockState {
             mode: self.sidebar_mode.into(),
             updated_at_millis: self.sidebar_state_updated_at_millis,
         };
         if Some(state) != self.last_published_sidebar_state {
             self.last_published_sidebar_state = Some(state);
-            publish_flock_sidebar_state(state);
+            publish_dock_state(state);
         }
     }
 

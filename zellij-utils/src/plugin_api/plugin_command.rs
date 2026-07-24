@@ -31,15 +31,14 @@ pub use super::generated_api::api::{
         CustomRgbHighlight as ProtobufCustomRgbHighlight,
         DeleteAllDeadSessionsResponse as ProtobufDeleteAllDeadSessionsResponse,
         DeleteDeadSessionResponse as ProtobufDeleteDeadSessionResponse, DeleteLayoutPayload,
-        DeleteLayoutResponse as ProtobufDeleteLayoutResponse, DumpLayoutPayload,
-        DumpLayoutResponse as ProtobufDumpLayoutResponse, DumpSessionLayoutPayload,
-        DumpSessionLayoutResponse as ProtobufDumpSessionLayoutResponse, EditLayoutPayload,
-        EditLayoutResponse as ProtobufEditLayoutResponse, EditScrollbackForPaneWithIdPayload,
-        EmbedMultiplePanesPayload, EnvVariable, ExecCmdPayload,
+        DeleteLayoutResponse as ProtobufDeleteLayoutResponse, DockState as ProtobufDockState,
+        DumpLayoutPayload, DumpLayoutResponse as ProtobufDumpLayoutResponse,
+        DumpSessionLayoutPayload, DumpSessionLayoutResponse as ProtobufDumpSessionLayoutResponse,
+        EditLayoutPayload, EditLayoutResponse as ProtobufEditLayoutResponse,
+        EditScrollbackForPaneWithIdPayload, EmbedMultiplePanesPayload, EnvVariable, ExecCmdPayload,
         FixedOrPercent as ProtobufFixedOrPercent,
         FixedOrPercentValue as ProtobufFixedOrPercentValue, FloatMultiplePanesPayload,
         FloatingPaneCoordinates as ProtobufFloatingPaneCoordinates,
-        FlockSidebarState as ProtobufFlockSidebarState,
         FocusOrCreateTabResponse as ProtobufFocusOrCreateTabResponse, FocusedPaneInfo,
         GenerateRandomNamePayload,
         GenerateRandomNameResponse as ProtobufGenerateRandomNameResponse,
@@ -136,8 +135,8 @@ pub use super::generated_api::api::{
 
 use crate::data::{
     AgentRunState, ConnectToSession, DeleteAllDeadSessionsResponse, DeleteDeadSessionResponse,
-    DeleteLayoutResponse, EditLayoutResponse, FloatingPaneCoordinates, FlockSidebarMode,
-    FlockSidebarState, GetFocusedPaneInfoResponse, GetPaneCwdResponse, GetPanePidResponse,
+    DeleteLayoutResponse, DockMode, DockState, EditLayoutResponse, FloatingPaneCoordinates,
+    GetFocusedPaneInfoResponse, GetPaneCwdResponse, GetPanePidResponse,
     GetPaneRunningCommandResponse, GetSessionListResponse, HighlightLayer, HighlightStyle,
     HttpVerb, InputMode, KeyWithModifier, KillSessionsResponse, MessageToPlugin, NewPluginArgs,
     PaneAgentStatus, PaneId, PermissionType, PluginCommand, RegexHighlight, RenameLayoutResponse,
@@ -1474,14 +1473,14 @@ impl TryFrom<ProtobufPluginCommand> for PluginCommand {
                 },
                 _ => Err("Mismatched payload for PublishAgentState"),
             },
-            Some(CommandName::PublishFlockSidebarState) => match protobuf_plugin_command.payload {
-                Some(Payload::PublishFlockSidebarStatePayload(payload)) => {
-                    Ok(PluginCommand::PublishFlockSidebarState(FlockSidebarState {
-                        mode: FlockSidebarMode::from_wire_u32(payload.mode),
+            Some(CommandName::PublishDockState) => match protobuf_plugin_command.payload {
+                Some(Payload::PublishDockStatePayload(payload)) => {
+                    Ok(PluginCommand::PublishDockState(DockState {
+                        mode: DockMode::from_wire_u32(payload.mode),
                         updated_at_millis: payload.updated_at_millis,
                     }))
                 },
-                _ => Err("Mismatched payload for PublishFlockSidebarState"),
+                _ => Err("Mismatched payload for PublishDockState"),
             },
             Some(CommandName::DumpSessionLayout) => match protobuf_plugin_command.payload {
                 Some(Payload::DumpSessionLayoutPayload(payload)) => {
@@ -3379,14 +3378,12 @@ impl TryFrom<PluginCommand> for ProtobufPluginCommand {
                     },
                 )),
             }),
-            PluginCommand::PublishFlockSidebarState(sidebar_state) => Ok(ProtobufPluginCommand {
-                name: CommandName::PublishFlockSidebarState as i32,
-                payload: Some(Payload::PublishFlockSidebarStatePayload(
-                    ProtobufFlockSidebarState {
-                        mode: sidebar_state.mode.as_wire_u32(),
-                        updated_at_millis: sidebar_state.updated_at_millis,
-                    },
-                )),
+            PluginCommand::PublishDockState(sidebar_state) => Ok(ProtobufPluginCommand {
+                name: CommandName::PublishDockState as i32,
+                payload: Some(Payload::PublishDockStatePayload(ProtobufDockState {
+                    mode: sidebar_state.mode.as_wire_u32(),
+                    updated_at_millis: sidebar_state.updated_at_millis,
+                })),
             }),
             PluginCommand::DumpSessionLayout { tab_index } => Ok(ProtobufPluginCommand {
                 name: CommandName::DumpSessionLayout as i32,
@@ -5139,9 +5136,7 @@ impl From<OpenPluginPaneFloatingResponse> for ProtobufOpenPluginPaneFloatingResp
 #[cfg(test)]
 mod publish_agent_state_tests {
     use super::*;
-    use crate::data::{
-        AgentRunState, FlockSidebarMode, FlockSidebarState, PaneAgentStatus, PaneId, PluginCommand,
-    };
+    use crate::data::{AgentRunState, DockMode, DockState, PaneAgentStatus, PaneId, PluginCommand};
     use prost::Message;
 
     #[test]
@@ -5182,12 +5177,12 @@ mod publish_agent_state_tests {
     }
 
     #[test]
-    fn publish_flock_sidebar_state_protobuf_round_trip() {
-        let state = FlockSidebarState {
-            mode: FlockSidebarMode::Closed,
+    fn publish_dock_state_protobuf_round_trip() {
+        let state = DockState {
+            mode: DockMode::Closed,
             updated_at_millis: 42,
         };
-        let command = PluginCommand::PublishFlockSidebarState(state);
+        let command = PluginCommand::PublishDockState(state);
 
         let protobuf: ProtobufPluginCommand = command.try_into().unwrap();
         let bytes = protobuf.encode_to_vec();
@@ -5195,10 +5190,10 @@ mod publish_agent_state_tests {
         let round_tripped: PluginCommand = decoded.try_into().unwrap();
 
         match round_tripped {
-            PluginCommand::PublishFlockSidebarState(decoded_state) => {
+            PluginCommand::PublishDockState(decoded_state) => {
                 assert_eq!(decoded_state, state);
             },
-            other => panic!("expected PublishFlockSidebarState, got {:?}", other),
+            other => panic!("expected PublishDockState, got {:?}", other),
         }
     }
 }

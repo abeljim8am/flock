@@ -1873,21 +1873,21 @@ pub struct PaneAgentStatus {
     pub seen: bool,
 }
 
-/// The flock-sidebar presentation mode, shared across live sessions through
-/// `SessionInfo`.
+/// Whether a dock is expanded or collapsed to its rail. Shared across live
+/// sessions through `SessionInfo` so the presentation follows the user.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
-pub enum FlockSidebarMode {
+pub enum DockMode {
     #[default]
     Open,
     Closed,
 }
 
-impl FlockSidebarMode {
+impl DockMode {
     /// A stable, lower-case wire name used for KDL serialization.
     pub fn as_wire_str(&self) -> &'static str {
         match self {
-            FlockSidebarMode::Open => "open",
-            FlockSidebarMode::Closed => "closed",
+            DockMode::Open => "open",
+            DockMode::Closed => "closed",
         }
     }
 
@@ -1895,16 +1895,16 @@ impl FlockSidebarMode {
     /// falling back to `Open` for anything unrecognized.
     pub fn from_wire_str(s: &str) -> Self {
         match s {
-            "closed" => FlockSidebarMode::Closed,
-            _ => FlockSidebarMode::Open,
+            "closed" => DockMode::Closed,
+            _ => DockMode::Open,
         }
     }
 
     /// Numeric wire value used for protobuf round-trips.
     pub fn as_wire_u32(&self) -> u32 {
         match self {
-            FlockSidebarMode::Open => 0,
-            FlockSidebarMode::Closed => 1,
+            DockMode::Open => 0,
+            DockMode::Closed => 1,
         }
     }
 
@@ -1912,17 +1912,18 @@ impl FlockSidebarMode {
     /// `Open`.
     pub fn from_wire_u32(v: u32) -> Self {
         match v {
-            1 => FlockSidebarMode::Closed,
-            _ => FlockSidebarMode::Open,
+            1 => DockMode::Closed,
+            _ => DockMode::Open,
         }
     }
 }
 
-/// Latest flock-sidebar mode update published by a session. The timestamp lets
-/// sidebars converge on the most recent toggle when multiple sessions are live.
+/// A session's latest dock mode. The timestamp lets sessions converge on the
+/// most recent toggle when several are live, without any of them needing to
+/// agree on an ordering beyond wall-clock.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
-pub struct FlockSidebarState {
-    pub mode: FlockSidebarMode,
+pub struct DockState {
+    pub mode: DockMode,
     pub updated_at_millis: u64,
 }
 
@@ -2030,10 +2031,10 @@ pub struct SessionInfo {
     /// existing cross-session metadata transport: another session's sidebar
     /// reads this to render that session's agents in full state fidelity.
     pub agent_states: BTreeMap<PaneId, PaneAgentStatus>,
-    /// The latest open/closed sidebar mode published by this session's
-    /// flock-sidebar plugin. Other sessions adopt the newest published mode so
-    /// the sidebar presentation follows the user across sessions.
-    pub flock_sidebar_state: Option<FlockSidebarState>,
+    /// This session's latest dock mode, if it has a dock. Other sessions adopt
+    /// the newest one so the dock's presentation follows the user across
+    /// sessions. `None` means the session's layout declares no dock.
+    pub dock_state: Option<DockState>,
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Eq, Deserialize, Serialize)]
@@ -3859,10 +3860,10 @@ pub enum PluginCommand {
     /// it and surfaces it on `SessionInfo` so other sessions' sidebars can see
     /// it (the flock-sidebar Phase 7 cross-session agent view).
     PublishAgentState(BTreeMap<PaneId, PaneAgentStatus>),
-    /// Publish this session's flock-sidebar open/closed state to the server,
-    /// which stores it and surfaces it on `SessionInfo` so other sessions'
-    /// sidebars can follow the same presentation mode.
-    PublishFlockSidebarState(FlockSidebarState),
+    /// Publish this session's dock mode to the server, which stores it and
+    /// surfaces it on `SessionInfo` so other sessions can follow the same
+    /// presentation mode.
+    PublishDockState(DockState),
 }
 
 // Response type for plugin API methods that open a pane in a new tab

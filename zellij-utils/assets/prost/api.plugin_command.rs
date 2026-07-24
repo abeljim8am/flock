@@ -314,7 +314,7 @@ pub mod plugin_command {
         #[prost(message, tag="165")]
         ResizePaneIdToFixedWidthPayload(super::ResizePaneIdToFixedWidthPayload),
         #[prost(message, tag="166")]
-        PublishFlockSidebarStatePayload(super::FlockSidebarState),
+        PublishDockStatePayload(super::DockState),
     }
 }
 #[allow(clippy::derive_partial_eq_without_eq)]
@@ -325,7 +325,7 @@ pub struct PublishAgentStatePayload {
 }
 #[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Clone, PartialEq, ::prost::Message)]
-pub struct FlockSidebarState {
+pub struct DockState {
     #[prost(uint32, tag="1")]
     pub mode: u32,
     #[prost(uint64, tag="2")]
@@ -2194,7 +2194,7 @@ pub enum CommandName {
     DeleteAllDeadSessionsAndReply = 214,
     PublishAgentState = 215,
     ResizePaneIdToFixedWidth = 216,
-    PublishFlockSidebarState = 217,
+    PublishDockState = 217,
 }
 impl CommandName {
     /// String value of the enum field names used in the ProtoBuf definition.
@@ -2399,7 +2399,7 @@ impl CommandName {
             CommandName::DeleteAllDeadSessionsAndReply => "DeleteAllDeadSessionsAndReply",
             CommandName::PublishAgentState => "PublishAgentState",
             CommandName::ResizePaneIdToFixedWidth => "ResizePaneIdToFixedWidth",
-            CommandName::PublishFlockSidebarState => "PublishFlockSidebarState",
+            CommandName::PublishDockState => "PublishDockState",
         }
     }
     /// Creates an enum from field names used in the ProtoBuf definition.
@@ -2601,7 +2601,7 @@ impl CommandName {
             "DeleteAllDeadSessionsAndReply" => Some(Self::DeleteAllDeadSessionsAndReply),
             "PublishAgentState" => Some(Self::PublishAgentState),
             "ResizePaneIdToFixedWidth" => Some(Self::ResizePaneIdToFixedWidth),
-            "PublishFlockSidebarState" => Some(Self::PublishFlockSidebarState),
+            "PublishDockState" => Some(Self::PublishDockState),
             _ => None,
         }
     }

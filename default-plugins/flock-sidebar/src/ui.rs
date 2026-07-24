@@ -35,8 +35,8 @@ use std::collections::BTreeMap;
 
 use unicode_width::UnicodeWidthStr;
 use zellij_tile::prelude::{
-    AgentRunState, FlockSidebarMode, PaletteColor, PaneAgentStatus, PaneId, PaneManifest,
-    RemoteBackend, RemoteConnectionState, SessionInfo, TabInfo,
+    AgentRunState, DockMode, PaletteColor, PaneAgentStatus, PaneId, PaneManifest, RemoteBackend,
+    RemoteConnectionState, SessionInfo, TabInfo,
 };
 
 use crate::detect::{identify_agent_from_command, AgentState};
@@ -88,16 +88,16 @@ impl SidebarMode {
     }
 }
 
-impl From<FlockSidebarMode> for SidebarMode {
-    fn from(mode: FlockSidebarMode) -> Self {
+impl From<DockMode> for SidebarMode {
+    fn from(mode: DockMode) -> Self {
         match mode {
-            FlockSidebarMode::Open => Self::Open,
-            FlockSidebarMode::Closed => Self::Closed,
+            DockMode::Open => Self::Open,
+            DockMode::Closed => Self::Closed,
         }
     }
 }
 
-impl From<SidebarMode> for FlockSidebarMode {
+impl From<SidebarMode> for DockMode {
     fn from(mode: SidebarMode) -> Self {
         match mode {
             SidebarMode::Open => Self::Open,

@@ -1573,11 +1573,11 @@ pub fn publish_agent_state(agent_states: BTreeMap<PaneId, PaneAgentStatus>) {
     unsafe { host_run_plugin_command() };
 }
 
-/// Publish this session's flock-sidebar open/closed state to the server. The
-/// server surfaces it on this session's `SessionInfo`, so other sessions'
-/// sidebars can follow the same presentation mode.
-pub fn publish_flock_sidebar_state(sidebar_state: FlockSidebarState) {
-    let plugin_command = PluginCommand::PublishFlockSidebarState(sidebar_state);
+/// Publish this session's dock mode to the server. The server surfaces it on
+/// this session's `SessionInfo`, so other sessions can follow the same
+/// presentation mode.
+pub fn publish_dock_state(dock_state: DockState) {
+    let plugin_command = PluginCommand::PublishDockState(dock_state);
     let protobuf_plugin_command: ProtobufPluginCommand = plugin_command.try_into().unwrap();
     object_to_stdout(&protobuf_plugin_command.encode_to_vec());
     unsafe { host_run_plugin_command() };

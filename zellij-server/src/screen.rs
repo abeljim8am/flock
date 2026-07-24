@@ -914,7 +914,7 @@ pub enum ScreenInstruction {
         BTreeMap<String, Duration>,    // resurrectable sessions - <name, created>
     ),
     PublishAgentState(BTreeMap<zellij_utils::data::PaneId, PaneAgentStatus>),
-    PublishFlockSidebarState(zellij_utils::data::FlockSidebarState),
+    PublishDockState(zellij_utils::data::DockState),
     ReplacePane(
         PaneId,
         HoldForCommand,
@@ -1300,9 +1300,7 @@ impl From<&ScreenInstruction> for ScreenContext {
             ScreenInstruction::BreakPaneLeft(..) => ScreenContext::BreakPaneLeft,
             ScreenInstruction::UpdateSessionInfos(..) => ScreenContext::UpdateSessionInfos,
             ScreenInstruction::PublishAgentState(..) => ScreenContext::PublishAgentState,
-            ScreenInstruction::PublishFlockSidebarState(..) => {
-                ScreenContext::PublishFlockSidebarState
-            },
+            ScreenInstruction::PublishDockState(..) => ScreenContext::PublishDockState,
             ScreenInstruction::ReplacePane(..) => ScreenContext::ReplacePane,
             ScreenInstruction::NewInPlacePluginPane(..) => ScreenContext::NewInPlacePluginPane,
             ScreenInstruction::SerializeLayoutForResurrection => {
@@ -1716,10 +1714,10 @@ pub(crate) struct Screen {
     /// cross-session metadata transport to other sessions' sidebars. Keyed by
     /// the plugin-facing `data::PaneId`.
     published_agent_states: BTreeMap<zellij_utils::data::PaneId, PaneAgentStatus>,
-    /// The latest flock-sidebar open/closed state published by this session's
-    /// flock-sidebar plugin. Stored here and copied onto every `SessionInfo` we
-    /// generate, so other sessions' sidebars can follow the same presentation.
-    published_flock_sidebar_state: Option<zellij_utils::data::FlockSidebarState>,
+    /// This session's dock mode. Copied onto every `SessionInfo` we generate, so
+    /// other sessions can follow the same presentation. `None` until something
+    /// establishes a mode.
+    published_dock_state: Option<zellij_utils::data::DockState>,
 }
 
 /// A pending forward waiting to be dispatched once the current in-flight
@@ -1878,7 +1876,7 @@ impl Screen {
             session_default_command: None,
             session_remote_backend: None,
             published_agent_states: BTreeMap::new(),
-            published_flock_sidebar_state: None,
+            published_dock_state: None,
         }
     }
 
@@ -3740,7 +3738,7 @@ impl Screen {
             remote_connection_state,
             remote_panes,
             agent_states: self.published_agent_states.clone(),
-            flock_sidebar_state: self.published_flock_sidebar_state,
+            dock_state: self.published_dock_state,
         };
         self.bus
             .senders
@@ -8954,12 +8952,12 @@ pub(crate) fn screen_thread_main(
                     screen.log_and_report_session_state()?;
                 }
             },
-            ScreenInstruction::PublishFlockSidebarState(sidebar_state) => {
-                // Same diff guard as agent state: sidebars may republish adopted
+            ScreenInstruction::PublishDockState(dock_state) => {
+                // Same diff guard as agent state: a plugin may republish adopted
                 // state while converging, but unchanged values shouldn't rewrite
                 // session metadata.
-                if screen.published_flock_sidebar_state != Some(sidebar_state) {
-                    screen.published_flock_sidebar_state = Some(sidebar_state);
+                if screen.published_dock_state != Some(dock_state) {
+                    screen.published_dock_state = Some(dock_state);
                     screen.log_and_report_session_state()?;
                 }
             },
@@ -9058,7 +9056,7 @@ pub(crate) fn screen_thread_main(
                     remote_connection_state,
                     remote_panes,
                     agent_states: screen.published_agent_states.clone(),
-                    flock_sidebar_state: screen.published_flock_sidebar_state,
+                    dock_state: screen.published_dock_state,
                 };
 
                 let session_layout_metadata = if screen.session_serialization {

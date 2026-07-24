@@ -1,10 +1,10 @@
 mod kdl_layout_parser;
 use crate::data::{
-    AgentRunState, BareKey, Direction, FloatingPaneCoordinates, FlockSidebarMode,
-    FlockSidebarState, InputMode, KeyWithModifier, LayoutInfo, LayoutMetadata, MultiplayerColors,
-    Palette, PaletteColor, PaneAgentStatus, PaneId, PaneInfo, PaneManifest, PermissionType,
-    RemoteBackend, RemoteConnectionState, RemotePaneMetadata, Resize, SessionInfo,
-    StyleDeclaration, Styling, TabInfo, WebSharing, DEFAULT_STYLES,
+    AgentRunState, BareKey, Direction, DockMode, DockState, FloatingPaneCoordinates, InputMode,
+    KeyWithModifier, LayoutInfo, LayoutMetadata, MultiplayerColors, Palette, PaletteColor,
+    PaneAgentStatus, PaneId, PaneInfo, PaneManifest, PermissionType, RemoteBackend,
+    RemoteConnectionState, RemotePaneMetadata, Resize, SessionInfo, StyleDeclaration, Styling,
+    TabInfo, WebSharing, DEFAULT_STYLES,
 };
 use crate::envs::EnvironmentVariables;
 use crate::home::{find_default_config_dir, get_layout_dir};
@@ -5827,13 +5827,13 @@ impl SessionInfo {
                 agent_states.insert(pane_id, PaneAgentStatus { state, label, seen });
             }
         }
-        let flock_sidebar_state = kdl_document.get("flock_sidebar_state").map(|state_node| {
+        let dock_state = kdl_document.get("dock_state").map(|state_node| {
             let mode = state_node
                 .entries()
                 .iter()
                 .find(|e| e.name().map(|n| n.value()) == Some("mode"))
                 .and_then(|e| e.value().as_string())
-                .map(FlockSidebarMode::from_wire_str)
+                .map(DockMode::from_wire_str)
                 .unwrap_or_default();
             let updated_at_millis = state_node
                 .entries()
@@ -5842,7 +5842,7 @@ impl SessionInfo {
                 .and_then(|e| e.value().as_i64())
                 .map(|millis| millis as u64)
                 .unwrap_or_default();
-            FlockSidebarState {
+            DockState {
                 mode,
                 updated_at_millis,
             }
@@ -5866,7 +5866,7 @@ impl SessionInfo {
             remote_connection_state,
             remote_panes,
             agent_states,
-            flock_sidebar_state,
+            dock_state,
         })
     }
     pub fn to_string(&self) -> String {
@@ -6056,14 +6056,14 @@ impl SessionInfo {
         agent_states_node.set_children(agent_states_children);
         kdl_document.nodes_mut().push(agent_states_node);
 
-        if let Some(sidebar_state) = self.flock_sidebar_state {
-            let mut sidebar_state_node = KdlNode::new("flock_sidebar_state");
-            sidebar_state_node.push(KdlEntry::new_prop("mode", sidebar_state.mode.as_wire_str()));
-            sidebar_state_node.push(KdlEntry::new_prop(
+        if let Some(dock_state) = self.dock_state {
+            let mut dock_state_node = KdlNode::new("dock_state");
+            dock_state_node.push(KdlEntry::new_prop("mode", dock_state.mode.as_wire_str()));
+            dock_state_node.push(KdlEntry::new_prop(
                 "updated_at_millis",
-                sidebar_state.updated_at_millis as i64,
+                dock_state.updated_at_millis as i64,
             ));
-            kdl_document.nodes_mut().push(sidebar_state_node);
+            kdl_document.nodes_mut().push(dock_state_node);
         }
 
         kdl_document.fmt();
@@ -6671,8 +6671,8 @@ fn serialize_and_deserialize_session_info_with_data() {
             );
             agent_states
         },
-        flock_sidebar_state: Some(FlockSidebarState {
-            mode: FlockSidebarMode::Closed,
+        dock_state: Some(DockState {
+            mode: DockMode::Closed,
             updated_at_millis: 42,
         }),
     };
