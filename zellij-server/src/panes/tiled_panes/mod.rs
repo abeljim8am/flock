@@ -39,7 +39,8 @@ fn pane_content_offset(position_and_size: &PaneGeom, viewport: &Viewport) -> (us
     // if the pane is not on the bottom or right edge on the screen, we need to reserve one space
     // from its content to leave room for the boundary between it and the next pane (if it doesn't
     // draw its own frame)
-    let columns_offset = if position_and_size.x + position_and_size.cols.as_usize() < viewport.cols
+    let columns_offset = if position_and_size.x + position_and_size.cols.as_usize()
+        < viewport.x + viewport.cols
     {
         1
     } else {
