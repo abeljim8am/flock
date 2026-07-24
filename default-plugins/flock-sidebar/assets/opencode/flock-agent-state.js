@@ -2,7 +2,7 @@
 // managed by flock-sidebar; reinstalling or updating the integration overwrites this file.
 // add custom hooks/plugins beside this file instead of editing it.
 // FLOCK_INTEGRATION_ID=opencode
-// FLOCK_INTEGRATION_VERSION=5
+// FLOCK_INTEGRATION_VERSION=6
 //
 // Ported from herdr's opencode integration plugin (herdr-agent-state.js,
 // HERDR_INTEGRATION_VERSION=8). Instead of writing herdr's unix socket, it
@@ -27,6 +27,10 @@
 // plugin to the file channel. Locally the successful pipe remains the channel.
 // v5 adds the Coder remote-agent channel. The same plugin file is used in every
 // environment; FLOCK_STATE_CHANNEL selects the transport at runtime.
+// v6 sends --agent-pid on the remote-agent channel. This plugin is loaded inside
+// opencode, so process.pid *is* the agent's pid — the daemon watches it for exit
+// to decide when the agent is gone. Naming it is exact; without it the daemon
+// has to infer the process from the reporter's ancestry.
 
 import { spawn } from "node:child_process";
 import { mkdirSync, writeFileSync, renameSync } from "node:fs";
@@ -138,6 +142,9 @@ function reportState(state) {
             state,
             "--agent",
             AGENT,
+            // Runs in-process: this is opencode's own pid, not the reporter's.
+            "--agent-pid",
+            String(process.pid),
           ],
           { stdio: "ignore", timeout: 2000 },
         );

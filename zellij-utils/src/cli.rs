@@ -199,6 +199,11 @@ pub enum RemoteAgentCommand {
         state: String,
         #[clap(long, value_parser)]
         agent: String,
+        /// The agent's own process id, when the integration knows it exactly.
+        /// The daemon watches this process for exit to decide when the agent is
+        /// gone, so naming it beats the daemon inferring it from ancestry.
+        #[clap(long, value_parser)]
+        agent_pid: Option<u32>,
     },
 }
 
@@ -1764,6 +1769,8 @@ mod tests {
             "blocked",
             "--agent",
             "opencode",
+            "--agent-pid",
+            "4242",
         ])
         .unwrap();
         assert!(matches!(
@@ -1772,9 +1779,36 @@ mod tests {
                 pane_id,
                 state,
                 agent,
+                agent_pid,
             })) if pane_id == "00000000-0000-4000-a000-000000000001"
                 && state == "blocked"
                 && agent == "opencode"
+                && agent_pid == Some(4242)
+        ));
+    }
+
+    #[test]
+    fn remote_agent_state_report_agent_pid_is_optional() {
+        // Integrations that cannot name the agent's process omit it; the daemon
+        // then resolves the pid from the reporter's ancestry.
+        let cli = CliArgs::try_parse_from([
+            "flock",
+            "remote-agent",
+            "report-state",
+            "--pane-id",
+            "00000000-0000-4000-a000-000000000001",
+            "--state",
+            "idle",
+            "--agent",
+            "claude",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Command::RemoteAgent(RemoteAgentCommand::ReportState {
+                agent_pid: None,
+                ..
+            }))
         ));
     }
 

@@ -53,10 +53,26 @@ pub enum HookReport {
         pane_id: PaneId,
         agent_label: String,
         state: AgentState,
+        presence: Presence,
     },
     /// Release the pane back to the shell, clearing hook authority (herdr's
     /// `pane.release_agent`).
     Release { pane_id: PaneId },
+}
+
+/// Whether a report is the agent announcing a transition or the remote daemon
+/// re-asserting an unchanged picture.
+///
+/// Only the remote-agent channel sends heartbeats: the daemon watches the
+/// agent's process and re-states presence on a timer, which is what lets the
+/// sidebar be a projection of the daemon rather than an authority that has to
+/// hold state correctly on its own. A heartbeat proves the agent is still there
+/// but must not count as a fresh report — otherwise it would keep resetting the
+/// screen-veto windows that arbitrate a hook which missed its stop event.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Presence {
+    Report,
+    Heartbeat,
 }
 
 /// Parse a `flock-state` pipe message's args into a [`HookReport`].
@@ -91,11 +107,18 @@ pub fn parse_hook_report(args: &BTreeMap<String, String>) -> Result<HookReport, 
         .filter(|label| !label.trim().is_empty())
         .unwrap_or(DEFAULT_AGENT_LABEL)
         .to_string();
+    // Local hooks omit `presence` entirely; only the remote-agent bridge sends
+    // it, so absence means "a real report".
+    let presence = match args.get("presence").map(|value| value.trim()) {
+        Some(value) if value.eq_ignore_ascii_case("heartbeat") => Presence::Heartbeat,
+        _ => Presence::Report,
+    };
 
     Ok(HookReport::State {
         pane_id,
         agent_label,
         state,
+        presence,
     })
 }
 
@@ -196,6 +219,7 @@ mod tests {
                 pane_id: PaneId::Terminal(7),
                 agent_label: "claude".into(),
                 state: AgentState::Blocked,
+                presence: Presence::Report,
             }
         );
     }
@@ -212,6 +236,7 @@ mod tests {
                 pane_id: PaneId::Terminal(3),
                 agent_label: DEFAULT_AGENT_LABEL.into(),
                 state: AgentState::Blocked,
+                presence: Presence::Report,
             }
         );
     }
@@ -285,6 +310,43 @@ mod tests {
     #[test]
     fn rejects_unknown_state() {
         assert!(parse_hook_report(&args(&[("pane_id", "1"), ("state", "ka-boom")])).is_err());
+    }
+
+    #[test]
+    fn presence_arg_distinguishes_heartbeats_from_reports() {
+        let presence_of = |pairs: &[(&str, &str)]| match parse_hook_report(&args(pairs)) {
+            Ok(HookReport::State { presence, .. }) => presence,
+            other => panic!("expected a state report, got {other:?}"),
+        };
+
+        // Local hooks never send `presence`; only the remote-agent bridge does.
+        assert_eq!(
+            presence_of(&[("pane_id", "1"), ("state", "working")]),
+            Presence::Report
+        );
+        assert_eq!(
+            presence_of(&[
+                ("pane_id", "1"),
+                ("state", "working"),
+                ("presence", "report")
+            ]),
+            Presence::Report
+        );
+        assert_eq!(
+            presence_of(&[
+                ("pane_id", "1"),
+                ("state", "working"),
+                ("presence", "Heartbeat")
+            ]),
+            Presence::Heartbeat
+        );
+        // An unrecognized value must not be mistaken for a heartbeat: treating a
+        // real report as a re-assertion would silently stop refreshing the
+        // screen-veto windows.
+        assert_eq!(
+            presence_of(&[("pane_id", "1"), ("state", "working"), ("presence", "wat")]),
+            Presence::Report
+        );
     }
 
     #[test]

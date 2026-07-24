@@ -58,7 +58,8 @@ fn main() {
                     pane_id,
                     state,
                     agent,
-                } => remote_agent::report_state(&pane_id, &state, &agent, None),
+                    agent_pid,
+                } => remote_agent::report_state(&pane_id, &state, &agent, agent_pid, None),
             };
             if let Err(error) = result {
                 eprintln!("flock remote-agent: {error:#}");

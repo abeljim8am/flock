@@ -50,7 +50,7 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use detect::{detect_agent, identify_agent_from_command, identify_agent_from_screen, AgentState};
 use hook::{
-    parse_daemon_version_report, parse_hook_report, DaemonVersionReport, HookReport,
+    parse_daemon_version_report, parse_hook_report, DaemonVersionReport, HookReport, Presence,
     DAEMON_VERSION_PIPE_NAME, HOOK_PIPE_NAME,
 };
 use palette::Theme;
@@ -535,31 +535,40 @@ impl State {
     }
 
     /// Feed one pane's screen text through identification (remote panes) and
-    /// state detection. For a remote (codespace SSH) pane the screen is the
-    /// only agent-identity source: confident agent chrome (re)identifies the
-    /// pane's agent and cancels any pending absence window, while a live frame
-    /// with no recognizable chrome opens it (release happens in `tick` after
-    /// the remote grace). Returns whether the arbitrated state changed.
+    /// state detection. Returns whether the arbitrated state changed.
+    ///
+    /// Screen identification only ever *adds* information. When a remote pane's
+    /// agent reports through the remote daemon, the hook label is the identity
+    /// and the daemon — which watches the agent's process — owns presence, so
+    /// the screen is used purely to refine state. The screen may establish and
+    /// revoke an agent only when it is the sole source, i.e. a remote host with
+    /// no integration hooks installed.
+    ///
+    /// That asymmetry is the fix for agents blinking in and out.
+    /// `identify_agent_from_screen` recognizes structural chrome for two agents
+    /// only, and its Codex marker — a line starting `› ` — is generic enough to
+    /// show up in other TUIs and in ordinary scrollback. Treating it as identity
+    /// for a remote pane running a third agent retired the correct hook, and the
+    /// pane was released a grace window later; the agent's next state transition
+    /// brought it back, and the cycle repeated.
     fn observe_pane_screen(&mut self, pane_id: PaneId, screen: &str, now: Instant) -> bool {
         let entry = self.agents.entry(pane_id).or_default();
-        let mut agent = entry.detected_agent;
-        if entry.remote {
+        if entry.remote && entry.hook_authority.is_none() {
             match identify_agent_from_screen(screen) {
-                Some(identified) => {
-                    agent = Some(identified);
-                    entry.set_detected_agent(agent, now);
-                },
+                Some(identified) => entry.set_detected_agent(Some(identified), now),
                 None => {
-                    // An overlay screen (transcript viewer, model picker)
-                    // hides the chrome without saying the agent is gone.
+                    // An overlay screen (transcript viewer, model picker) hides
+                    // the chrome without saying the agent is gone.
+                    let agent = entry.detected_agent;
                     if agent.is_some() && !detect_agent(agent, screen).skip_state_update {
                         entry.mark_agent_missing(now);
                     }
+                    false
                 },
-            }
+            };
         }
-        let detection = detect_agent(agent, screen);
-        entry.observe_screen(agent, detection, now)
+        let detection = detect_agent(entry.detection_agent(), screen);
+        entry.observe_screen(detection, now)
     }
 
     /// Whether enough time has elapsed to refresh the cross-session list. Kept
@@ -844,9 +853,16 @@ impl State {
                 pane_id,
                 agent_label,
                 state,
+                presence,
             } => {
                 let entry = self.agents.entry(pane_id).or_default();
-                entry.set_hook_authority(agent_label, state, now)
+                match presence {
+                    // A transition the agent reported itself.
+                    Presence::Report => entry.set_hook_authority(agent_label, state, now),
+                    // The remote daemon re-asserting a picture it still holds:
+                    // proof of presence, not a new report.
+                    Presence::Heartbeat => entry.refresh_hook_authority(agent_label, state, now),
+                }
             },
             HookReport::Release { pane_id } => match self.agents.get_mut(&pane_id) {
                 // Releasing a pane we never tracked is a no-op.
@@ -1188,6 +1204,9 @@ pub(crate) enum RemoteBinding {
 /// Recognize any remote binding in an argv (a session's `default_command` or
 /// a pane's command).
 pub(crate) fn parse_remote_binding(argv: &[String]) -> Option<RemoteBinding> {
+    if let Some(binding) = parse_remote_pty_binding(argv) {
+        return Some(binding);
+    }
     if codespace::parse_codespace_ssh(argv).is_some() {
         return Some(RemoteBinding::Codespace);
     }
@@ -1195,6 +1214,35 @@ pub(crate) fn parse_remote_binding(argv: &[String]) -> Option<RemoteBinding> {
         return Some(RemoteBinding::Devcontainer);
     }
     None
+}
+
+/// Recognize a `flock remote-agent remote-pty --provider <p> …` argv — the
+/// bridge every provider on the remote-agent engine runs.
+///
+/// A pane that *is* the bridge says so in its own argv, so recognizing it here
+/// makes the remote flag independent of when the session list happens to arrive.
+/// Without this, coder and ssh panes fell back to "this session is bound", which
+/// needs `self.sessions` to already carry the typed backend: a `CommandChanged`
+/// that landed before the first session refresh left the pane marked local
+/// forever — the bridge's local argv never changes, so no later event corrected
+/// it — and a local absence signal could then release a live remote agent.
+fn parse_remote_pty_binding(argv: &[String]) -> Option<RemoteBinding> {
+    let bridge = argv
+        .windows(2)
+        .any(|pair| pair[0] == "remote-agent" && pair[1] == "remote-pty");
+    if !bridge {
+        return None;
+    }
+    let provider = argv
+        .iter()
+        .position(|arg| arg == "--provider")
+        .and_then(|index| argv.get(index + 1))?;
+    match provider.as_str() {
+        "coder" => Some(RemoteBinding::Coder),
+        "ssh" => Some(RemoteBinding::Ssh),
+        "devcontainer" => Some(RemoteBinding::Devcontainer),
+        _ => None,
+    }
 }
 
 pub(crate) fn session_remote_binding(session: &SessionInfo) -> Option<RemoteBinding> {
@@ -1472,7 +1520,7 @@ mod tests {
         state.observe_pane_screen(pane_id, "user@codespace:~/repo$ ", now);
         let entry = state.agents.get_mut(&pane_id).unwrap();
         assert!(entry.is_agent(), "still tracked inside the grace window");
-        assert!(entry.tick(now + state::REMOTE_AGENT_GONE_GRACE));
+        assert!(entry.tick(now + state::AGENT_GONE_GRACE));
         let entry = state.agents.get(&pane_id).unwrap();
         assert!(!entry.is_agent());
         assert!(
@@ -1502,7 +1550,7 @@ mod tests {
             .agents
             .get_mut(&pane_id)
             .unwrap()
-            .tick(now + state::REMOTE_AGENT_GONE_GRACE));
+            .tick(now + state::AGENT_GONE_GRACE));
         assert_eq!(
             state.agents.get(&pane_id).and_then(|e| e.detected_agent),
             Some(Agent::Claude)
@@ -1769,6 +1817,105 @@ mod tests {
             argv_from_terminal_command("/opt/homebrew/bin/claude --dangerously-skip-permissions");
 
         assert_eq!(identify_agent_from_command(&argv), Some(Agent::Claude));
+    }
+
+    #[test]
+    fn remote_pty_panes_are_marked_remote_without_a_session_list() {
+        // The ordering hazard: a CommandChanged can arrive before the first
+        // session refresh, and the bridge's local argv never changes afterwards,
+        // so a pane misjudged here would stay misjudged for its whole life.
+        let mut state = state_with_provider("coder_enabled");
+        assert!(state.sessions.is_empty());
+
+        let pane_id = PaneId::Terminal(3);
+        state.apply_command_changed(
+            pane_id,
+            &argv(&[
+                "/tmp/flock",
+                "remote-agent",
+                "remote-pty",
+                "--provider",
+                "coder",
+                "--workspace",
+                "abeljim/wooli-test",
+            ]),
+            true,
+            Instant::now(),
+        );
+
+        assert!(state.agents.get(&pane_id).unwrap().remote);
+    }
+
+    #[test]
+    fn a_remote_agent_survives_a_local_no_foreground_child_report() {
+        // End-to-end over the local paths that used to release remote agents:
+        // the hook establishes the agent, then the host reports the pane has no
+        // foreground child. On a remote pane that says nothing about the agent.
+        let mut state = state_with_provider("coder_enabled");
+        let now = Instant::now();
+        let pane_id = PaneId::Terminal(3);
+        let bridge = argv(&[
+            "/tmp/flock",
+            "remote-agent",
+            "remote-pty",
+            "--provider",
+            "coder",
+            "--workspace",
+            "abeljim/wooli-test",
+        ]);
+        state.apply_command_changed(pane_id, &bridge, true, now);
+        state.apply_hook_report(HookReport::State {
+            pane_id,
+            agent_label: "opencode".into(),
+            state: AgentState::Working,
+            presence: Presence::Report,
+        });
+        assert!(state.agents.get(&pane_id).unwrap().is_agent());
+
+        state.apply_command_changed(pane_id, &bridge, false, now);
+        // A screen with no recognizable agent chrome, as during a full-screen
+        // tool or a torn frame.
+        state.observe_pane_screen(pane_id, "$ ", now);
+
+        let entry = state.agents.get_mut(&pane_id).unwrap();
+        assert!(!entry.tick(now + state::AGENT_GONE_GRACE * 100));
+        assert!(entry.is_agent());
+        assert_eq!(entry.state, AgentState::Working);
+    }
+
+    #[test]
+    fn a_remote_agent_is_not_misidentified_by_generic_codex_chrome() {
+        // The primary flicker path: a `› ` line is Codex's screen marker but
+        // appears in other TUIs and in scrollback. It must not retire the
+        // opencode hook that actually owns this pane.
+        let mut state = state_with_provider("coder_enabled");
+        let now = Instant::now();
+        let pane_id = PaneId::Terminal(3);
+        state.apply_command_changed(
+            pane_id,
+            &argv(&[
+                "/tmp/flock",
+                "remote-agent",
+                "remote-pty",
+                "--provider",
+                "coder",
+            ]),
+            true,
+            now,
+        );
+        state.apply_hook_report(HookReport::State {
+            pane_id,
+            agent_label: "opencode".into(),
+            state: AgentState::Working,
+            presence: Presence::Report,
+        });
+
+        state.observe_pane_screen(pane_id, "some output\n› \n", now);
+
+        let entry = state.agents.get(&pane_id).unwrap();
+        assert_eq!(entry.detected_agent, None, "screen must not claim identity");
+        assert_eq!(entry.effective_agent_label().as_deref(), Some("opencode"));
+        assert!(entry.hook_authority.is_some(), "hook must survive");
     }
 
     #[test]
