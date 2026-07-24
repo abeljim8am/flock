@@ -252,6 +252,7 @@ impl TiledPanes {
         let pane_grid = TiledPaneGrid::new(
             &mut self.panes,
             &self.panes_to_hide,
+            self.dock.map(|dock| dock.pane_id),
             *self.display_area.borrow(),
             *self.viewport.borrow(),
         );
@@ -264,6 +265,7 @@ impl TiledPanes {
         let mut pane_grid = TiledPaneGrid::new(
             &mut self.panes,
             &self.panes_to_hide,
+            self.dock.map(|dock| dock.pane_id),
             *self.display_area.borrow(),
             *self.viewport.borrow(),
         );
@@ -299,6 +301,7 @@ impl TiledPanes {
         let mut pane_grid = TiledPaneGrid::new(
             &mut self.panes,
             &self.panes_to_hide,
+            self.dock.map(|dock| dock.pane_id),
             *self.display_area.borrow(),
             *self.viewport.borrow(),
         );
@@ -346,6 +349,7 @@ impl TiledPanes {
         let mut pane_grid = TiledPaneGrid::new(
             &mut self.panes,
             &self.panes_to_hide,
+            self.dock.map(|dock| dock.pane_id),
             *self.display_area.borrow(),
             *self.viewport.borrow(),
         );
@@ -393,6 +397,7 @@ impl TiledPanes {
         let mut pane_grid = TiledPaneGrid::new(
             &mut self.panes,
             &self.panes_to_hide,
+            self.dock.map(|dock| dock.pane_id),
             *self.display_area.borrow(),
             *self.viewport.borrow(),
         );
@@ -466,6 +471,7 @@ impl TiledPanes {
         let mut pane_grid = TiledPaneGrid::new(
             &mut self.panes,
             &self.panes_to_hide,
+            self.dock.map(|dock| dock.pane_id),
             *self.display_area.borrow(),
             *self.viewport.borrow(),
         );
@@ -501,6 +507,7 @@ impl TiledPanes {
         let mut pane_grid = TiledPaneGrid::new(
             &mut self.panes,
             &self.panes_to_hide,
+            self.dock.map(|dock| dock.pane_id),
             *self.display_area.borrow(),
             *self.viewport.borrow(),
         );
@@ -530,7 +537,7 @@ impl TiledPanes {
             .values()
             .filter_map(|p| {
                 let geom = p.position_and_size();
-                if geom.cols.is_fixed() || geom.rows.is_fixed() {
+                if !p.is_dock() && (geom.cols.is_fixed() || geom.rows.is_fixed()) {
                     Some(geom.into())
                 } else {
                     None
@@ -543,7 +550,7 @@ impl TiledPanes {
             .values()
             .filter_map(|p| {
                 let geom = p.position_and_size();
-                if p.borderless() {
+                if p.borderless() && !p.is_dock() {
                     Some(geom.into())
                 } else {
                     None
@@ -551,12 +558,19 @@ impl TiledPanes {
             })
             .collect()
     }
+    /// Geoms of chrome panes that the viewport should be inset by. Docks are
+    /// excluded: their band is reserved explicitly and up front by
+    /// [`reserve_dock_band`](Self::reserve_dock_band), not inferred from geometry.
+    /// Inferring it here would make the result depend on iteration order, since a
+    /// left-edge pane only spans the viewport's full height *after* the top and
+    /// bottom chrome have inset it.
     pub fn non_selectable_pane_geoms_inside_viewport(&self) -> Vec<Viewport> {
         self.panes
             .values()
             .filter_map(|p| {
                 let geom = p.position_and_size();
-                if !p.selectable() && is_inside_viewport(&self.viewport.borrow(), p) {
+                if !p.selectable() && !p.is_dock() && is_inside_viewport(&self.viewport.borrow(), p)
+                {
                     Some(geom.into())
                 } else {
                     None
@@ -567,7 +581,7 @@ impl TiledPanes {
     pub fn first_selectable_pane_id(&self) -> Option<PaneId> {
         self.panes
             .iter()
-            .filter(|(_id, pane)| pane.selectable())
+            .filter(|(_id, pane)| pane.selectable() && !pane.is_dock())
             .map(|(id, _)| id.to_owned())
             .next()
     }
@@ -584,6 +598,7 @@ impl TiledPanes {
         let mut pane_grid = TiledPaneGrid::new(
             &mut self.panes,
             &self.panes_to_hide,
+            self.dock.map(|dock| dock.pane_id),
             *self.display_area.borrow(),
             *self.viewport.borrow(),
         );
@@ -1331,6 +1346,7 @@ impl TiledPanes {
             let mut pane_grid = TiledPaneGrid::new(
                 &mut self.panes,
                 &self.panes_to_hide,
+                self.dock.map(|dock| dock.pane_id),
                 *display_area,
                 *viewport,
             );
@@ -1426,6 +1442,7 @@ impl TiledPanes {
             let mut pane_grid = TiledPaneGrid::new(
                 &mut self.panes,
                 &self.panes_to_hide,
+                self.dock.map(|dock| dock.pane_id),
                 *self.display_area.borrow(),
                 *self.viewport.borrow(),
             );
@@ -1456,6 +1473,7 @@ impl TiledPanes {
             let mut pane_grid = TiledPaneGrid::new(
                 &mut self.panes,
                 &self.panes_to_hide,
+                self.dock.map(|dock| dock.pane_id),
                 *self.display_area.borrow(),
                 *self.viewport.borrow(),
             );
@@ -1486,6 +1504,7 @@ impl TiledPanes {
             let mut pane_grid = TiledPaneGrid::new(
                 &mut self.panes,
                 &self.panes_to_hide,
+                self.dock.map(|dock| dock.pane_id),
                 *self.display_area.borrow(),
                 *self.viewport.borrow(),
             );
@@ -1516,6 +1535,7 @@ impl TiledPanes {
             let mut pane_grid = TiledPaneGrid::new(
                 &mut self.panes,
                 &self.panes_to_hide,
+                self.dock.map(|dock| dock.pane_id),
                 *self.display_area.borrow(),
                 *self.viewport.borrow(),
             );
@@ -1644,6 +1664,7 @@ impl TiledPanes {
                     let pane_grid = TiledPaneGrid::new(
                         &mut self.panes,
                         &self.panes_to_hide,
+                        self.dock.map(|dock| dock.pane_id),
                         *self.display_area.borrow(),
                         *self.viewport.borrow(),
                     );
@@ -1731,6 +1752,7 @@ impl TiledPanes {
                 let mut pane_grid = TiledPaneGrid::new(
                     &mut self.panes,
                     &self.panes_to_hide,
+                    self.dock.map(|dock| dock.pane_id),
                     *self.display_area.borrow(),
                     *self.viewport.borrow(),
                 );
@@ -1787,6 +1809,7 @@ impl TiledPanes {
         let mut pane_grid = TiledPaneGrid::new(
             &mut self.panes,
             &self.panes_to_hide,
+            self.dock.map(|dock| dock.pane_id),
             *self.display_area.borrow(),
             *self.viewport.borrow(),
         );
@@ -2004,6 +2027,7 @@ impl TiledPanes {
         let mut pane_grid = TiledPaneGrid::new(
             &mut self.panes,
             &self.panes_to_hide,
+            self.dock.map(|dock| dock.pane_id),
             *self.display_area.borrow(),
             *self.viewport.borrow(),
         );
@@ -2027,6 +2051,7 @@ impl TiledPanes {
             let pane_grid = TiledPaneGrid::new(
                 &mut self.panes,
                 &self.panes_to_hide,
+                self.dock.map(|dock| dock.pane_id),
                 *self.display_area.borrow(),
                 *self.viewport.borrow(),
             );
@@ -2054,6 +2079,7 @@ impl TiledPanes {
             let pane_grid = TiledPaneGrid::new(
                 &mut self.panes,
                 &self.panes_to_hide,
+                self.dock.map(|dock| dock.pane_id),
                 *self.display_area.borrow(),
                 *self.viewport.borrow(),
             );
@@ -2090,6 +2116,7 @@ impl TiledPanes {
         let pane_grid = TiledPaneGrid::new(
             &mut self.panes,
             &self.panes_to_hide,
+            self.dock.map(|dock| dock.pane_id),
             *self.display_area.borrow(),
             *self.viewport.borrow(),
         );
@@ -2121,6 +2148,7 @@ impl TiledPanes {
                 let pane_grid = TiledPaneGrid::new(
                     &mut self.panes,
                     &self.panes_to_hide,
+                    self.dock.map(|dock| dock.pane_id),
                     *self.display_area.borrow(),
                     *self.viewport.borrow(),
                 );
@@ -2162,6 +2190,7 @@ impl TiledPanes {
                 let mut pane_grid = TiledPaneGrid::new(
                     &mut self.panes,
                     &self.panes_to_hide,
+                    self.dock.map(|dock| dock.pane_id),
                     *self.display_area.borrow(),
                     *self.viewport.borrow(),
                 );
@@ -2213,6 +2242,7 @@ impl TiledPanes {
                 let mut pane_grid = TiledPaneGrid::new(
                     &mut self.panes,
                     &self.panes_to_hide,
+                    self.dock.map(|dock| dock.pane_id),
                     *self.display_area.borrow(),
                     *self.viewport.borrow(),
                 );
@@ -2264,6 +2294,7 @@ impl TiledPanes {
                 let pane_grid = TiledPaneGrid::new(
                     &mut self.panes,
                     &self.panes_to_hide,
+                    self.dock.map(|dock| dock.pane_id),
                     *self.display_area.borrow(),
                     *self.viewport.borrow(),
                 );
@@ -2353,6 +2384,7 @@ impl TiledPanes {
             let pane_grid = TiledPaneGrid::new(
                 &mut self.panes,
                 &self.panes_to_hide,
+                self.dock.map(|dock| dock.pane_id),
                 *self.display_area.borrow(),
                 *self.viewport.borrow(),
             );
@@ -2418,6 +2450,7 @@ impl TiledPanes {
         let mut pane_grid = TiledPaneGrid::new(
             &mut self.panes,
             &self.panes_to_hide,
+            self.dock.map(|dock| dock.pane_id),
             *self.display_area.borrow(),
             *self.viewport.borrow(),
         );
@@ -2471,6 +2504,7 @@ impl TiledPanes {
         let pane_grid = TiledPaneGrid::new(
             &mut self.panes,
             &self.panes_to_hide,
+            self.dock.map(|dock| dock.pane_id),
             *self.display_area.borrow(),
             *self.viewport.borrow(),
         );
@@ -2522,6 +2556,7 @@ impl TiledPanes {
         let pane_grid = TiledPaneGrid::new(
             &mut self.panes,
             &self.panes_to_hide,
+            self.dock.map(|dock| dock.pane_id),
             *self.display_area.borrow(),
             *self.viewport.borrow(),
         );
@@ -2573,6 +2608,7 @@ impl TiledPanes {
         let mut pane_grid = TiledPaneGrid::new(
             &mut self.panes,
             &self.panes_to_hide,
+            self.dock.map(|dock| dock.pane_id),
             *self.display_area.borrow(),
             *self.viewport.borrow(),
         );
@@ -2669,6 +2705,7 @@ impl TiledPanes {
         let mut pane_grid = TiledPaneGrid::new(
             &mut self.panes,
             &self.panes_to_hide,
+            self.dock.map(|dock| dock.pane_id),
             *self.display_area.borrow(),
             *self.viewport.borrow(),
         );
@@ -2720,13 +2757,18 @@ impl TiledPanes {
                 pane.set_should_render(true);
                 pane.set_should_render_boundaries(true);
             }
+            let dock_pane_id = self.dock_pane_id();
             let viewport_pane_ids: Vec<_> = self
                 .panes
                 .keys()
                 .copied()
                 .into_iter()
                 .filter(|id| {
-                    !is_inside_viewport(&*self.viewport.borrow(), self.get_pane(*id).unwrap())
+                    Some(*id) != dock_pane_id
+                        && !is_inside_viewport(
+                            &*self.viewport.borrow(),
+                            self.get_pane(*id).unwrap(),
+                        )
                 })
                 .collect();
             for pid in viewport_pane_ids {
@@ -2753,8 +2795,15 @@ impl TiledPanes {
         if self.fullscreen_is_active.is_some() {
             self.unset_fullscreen();
         } else {
+            // A dock survives fullscreen: it is chrome that owns a band of the
+            // display, so the fullscreen pane fills the remaining space rather than
+            // covering it. (Note `is_inside_viewport` only tests the y axis, so a
+            // full-height dock would not be collected here anyway — but relying on
+            // that coincidence is how the previous sidebar ended up being hidden.)
+            let dock_pane_id = self.dock_pane_id();
             let pane_ids_to_hide = self.panes.iter().filter_map(|(&id, _pane)| {
                 if id != pane_id
+                    && Some(id) != dock_pane_id
                     && is_inside_viewport(&*self.viewport.borrow(), self.get_pane(id).unwrap())
                 {
                     Some(id)
@@ -2776,7 +2825,11 @@ impl TiledPanes {
                     .copied()
                     .into_iter()
                     .filter(|id| {
-                        !is_inside_viewport(&*self.viewport.borrow(), self.get_pane(*id).unwrap())
+                        Some(*id) != dock_pane_id
+                            && !is_inside_viewport(
+                                &*self.viewport.borrow(),
+                                self.get_pane(*id).unwrap(),
+                            )
                     })
                     .collect();
                 for pid in viewport_pane_ids {
@@ -2847,8 +2900,23 @@ impl TiledPanes {
     pub fn panes_to_hide_count(&self) -> usize {
         self.panes_to_hide.len()
     }
+    /// The number of panes a layout has to account for.
+    ///
+    /// A dock is not one of them: it is not a node in any `TiledPaneLayout`, so
+    /// counting it here would make this disagree with the number of leaf pane
+    /// nodes a layout declares — and `position_panes_in_space` pads or truncates
+    /// the layout tree to match this count. It also feeds swap-layout
+    /// `max_panes`/`min_panes`, which should be about content, not chrome.
     pub fn visible_panes_count(&self) -> usize {
-        self.panes.len().saturating_sub(self.panes_to_hide.len())
+        let dock_count = self
+            .dock
+            .as_ref()
+            .filter(|dock| !self.panes_to_hide.contains(&dock.pane_id))
+            .is_some() as usize;
+        self.panes
+            .len()
+            .saturating_sub(self.panes_to_hide.len())
+            .saturating_sub(dock_count)
     }
     pub fn add_to_hidden_panels(&mut self, pid: PaneId) {
         self.panes_to_hide.insert(pid);
@@ -2862,12 +2930,26 @@ impl TiledPanes {
     pub fn focus_all_panes(&mut self) {
         self.active_panes.focus_all_panes(&mut self.panes);
     }
+    /// Hand every pane over to a layout applier, **except the dock**.
+    ///
+    /// This is what keeps a relayout from touching the dock at all. If the dock
+    /// were drained, `ExistingTabState` would exact-match it by its `Run::Plugin`
+    /// and re-apply whatever width the layout slot happens to declare — silently
+    /// undoing a collapse the moment a pane is opened or the terminal is resized.
+    /// Keeping it out of the applier's hands is also why none of the four
+    /// `ExistingTabState` matchers need to know docks exist.
     pub fn drain(&mut self) -> BTreeMap<PaneId, Box<dyn Pane>> {
         self.unset_fullscreen();
-        match self.panes.iter().next().map(|(pid, _p)| *pid) {
+        let mut drained = match self.panes.iter().next().map(|(pid, _p)| *pid) {
             Some(first_pid) => self.panes.split_off(&first_pid),
             None => BTreeMap::new(),
+        };
+        if let Some(dock_pane_id) = self.dock_pane_id() {
+            if let Some(dock_pane) = drained.remove(&dock_pane_id) {
+                self.panes.insert(dock_pane_id, dock_pane);
+            }
         }
+        drained
     }
     pub fn active_panes(&self) -> ActivePanes {
         self.active_panes.clone()
@@ -2965,6 +3047,7 @@ impl TiledPanes {
         let pane_grid = TiledPaneGrid::new(
             &mut self.panes,
             &self.panes_to_hide,
+            self.dock.map(|dock| dock.pane_id),
             *self.display_area.borrow(),
             *self.viewport.borrow(),
         );
@@ -2975,6 +3058,7 @@ impl TiledPanes {
         let pane_grid = TiledPaneGrid::new(
             &mut self.panes,
             &self.panes_to_hide,
+            self.dock.map(|dock| dock.pane_id),
             *self.display_area.borrow(),
             *self.viewport.borrow(),
         );
@@ -2985,6 +3069,7 @@ impl TiledPanes {
         let pane_grid = TiledPaneGrid::new(
             &mut self.panes,
             &self.panes_to_hide,
+            self.dock.map(|dock| dock.pane_id),
             *self.display_area.borrow(),
             *self.viewport.borrow(),
         );
@@ -2994,6 +3079,7 @@ impl TiledPanes {
         let pane_grid = TiledPaneGrid::new(
             &mut self.panes,
             &self.panes_to_hide,
+            self.dock.map(|dock| dock.pane_id),
             *self.display_area.borrow(),
             *self.viewport.borrow(),
         );

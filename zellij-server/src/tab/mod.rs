@@ -3475,7 +3475,8 @@ impl Tab {
         self.suppressed_panes.iter()
     }
     fn get_selectable_tiled_panes(&self) -> impl Iterator<Item = (&PaneId, &Box<dyn Pane>)> {
-        self.get_tiled_panes().filter(|(_, p)| p.selectable())
+        self.get_tiled_panes()
+            .filter(|(_, p)| p.selectable() && !p.is_dock())
     }
     fn get_selectable_floating_panes(&self) -> impl Iterator<Item = (&PaneId, &Box<dyn Pane>)> {
         self.get_floating_panes().filter(|(_, p)| p.selectable())
@@ -3513,15 +3514,24 @@ impl Tab {
         tiled_panes_count + floating_panes_count + 1
     }
     pub fn has_selectable_panes(&self) -> bool {
-        let selectable_tiled_panes = self.tiled_panes.get_panes().filter(|(_, p)| p.selectable());
+        let selectable_tiled_panes = self
+            .tiled_panes
+            .get_panes()
+            .filter(|(_, p)| p.selectable() && !p.is_dock());
         let selectable_floating_panes = self
             .floating_panes
             .get_panes()
             .filter(|(_, p)| p.selectable());
         selectable_tiled_panes.count() > 0 || selectable_floating_panes.count() > 0
     }
+    /// Whether this tab still holds anything worth showing. `Screen` closes tabs
+    /// for which this is false, so a dock must not count — otherwise a tab whose
+    /// last content pane is closed would be kept alive by its chrome.
     pub fn has_selectable_tiled_panes(&self) -> bool {
-        let selectable_tiled_panes = self.tiled_panes.get_panes().filter(|(_, p)| p.selectable());
+        let selectable_tiled_panes = self
+            .tiled_panes
+            .get_panes()
+            .filter(|(_, p)| p.selectable() && !p.is_dock());
         selectable_tiled_panes.count() > 0
     }
     pub fn resize_whole_tab(&mut self, new_screen_size: Size) -> Result<()> {

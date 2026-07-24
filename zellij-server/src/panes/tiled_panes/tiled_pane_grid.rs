@@ -32,15 +32,21 @@ pub struct TiledPaneGrid<'a> {
 }
 
 impl<'a> TiledPaneGrid<'a> {
+    /// `dock_pane_id` is excluded from the grid entirely: a dock reserves a band
+    /// of the display that the solver is never told about, so it must not appear
+    /// as a pane to be solved, resized, or navigated to. The band itself is
+    /// accounted for by the caller, which passes a reduced `space` and a matching
+    /// `origin` to [`layout`](Self::layout).
     pub fn new(
         panes: impl IntoIterator<Item = (&'a PaneId, &'a mut Box<dyn Pane>)>,
         panes_to_hide: &HashSet<PaneId>,
+        dock_pane_id: Option<PaneId>,
         display_area: Size,
         viewport: Viewport,
     ) -> Self {
         let panes: HashMap<_, _> = panes
             .into_iter()
-            .filter(|(p_id, _)| !panes_to_hide.contains(p_id))
+            .filter(|(p_id, _)| !panes_to_hide.contains(p_id) && Some(**p_id) != dock_pane_id)
             .map(|(p_id, p)| (*p_id, p))
             .collect();
         TiledPaneGrid {
