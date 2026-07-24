@@ -910,6 +910,24 @@ impl Tab {
     pub fn set_dock_declaration(&mut self, dock_layout: DockLayout, mode: DockMode) {
         self.dock_declaration = Some((dock_layout, mode));
     }
+    /// Apply a dock mode decided by `Screen`. Idempotent; a no-op without a dock.
+    pub fn set_dock_mode(&mut self, mode: DockMode) {
+        if self.tiled_panes.dock_mode() == Some(mode) {
+            return;
+        }
+        // Keep the declaration in step, so a dock materialized later in this tab's
+        // life (eg. after an override layout) comes up in the current mode.
+        if let Some((_, declared_mode)) = self.dock_declaration.as_mut() {
+            *declared_mode = mode;
+        }
+        self.tiled_panes.set_dock_mode(mode);
+        self.set_force_render();
+        // The band moved, so cells the dock vacated have to be cleared.
+        self.set_should_clear_display_before_rendering();
+    }
+    pub fn dock_mode(&self) -> Option<DockMode> {
+        self.tiled_panes.dock_mode()
+    }
     pub fn apply_layout(
         &mut self,
         layout: TiledPaneLayout,
@@ -5737,28 +5755,6 @@ impl Tab {
             .any(|s_p| s_p.1.pid() == pane_id)
         {
             log::error!("Cannot resize suppressed panes");
-        }
-        Ok(())
-    }
-    pub fn resize_pane_id_to_fixed_width(&mut self, pane_id: PaneId, width: usize) -> Result<()> {
-        // Only tiled panes have a meaningful split width to fix; floating /
-        // suppressed panes are positioned independently, so this is a no-op for
-        // them (the docked rail this serves is always tiled).
-        if self.tiled_panes.panes_contain(&pane_id) {
-            let pane_is_selectable = self
-                .tiled_panes
-                .get_pane(pane_id)
-                .map(|pane| pane.selectable())
-                .unwrap_or(true);
-            if self.tiled_panes.set_pane_fixed_width(pane_id, width) {
-                // Like a regular resize, the split boundary moved: force a clean
-                // redraw so cells vacated by the shrunk pane are cleared.
-                if pane_is_selectable {
-                    self.swap_layouts.set_is_tiled_damaged();
-                }
-                self.set_force_render();
-                self.set_should_clear_display_before_rendering();
-            }
         }
         Ok(())
     }

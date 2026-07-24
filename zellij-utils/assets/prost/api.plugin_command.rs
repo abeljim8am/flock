@@ -3,7 +3,7 @@
 pub struct PluginCommand {
     #[prost(enumeration="CommandName", tag="1")]
     pub name: i32,
-    #[prost(oneof="plugin_command::Payload", tags="2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 60, 61, 62, 63, 64, 65, 66, 67, 68, 69, 70, 71, 72, 73, 74, 75, 76, 77, 78, 79, 80, 81, 82, 83, 84, 85, 86, 87, 88, 89, 90, 91, 92, 93, 94, 95, 96, 97, 98, 99, 100, 101, 102, 103, 104, 105, 106, 107, 108, 109, 110, 111, 112, 113, 114, 119, 120, 121, 122, 123, 124, 125, 126, 127, 128, 129, 130, 131, 132, 133, 134, 135, 136, 137, 138, 139, 140, 141, 142, 143, 144, 145, 146, 147, 148, 149, 150, 151, 152, 153, 154, 155, 156, 157, 158, 159, 160, 161, 162, 163, 164, 165, 166")]
+    #[prost(oneof="plugin_command::Payload", tags="2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 60, 61, 62, 63, 64, 65, 66, 67, 68, 69, 70, 71, 72, 73, 74, 75, 76, 77, 78, 79, 80, 81, 82, 83, 84, 85, 86, 87, 88, 89, 90, 91, 92, 93, 94, 95, 96, 97, 98, 99, 100, 101, 102, 103, 104, 105, 106, 107, 108, 109, 110, 111, 112, 113, 114, 119, 120, 121, 122, 123, 124, 125, 126, 127, 128, 129, 130, 131, 132, 133, 134, 135, 136, 137, 138, 139, 140, 141, 142, 143, 144, 145, 146, 147, 148, 149, 150, 151, 152, 153, 154, 155, 156, 157, 158, 159, 160, 161, 162, 163, 164, 165")]
     pub payload: ::core::option::Option<plugin_command::Payload>,
 }
 /// Nested message and enum types in `PluginCommand`.
@@ -311,10 +311,10 @@ pub mod plugin_command {
         DeleteDeadSessionAndReplyPayload(::prost::alloc::string::String),
         #[prost(message, tag="164")]
         PublishAgentStatePayload(super::PublishAgentStatePayload),
+        /// 166 was publish_dock_state_payload; do not reuse. (`reserved` is not valid
+        /// inside a oneof, hence the comment.)
         #[prost(message, tag="165")]
-        ResizePaneIdToFixedWidthPayload(super::ResizePaneIdToFixedWidthPayload),
-        #[prost(message, tag="166")]
-        PublishDockStatePayload(super::DockState),
+        SetDockModePayload(super::SetDockModePayload),
     }
 }
 #[allow(clippy::derive_partial_eq_without_eq)]
@@ -333,11 +333,9 @@ pub struct DockState {
 }
 #[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Clone, PartialEq, ::prost::Message)]
-pub struct ResizePaneIdToFixedWidthPayload {
-    #[prost(message, optional, tag="1")]
-    pub pane_id: ::core::option::Option<PaneId>,
-    #[prost(uint32, tag="2")]
-    pub width: u32,
+pub struct SetDockModePayload {
+    #[prost(uint32, tag="1")]
+    pub mode: u32,
 }
 #[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -2193,8 +2191,12 @@ pub enum CommandName {
     DeleteDeadSessionAndReply = 213,
     DeleteAllDeadSessionsAndReply = 214,
     PublishAgentState = 215,
-    ResizePaneIdToFixedWidth = 216,
-    PublishDockState = 217,
+    /// 216 was ResizePaneIdToFixedWidth: a plugin setting its own pane's exact
+    /// column count. Docks made it unnecessary — the server owns dock geometry, so
+    /// a plugin asks for a *mode* and the server decides the width. Reusing the
+    /// number rather than claiming a new one keeps the fork's wire surface from
+    /// growing.
+    SetDockMode = 216,
 }
 impl CommandName {
     /// String value of the enum field names used in the ProtoBuf definition.
@@ -2398,8 +2400,7 @@ impl CommandName {
             CommandName::DeleteDeadSessionAndReply => "DeleteDeadSessionAndReply",
             CommandName::DeleteAllDeadSessionsAndReply => "DeleteAllDeadSessionsAndReply",
             CommandName::PublishAgentState => "PublishAgentState",
-            CommandName::ResizePaneIdToFixedWidth => "ResizePaneIdToFixedWidth",
-            CommandName::PublishDockState => "PublishDockState",
+            CommandName::SetDockMode => "SetDockMode",
         }
     }
     /// Creates an enum from field names used in the ProtoBuf definition.
@@ -2600,8 +2601,7 @@ impl CommandName {
             "DeleteDeadSessionAndReply" => Some(Self::DeleteDeadSessionAndReply),
             "DeleteAllDeadSessionsAndReply" => Some(Self::DeleteAllDeadSessionsAndReply),
             "PublishAgentState" => Some(Self::PublishAgentState),
-            "ResizePaneIdToFixedWidth" => Some(Self::ResizePaneIdToFixedWidth),
-            "PublishDockState" => Some(Self::PublishDockState),
+            "SetDockMode" => Some(Self::SetDockMode),
             _ => None,
         }
     }

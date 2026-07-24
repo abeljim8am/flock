@@ -3693,11 +3693,6 @@ pub enum PluginCommand {
     OpenCommandPaneBackground(CommandToRun, Context),
     RerunCommandPane(u32), // u32  - terminal pane id
     ResizePaneIdWithDirection(ResizeStrategy, PaneId),
-    /// Set a pane's width to an exact column count, bypassing the increment /
-    /// percent-floor resize (which can't shrink a percent-sized pane below 5% of
-    /// the screen). The pane becomes fixed-width and siblings reflow to fill the
-    /// rest, the same way a layout `size=N` pane is laid out. u32 -> target cols.
-    ResizePaneIdToFixedWidth(PaneId, u32),
     EditScrollbackForPaneWithId(PaneId),
     GetPaneScrollback {
         pane_id: PaneId,
@@ -3860,10 +3855,14 @@ pub enum PluginCommand {
     /// it and surfaces it on `SessionInfo` so other sessions' sidebars can see
     /// it (the flock-sidebar Phase 7 cross-session agent view).
     PublishAgentState(BTreeMap<PaneId, PaneAgentStatus>),
-    /// Publish this session's dock mode to the server, which stores it and
-    /// surfaces it on `SessionInfo` so other sessions can follow the same
-    /// presentation mode.
-    PublishDockState(DockState),
+    /// Ask the server to put this session's dock in `mode`.
+    ///
+    /// Semantic and idempotent by design: the plugin says *what* it wants, the
+    /// server decides how many columns that is (clamped against the tab width),
+    /// applies it to every tab, stamps the timestamp, and republishes it on
+    /// `SessionInfo`. A plugin never sets a width, so it can never fight the
+    /// layout engine.
+    SetDockMode(DockMode),
 }
 
 // Response type for plugin API methods that open a pane in a new tab

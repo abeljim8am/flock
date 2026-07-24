@@ -34,7 +34,7 @@ use std::net::{IpAddr, Ipv4Addr};
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::str;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::route::NotificationEnd;
 
@@ -304,8 +304,8 @@ use crate::{
 };
 use zellij_utils::{
     data::{
-        Event, InputMode, ModeInfo, Palette, PaletteColor, PaneAgentStatus, PluginCapabilities,
-        Style,
+        DockMode, Event, InputMode, ModeInfo, Palette, PaletteColor, PaneAgentStatus,
+        PluginCapabilities, Style,
     },
     errors::{ContextType, ScreenContext},
     input::get_mode_info,
@@ -914,7 +914,6 @@ pub enum ScreenInstruction {
         BTreeMap<String, Duration>,    // resurrectable sessions - <name, created>
     ),
     PublishAgentState(BTreeMap<zellij_utils::data::PaneId, PaneAgentStatus>),
-    PublishDockState(zellij_utils::data::DockState),
     ReplacePane(
         PaneId,
         HoldForCommand,
@@ -974,7 +973,8 @@ pub enum ScreenInstruction {
     },
     RerunCommandPane(u32, Option<NotificationEnd>), // u32 - terminal pane id
     ResizePaneWithId(ResizeStrategy, PaneId),
-    ResizePaneIdToFixedWidth(PaneId, usize), // usize - target width in columns
+    SetDockMode(DockMode),
+    ToggleDock,
     EditScrollbackForPaneWithId(PaneId, Option<NotificationEnd>),
     WriteToPaneId(Vec<u8>, PaneId, Option<NotificationEnd>),
     Paste(Vec<u8>, Option<PaneId>, ClientId, Option<NotificationEnd>),
@@ -1300,7 +1300,6 @@ impl From<&ScreenInstruction> for ScreenContext {
             ScreenInstruction::BreakPaneLeft(..) => ScreenContext::BreakPaneLeft,
             ScreenInstruction::UpdateSessionInfos(..) => ScreenContext::UpdateSessionInfos,
             ScreenInstruction::PublishAgentState(..) => ScreenContext::PublishAgentState,
-            ScreenInstruction::PublishDockState(..) => ScreenContext::PublishDockState,
             ScreenInstruction::ReplacePane(..) => ScreenContext::ReplacePane,
             ScreenInstruction::NewInPlacePluginPane(..) => ScreenContext::NewInPlacePluginPane,
             ScreenInstruction::SerializeLayoutForResurrection => {
@@ -1314,9 +1313,8 @@ impl From<&ScreenInstruction> for ScreenContext {
             ScreenInstruction::Reconfigure { .. } => ScreenContext::Reconfigure,
             ScreenInstruction::RerunCommandPane { .. } => ScreenContext::RerunCommandPane,
             ScreenInstruction::ResizePaneWithId(..) => ScreenContext::ResizePaneWithId,
-            ScreenInstruction::ResizePaneIdToFixedWidth(..) => {
-                ScreenContext::ResizePaneIdToFixedWidth
-            },
+            ScreenInstruction::SetDockMode(..) => ScreenContext::SetDockMode,
+            ScreenInstruction::ToggleDock => ScreenContext::ToggleDock,
             ScreenInstruction::EditScrollbackForPaneWithId(..) => {
                 ScreenContext::EditScrollbackForPaneWithId
             },
@@ -4424,22 +4422,49 @@ impl Screen {
             log::error!("Failed to find pane with id: {:?} to resize", pane_id);
         }
     }
-    pub fn resize_pane_id_to_fixed_width(&mut self, pane_id: PaneId, width: usize) {
-        let mut found = false;
+    /// Put every tab's dock in `mode`.
+    ///
+    /// `Screen` is the single writer of dock state. That is what makes all tabs
+    /// agree, makes the operation idempotent, and means a plugin can converge on a
+    /// mode adopted from another session without racing anything.
+    pub fn set_dock_mode(&mut self, mode: DockMode) -> Result<()> {
+        let already_in_mode = self
+            .published_dock_state
+            .map(|state| state.mode == mode)
+            .unwrap_or(false);
+        if already_in_mode {
+            return Ok(());
+        }
         for tab in self.tabs.values_mut() {
-            if tab.has_pane_with_pid(&pane_id) {
-                tab.resize_pane_id_to_fixed_width(pane_id, width)
-                    .non_fatal();
-                found = true;
-                break;
-            }
+            tab.set_dock_mode(mode);
         }
-        if !found {
-            log::error!(
-                "Failed to find pane with id: {:?} to set fixed width",
-                pane_id
-            );
-        }
+        self.published_dock_state = Some(zellij_utils::data::DockState {
+            mode,
+            // Stamped server-side so cross-session convergence never depends on a
+            // plugin's clock.
+            updated_at_millis: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0),
+        });
+        self.log_and_report_session_state()?;
+        Ok(())
+    }
+    /// Flip every tab's dock between open and collapsed.
+    pub fn toggle_dock(&mut self) -> Result<()> {
+        let current = self
+            .published_dock_state
+            .map(|state| state.mode)
+            .or_else(|| {
+                // No mode established yet: take it from whatever a tab materialized.
+                self.tabs.values().find_map(|tab| tab.dock_mode())
+            })
+            .unwrap_or_default();
+        let next = match current {
+            DockMode::Open => DockMode::Closed,
+            DockMode::Closed => DockMode::Open,
+        };
+        self.set_dock_mode(next)
     }
     pub fn break_pane(
         &mut self,
@@ -8964,15 +8989,6 @@ pub(crate) fn screen_thread_main(
                     screen.log_and_report_session_state()?;
                 }
             },
-            ScreenInstruction::PublishDockState(dock_state) => {
-                // Same diff guard as agent state: a plugin may republish adopted
-                // state while converging, but unchanged values shouldn't rewrite
-                // session metadata.
-                if screen.published_dock_state != Some(dock_state) {
-                    screen.published_dock_state = Some(dock_state);
-                    screen.log_and_report_session_state()?;
-                }
-            },
             ScreenInstruction::UpdateAvailableLayouts(layouts, errors) => {
                 screen.update_available_layouts(layouts, errors);
             },
@@ -9257,10 +9273,14 @@ pub(crate) fn screen_thread_main(
                 // cells are cleared rather than left as garbage.
                 screen.render(None)?;
             },
-            ScreenInstruction::ResizePaneIdToFixedWidth(pane_id, width) => {
-                screen.resize_pane_id_to_fixed_width(pane_id, width);
-                // Repaint so the resize is reflected and a shrunk pane's vacated
-                // cells are cleared rather than left as garbage.
+            ScreenInstruction::SetDockMode(mode) => {
+                screen.set_dock_mode(mode)?;
+                // Repaint so the band change is reflected and the cells the dock
+                // vacated are cleared rather than left as garbage.
+                screen.render(None)?;
+            },
+            ScreenInstruction::ToggleDock => {
+                screen.toggle_dock()?;
                 screen.render(None)?;
             },
             ScreenInstruction::EditScrollbackForPaneWithId(pane_id, completion_tx) => {

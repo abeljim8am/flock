@@ -444,9 +444,7 @@ fn host_run_plugin_command(mut caller: Caller<'_, PluginEnv>) {
                     PluginCommand::PublishAgentState(agent_states) => {
                         publish_agent_state(env, agent_states)
                     },
-                    PluginCommand::PublishDockState(dock_state) => {
-                        publish_dock_state(env, dock_state)
-                    },
+                    PluginCommand::SetDockMode(mode) => set_dock_mode(env, mode),
                     PluginCommand::ScanHostFolder(folder_to_scan) => {
                         scan_host_folder(env, folder_to_scan)
                     },
@@ -481,9 +479,6 @@ fn host_run_plugin_command(mut caller: Caller<'_, PluginEnv>) {
                     },
                     PluginCommand::ResizePaneIdWithDirection(resize, pane_id) => {
                         resize_pane_with_id(env, resize, pane_id.into())
-                    },
-                    PluginCommand::ResizePaneIdToFixedWidth(pane_id, width) => {
-                        resize_pane_id_to_fixed_width(env, pane_id.into(), width as usize)
                     },
                     PluginCommand::EditScrollbackForPaneWithId(pane_id) => {
                         edit_scrollback_for_pane_with_id(env, pane_id.into())
@@ -3309,11 +3304,11 @@ fn publish_agent_state(
         .context("failed to publish agent state");
 }
 
-fn publish_dock_state(env: &PluginEnv, dock_state: zellij_utils::data::DockState) {
+fn set_dock_mode(env: &PluginEnv, mode: zellij_utils::data::DockMode) {
     let _ = env
         .senders
-        .send_to_screen(ScreenInstruction::PublishDockState(dock_state))
-        .context("failed to publish dock state");
+        .send_to_screen(ScreenInstruction::SetDockMode(mode))
+        .context("failed to set dock mode");
 }
 
 fn kill_sessions(session_names: Vec<String>) {
@@ -4019,12 +4014,6 @@ fn resize_pane_with_id(env: &PluginEnv, resize: ResizeStrategy, pane_id: PaneId)
     let _ = env
         .senders
         .send_to_screen(ScreenInstruction::ResizePaneWithId(resize, pane_id));
-}
-
-fn resize_pane_id_to_fixed_width(env: &PluginEnv, pane_id: PaneId, width: usize) {
-    let _ = env
-        .senders
-        .send_to_screen(ScreenInstruction::ResizePaneIdToFixedWidth(pane_id, width));
 }
 
 fn edit_scrollback_for_pane_with_id(env: &PluginEnv, pane_id: PaneId) {
@@ -5483,7 +5472,6 @@ fn check_command_permission(
         | PluginCommand::HidePaneWithId(..)
         | PluginCommand::RerunCommandPane(..)
         | PluginCommand::ResizePaneIdWithDirection(..)
-        | PluginCommand::ResizePaneIdToFixedWidth(..)
         | PluginCommand::CloseTabWithIndex(..)
         | PluginCommand::BreakPanesToNewTab(..)
         | PluginCommand::BreakPanesToTabWithIndex(..)
@@ -5521,7 +5509,7 @@ fn check_command_permission(
         | PluginCommand::HideFloatingPanes { .. }
         | PluginCommand::SetPaneRegexHighlights(..)
         | PluginCommand::PublishAgentState(..)
-        | PluginCommand::PublishDockState(..)
+        | PluginCommand::SetDockMode(..)
         | PluginCommand::ClearPaneHighlights(..) => PermissionType::ChangeApplicationState,
         PluginCommand::UnblockCliPipeInput(..)
         | PluginCommand::BlockCliPipeInput(..)
