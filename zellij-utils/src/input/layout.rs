@@ -692,6 +692,41 @@ pub type SwapFloatingLayout = (
     Option<String>,
 ); // Option<String> is the swap layout name
 
+/// The default expanded and collapsed widths of a dock, in columns, when the
+/// layout does not say.
+pub const DEFAULT_DOCK_OPEN_COLS: usize = 40;
+pub const DEFAULT_DOCK_CLOSED_COLS: usize = 5;
+
+/// A plugin pane pinned to the left edge of every tab, reserving a band of
+/// columns for itself.
+///
+/// A dock is deliberately *not* a node in any `TiledPaneLayout`: it does not
+/// count toward pane counts, it never occupies a swap-layout slot, and the
+/// tiling solver never sees it. The server owns its geometry and its
+/// open/closed mode; the plugin inside it only renders. Declared once per
+/// layout (session-wide), materialized once per tab.
+///
+/// Widths are fixed column counts rather than percentages because the
+/// collapsed rail has to land on an exact width to render its icon column.
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+pub struct DockLayout {
+    pub run: RunPluginOrAlias,
+    /// Columns when open. Layout property `size`.
+    pub open_cols: usize,
+    /// Columns when collapsed to a rail. Layout property `closed_size`.
+    pub closed_cols: usize,
+}
+
+impl DockLayout {
+    pub fn new(run: RunPluginOrAlias) -> Self {
+        DockLayout {
+            run,
+            open_cols: DEFAULT_DOCK_OPEN_COLS,
+            closed_cols: DEFAULT_DOCK_CLOSED_COLS,
+        }
+    }
+}
+
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq, Default)]
 pub struct Layout {
     pub tabs: Vec<(Option<String>, TiledPaneLayout, Vec<FloatingPaneLayout>)>,
@@ -700,6 +735,9 @@ pub struct Layout {
     pub swap_layouts: Vec<(TiledPaneLayout, Vec<FloatingPaneLayout>)>,
     pub swap_tiled_layouts: Vec<SwapTiledLayout>,
     pub swap_floating_layouts: Vec<SwapFloatingLayout>,
+    /// Session-wide dock declaration. Every tab materializes one dock pane from
+    /// it; `Screen` owns the shared open/closed mode.
+    pub dock: Option<DockLayout>,
 }
 
 /// Layout configuration for a single tab in multi-tab override
@@ -1817,6 +1855,9 @@ impl Layout {
                 }
             }
         }
+        if let Some(dock) = self.dock.as_mut() {
+            dock.run.populate_run_plugin_if_needed(plugin_aliases);
+        }
     }
     pub fn add_cwd_to_layout(&mut self, cwd: &PathBuf) {
         for (_, tiled_pane_layout, floating_panes) in self.tabs.iter_mut() {
@@ -1831,6 +1872,16 @@ impl Layout {
                 floating_pane.add_cwd_to_layout(&cwd);
             }
         }
+        // Deliberately not the dock: it is session chrome, not tab content, so it
+        // must not inherit the cwd a tab happens to be opened with. Otherwise the
+        // same dock declaration would resolve to a different plugin identity per
+        // tab (see `populate_run_plugin_if_needed`, which merges `caller_cwd` into
+        // the resolved configuration).
+    }
+    /// The dock's plugin, as a run instruction, so the plugin thread can preload a
+    /// `PluginId` for it alongside the tab's own panes.
+    pub fn dock_run_instruction(&self) -> Option<Run> {
+        self.dock.as_ref().map(|dock| Run::Plugin(dock.run.clone()))
     }
     pub fn pane_count(&self) -> usize {
         let mut pane_count = 0;

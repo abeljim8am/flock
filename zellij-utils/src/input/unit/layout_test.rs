@@ -2570,3 +2570,207 @@ fn flock_builtin_layout_loads_with_swap_layout() {
     )
     .unwrap();
 }
+
+fn dock_of(layout: &Layout) -> &DockLayout {
+    layout.dock.as_ref().expect("layout should have a dock")
+}
+
+#[test]
+fn layout_with_dock() {
+    let kdl_layout = r#"
+        layout {
+            dock size=40 closed_size=5 {
+                plugin location="zellij:status-bar"
+            }
+            pane
+        }
+    "#;
+    let layout = Layout::from_kdl(kdl_layout, Some("layout_file_name".into()), None, None).unwrap();
+    let dock = dock_of(&layout);
+    assert_eq!(dock.open_cols, 40);
+    assert_eq!(dock.closed_cols, 5);
+    // The dock must not also appear as a pane in the tab layout — that is the
+    // whole point: it cannot occupy a layout slot or be counted as a pane.
+    let template = layout.template.as_ref().unwrap();
+    assert_eq!(template.0.children.len(), 1);
+    assert_eq!(template.0.children[0].run, None);
+    assert_eq!(layout.pane_count(), 1);
+}
+
+#[test]
+fn layout_with_dock_defaults() {
+    let kdl_layout = r#"
+        layout {
+            dock {
+                plugin location="zellij:status-bar"
+            }
+            pane
+        }
+    "#;
+    let layout = Layout::from_kdl(kdl_layout, Some("layout_file_name".into()), None, None).unwrap();
+    let dock = dock_of(&layout);
+    assert_eq!(dock.open_cols, DEFAULT_DOCK_OPEN_COLS);
+    assert_eq!(dock.closed_cols, DEFAULT_DOCK_CLOSED_COLS);
+}
+
+#[test]
+fn layout_with_dock_plugin_configuration() {
+    let kdl_layout = r#"
+        layout {
+            dock {
+                plugin location="zellij:status-bar" {
+                    some_key "some_value"
+                }
+            }
+            pane
+        }
+    "#;
+    let layout = Layout::from_kdl(kdl_layout, Some("layout_file_name".into()), None, None).unwrap();
+    let configuration = dock_of(&layout)
+        .run
+        .get_run_plugin()
+        .expect("dock plugin should resolve to a run plugin")
+        .configuration;
+    assert_eq!(
+        configuration.inner().get("some_key").map(|v| v.as_str()),
+        Some("some_value")
+    );
+}
+
+#[test]
+fn layout_with_dock_alongside_explicit_tabs() {
+    // The dock is session-wide: declared once, and it does not conflict with
+    // explicit tab nodes the way a pane would.
+    let kdl_layout = r#"
+        layout {
+            dock {
+                plugin location="zellij:status-bar"
+            }
+            tab name="one" {
+                pane
+            }
+            tab name="two" {
+                pane
+            }
+        }
+    "#;
+    let layout = Layout::from_kdl(kdl_layout, Some("layout_file_name".into()), None, None).unwrap();
+    assert!(layout.dock.is_some());
+    assert_eq!(layout.tabs.len(), 2);
+}
+
+#[test]
+fn layout_with_two_docks_is_an_error() {
+    let kdl_layout = r#"
+        layout {
+            dock {
+                plugin location="zellij:status-bar"
+            }
+            dock {
+                plugin location="zellij:tab-bar"
+            }
+            pane
+        }
+    "#;
+    let error = Layout::from_kdl(kdl_layout, Some("layout_file_name".into()), None, None)
+        .expect_err("two docks should be rejected");
+    assert!(
+        format!("{:?}", error).contains("Only one dock node per layout allowed"),
+        "unexpected error: {:?}",
+        error
+    );
+}
+
+#[test]
+fn layout_with_dock_without_plugin_is_an_error() {
+    let kdl_layout = r#"
+        layout {
+            dock size=40
+            pane
+        }
+    "#;
+    assert!(Layout::from_kdl(kdl_layout, Some("layout_file_name".into()), None, None).is_err());
+}
+
+#[test]
+fn layout_with_dock_running_a_command_is_an_error() {
+    let kdl_layout = r#"
+        layout {
+            dock size=40 {
+                command "htop"
+            }
+            pane
+        }
+    "#;
+    assert!(Layout::from_kdl(kdl_layout, Some("layout_file_name".into()), None, None).is_err());
+}
+
+#[test]
+fn layout_with_dock_closed_size_larger_than_size_is_an_error() {
+    let kdl_layout = r#"
+        layout {
+            dock size=5 closed_size=40 {
+                plugin location="zellij:status-bar"
+            }
+            pane
+        }
+    "#;
+    assert!(Layout::from_kdl(kdl_layout, Some("layout_file_name".into()), None, None).is_err());
+}
+
+#[test]
+fn dock_inside_a_tab_is_an_error() {
+    let kdl_layout = r#"
+        layout {
+            tab {
+                dock {
+                    plugin location="zellij:status-bar"
+                }
+                pane
+            }
+        }
+    "#;
+    let error = Layout::from_kdl(kdl_layout, Some("layout_file_name".into()), None, None)
+        .expect_err("a nested dock should be rejected");
+    assert!(
+        format!("{:?}", error).contains("declare it once at the top level"),
+        "unexpected error: {:?}",
+        error
+    );
+}
+
+#[test]
+fn dock_inside_a_swap_layout_is_an_error() {
+    // Allowing this would reintroduce the bug the dock exists to kill: a
+    // relayout re-asserting the dock's declared width and undoing the toggle.
+    let kdl_layout = r#"
+        layout {
+            pane
+        }
+    "#;
+    let kdl_swap_layout = r#"
+        swap_tiled_layout name="vertical" {
+            tab max_panes=2 {
+                dock {
+                    plugin location="zellij:status-bar"
+                }
+                pane
+            }
+        }
+    "#;
+    let error = Layout::from_kdl(
+        kdl_layout,
+        Some("layout_file_name".into()),
+        Some(("layout_file_name.swap.kdl", kdl_swap_layout)),
+        None,
+    )
+    .expect_err("a dock inside a swap layout should be rejected");
+    // The swap-layout document is parsed by its own tab parser, which rejects the
+    // node as an invalid tab property rather than reaching `assert_no_nested_dock`.
+    // Either way it must name the offending node so the message is actionable.
+    assert!(
+        format!("{:?}", error).contains("dock"),
+        "unexpected error: {:?}",
+        error
+    );
+}
