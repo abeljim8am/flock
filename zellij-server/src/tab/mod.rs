@@ -57,12 +57,15 @@ use std::{
     str,
 };
 use zellij_utils::{
-    data::{Event, FloatingPaneCoordinates, InputMode, ModeInfo, Palette, PaletteColor, Styling},
+    data::{
+        DockMode, Event, FloatingPaneCoordinates, InputMode, ModeInfo, Palette, PaletteColor,
+        Styling,
+    },
     input::{
         command::TerminalAction,
         layout::{
-            FloatingPaneLayout, Run, RunPluginOrAlias, SwapFloatingLayout, SwapTiledLayout,
-            TiledPaneLayout,
+            DockLayout, FloatingPaneLayout, Run, RunPluginOrAlias, SwapFloatingLayout,
+            SwapTiledLayout, TiledPaneLayout,
         },
         parse_keys,
     },
@@ -200,6 +203,10 @@ pub(crate) struct Tab {
     pending_instructions: Vec<BufferedTabInstruction>, // instructions that came while the tab was
     // pending and need to be re-applied
     swap_layouts: SwapLayouts,
+    /// The session-wide dock declaration this tab should materialize, and the mode
+    /// to materialize it in. Set by `Screen` (the single owner of the mode) before
+    /// the layout is applied; `None` when the layout declares no dock.
+    dock_declaration: Option<(DockLayout, DockMode)>,
     default_shell: PathBuf,
     default_editor: Option<PathBuf>,
     debug: bool,
@@ -869,6 +876,7 @@ impl Tab {
             is_pending: true, // will be switched to false once the layout is applied
             pending_instructions: vec![],
             swap_layouts,
+            dock_declaration: None,
             default_shell,
             debug,
             arrow_fonts,
@@ -897,18 +905,52 @@ impl Tab {
         }
     }
 
+    /// The dock declaration this tab materializes, and the mode to do it in.
+    /// `Screen` owns the mode, so it sets this before applying the layout.
+    pub fn set_dock_declaration(&mut self, dock_layout: DockLayout, mode: DockMode) {
+        self.dock_declaration = Some((dock_layout, mode));
+    }
     pub fn apply_layout(
         &mut self,
         layout: TiledPaneLayout,
         floating_panes_layout: Vec<FloatingPaneLayout>,
         new_terminal_ids: Vec<(u32, HoldForCommand)>,
         new_floating_terminal_ids: Vec<(u32, HoldForCommand)>,
-        new_plugin_ids: HashMap<RunPluginOrAlias, Vec<u32>>,
+        mut new_plugin_ids: HashMap<RunPluginOrAlias, Vec<u32>>,
         client_id: ClientId,
         blocking_terminal: Option<(u32, NotificationEnd)>,
     ) -> Result<()> {
         self.swap_layouts
             .set_base_layout((layout.clone(), floating_panes_layout.clone()));
+        // Before the tiled layout, so the band is already reserved and the layout is
+        // positioned beside the dock rather than underneath it.
+        if let Some((dock_layout, dock_mode)) = self.dock_declaration.clone() {
+            LayoutApplier::new(
+                &self.viewport,
+                &self.senders,
+                &self.sixel_image_store,
+                &self.link_handler,
+                &self.terminal_emulator_colors,
+                &self.terminal_emulator_color_codes,
+                &self.character_cell_size,
+                &self.connected_clients_in_app,
+                &self.style,
+                &self.display_area,
+                &mut self.tiled_panes,
+                &mut self.floating_panes,
+                self.draw_pane_frames,
+                &mut self.focus_pane_id,
+                &self.os_api,
+                self.debug,
+                self.arrow_fonts,
+                self.styled_underlines,
+                self.osc8_hyperlinks,
+                self.explicitly_disable_kitty_keyboard_protocol,
+                None,
+            )
+            .apply_dock(&dock_layout, dock_mode, &mut new_plugin_ids)
+            .non_fatal();
+        }
         match LayoutApplier::new(
             &self.viewport,
             &self.senders,

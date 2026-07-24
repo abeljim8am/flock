@@ -17,10 +17,12 @@ use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap};
 use std::rc::Rc;
 use zellij_utils::{
-    data::{Palette, Style},
-    input::layout::{FloatingPaneLayout, Run, RunPluginOrAlias, TiledPaneLayout},
+    data::{DockMode, Palette, Style},
+    input::layout::{DockLayout, FloatingPaneLayout, Run, RunPluginOrAlias, TiledPaneLayout},
     pane_size::{PaneGeom, Size, SizeInPixels, Viewport},
 };
+
+use crate::panes::DockedPane;
 
 pub struct LayoutApplier<'a> {
     viewport: Rc<RefCell<Viewport>>, // includes all non-UI panes
@@ -156,6 +158,70 @@ impl<'a> LayoutApplier<'a> {
         )?;
         let should_show_floating_panes = layout_has_floating_panes && !hide_floating_panes;
         return Ok(should_show_floating_panes);
+    }
+    /// Materialize this tab's dock from the layout's `dock` declaration.
+    ///
+    /// Must run *before* `apply_tiled_panes_layout`, so that
+    /// `total_space_for_tiled_panes` already sees the reserved band and positions
+    /// the layout beside it rather than underneath it.
+    ///
+    /// Idempotent: a tab that already has a dock pane keeps it. Nothing here looks
+    /// the dock up by plugin URL, which is what makes a duplicate structurally
+    /// impossible.
+    pub fn apply_dock(
+        &mut self,
+        dock: &DockLayout,
+        mode: DockMode,
+        new_plugin_ids: &mut HashMap<RunPluginOrAlias, Vec<u32>>,
+    ) -> Result<()> {
+        let err_context = || format!("Failed to apply dock");
+        if self.tiled_panes.dock_pane_id().is_some() {
+            // Already materialized; only the mode can change, and `Screen` owns that.
+            self.tiled_panes.reserve_dock_band();
+            return Ok(());
+        }
+        let pid = new_plugin_ids
+            .get_mut(&dock.run)
+            .and_then(|ids| ids.pop())
+            .with_context(err_context)?;
+        let mut dock_pane = PluginPane::new(
+            pid,
+            PaneGeom::default(),
+            self.senders
+                .to_plugin
+                .as_ref()
+                .with_context(err_context)?
+                .clone(),
+            dock.run.location_string(),
+            String::new(),
+            self.sixel_image_store.clone(),
+            self.terminal_emulator_colors.clone(),
+            self.terminal_emulator_color_codes.clone(),
+            self.link_handler.clone(),
+            self.character_cell_size.clone(),
+            self.connected_clients.borrow().keys().copied().collect(),
+            self.style,
+            Some(Run::Plugin(dock.run.clone())),
+            self.debug,
+            self.arrow_fonts,
+            self.styled_underlines,
+        );
+        // A dock draws its own edge if it wants one, is never focusable, and is
+        // marked so every tiling path can skip it.
+        dock_pane.set_borderless(true);
+        dock_pane.set_selectable(false);
+        dock_pane.set_is_dock(true);
+        let pane_id = PaneId::Plugin(pid);
+        self.tiled_panes
+            .add_pane_with_existing_geom(pane_id, Box::new(dock_pane));
+        self.tiled_panes.set_dock(DockedPane {
+            pane_id,
+            mode,
+            open_cols: dock.open_cols,
+            closed_cols: dock.closed_cols,
+        });
+        self.tiled_panes.reserve_dock_band();
+        Ok(())
     }
     pub fn apply_tiled_panes_layout_to_existing_panes(
         &mut self,

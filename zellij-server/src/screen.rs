@@ -3311,10 +3311,22 @@ impl Screen {
         };
 
         // apply the layout to the new tab
+        let dock_declaration = self.default_layout.dock.clone().map(|dock_layout| {
+            // `Screen` is the single owner of the mode, so every tab — including one
+            // created while the dock is collapsed — materializes in the same state.
+            let mode = self
+                .published_dock_state
+                .map(|dock_state| dock_state.mode)
+                .unwrap_or_default();
+            (dock_layout, mode)
+        });
         self.tabs
             .get_mut(&tab_id)
             .context("couldn't find tab with index {tab_id}")
             .and_then(|tab| {
+                if let Some((dock_layout, dock_mode)) = dock_declaration {
+                    tab.set_dock_declaration(dock_layout, dock_mode);
+                }
                 tab.apply_layout(
                     layout,
                     floating_panes_layout,
