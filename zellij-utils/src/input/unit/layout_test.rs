@@ -2538,10 +2538,20 @@ fn tiled_pane_still_rejects_zero_percent() {
 
 #[test]
 fn flock_bundled_layout_parses() {
-    // The bundled flock layout (slim docked flock-sidebar rail beside a content
-    // pane); make sure it parses as shipped.
+    // The bundled flock layout: the sidebar as a dock beside a content pane.
     let kdl_layout = include_str!("../../../assets/layouts/flock.kdl");
-    Layout::from_kdl(kdl_layout, Some("flock.kdl".into()), None, None).unwrap();
+    let layout = Layout::from_kdl(kdl_layout, Some("flock.kdl".into()), None, None).unwrap();
+    let dock = layout
+        .dock
+        .as_ref()
+        .expect("the bundled flock layout declares a dock");
+    assert_eq!(dock.open_cols, 40);
+    assert_eq!(dock.closed_cols, 5);
+    // The rail only renders below the sidebar's 16-column label threshold.
+    assert!(dock.closed_cols < 16, "closed_size must fall in the rail");
+    // Exactly the content pane, the tab-bar and the status-bar — the dock is not
+    // one of them, so swap-layout pane constraints count only real panes.
+    assert_eq!(layout.pane_count(), 3);
 }
 
 #[test]

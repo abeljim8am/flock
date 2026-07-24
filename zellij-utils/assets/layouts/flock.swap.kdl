@@ -1,32 +1,35 @@
+// The dock is declared once in flock.kdl and is deliberately absent here: a swap
+// layout must not describe it, or re-applying one would re-assert its width and
+// undo the user's toggle. The parser rejects a `dock` node inside a swap layout
+// for that reason.
+//
+// `max_panes`/`min_panes` count content panes plus the tab-bar and status-bar —
+// but not the dock, since `visible_panes_count` excludes it. They are one lower
+// than they would have been when the sidebar was a pane.
 tab_template name="flock_ui" {
    pane size=1 borderless=true {
        plugin location="tab-bar"
    }
-   pane split_direction="vertical" {
-       pane size=40 borderless=true {
-           plugin location="zellij:flock-sidebar"
-       }
-       children
-   }
+   children
    pane size=2 borderless=true {
        plugin location="status-bar"
    }
 }
 
 swap_tiled_layout name="vertical" {
-    flock_ui max_panes=6 {
+    flock_ui max_panes=5 {
         pane split_direction="vertical" {
             pane
             pane { children; }
         }
     }
-    flock_ui max_panes=9 {
+    flock_ui max_panes=8 {
         pane split_direction="vertical" {
             pane { children; }
             pane { pane; pane; pane; pane; }
         }
     }
-    flock_ui max_panes=13 {
+    flock_ui max_panes=12 {
         pane split_direction="vertical" {
             pane { children; }
             pane { pane; pane; pane; pane; }
@@ -36,17 +39,17 @@ swap_tiled_layout name="vertical" {
 }
 
 swap_tiled_layout name="horizontal" {
-    flock_ui max_panes=5 {
+    flock_ui max_panes=4 {
         pane
         pane
     }
-    flock_ui max_panes=9 {
+    flock_ui max_panes=8 {
         pane {
             pane split_direction="vertical" { children; }
             pane split_direction="vertical" { pane; pane; pane; pane; }
         }
     }
-    flock_ui max_panes=13 {
+    flock_ui max_panes=12 {
         pane {
             pane split_direction="vertical" { children; }
             pane split_direction="vertical" { pane; pane; pane; pane; }
@@ -56,7 +59,7 @@ swap_tiled_layout name="horizontal" {
 }
 
 swap_tiled_layout name="stacked" {
-    flock_ui min_panes=6 {
+    flock_ui min_panes=5 {
         pane split_direction="vertical" {
             pane
             pane stacked=true { children; }
