@@ -5,6 +5,8 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
 
 ## [Unreleased]
+
+## [26.7.0] - 2026-07-24
 * feat(dock)!: redesign the flock sidebar as a first-class `dock` — a layout-level
   declaration (`dock size=40 closed_size=5 { plugin location="…" }`) for a plugin
   pinned to the left edge, excluded from pane counts, swap layouts, relayout
@@ -25,6 +27,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
     layout that has both a dock and a pane running the dock's plugin drops the pane.
   * **Breaking (session metadata):** the persisted node is `dock_state`, not
     `flock_sidebar_state`.
+* refactor(remote-agent)!: own agent presence with process liveness (daemon tracks a
+  specific pid per remote pane; screen scraping can no longer revoke hook-reported
+  presence; protocol v3 with no back-compat — remote panes must close once to respawn
+  the daemon)
 * fix(ui): compare a pane's right edge against `viewport.x + viewport.cols` rather
   than `viewport.cols` when drawing right boundaries and computing content offsets
   (dormant until something insets the viewport horizontally).
