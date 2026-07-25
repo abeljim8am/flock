@@ -81,6 +81,9 @@ const SPINNER_SECS: f64 = 0.12;
 /// same session from the sidebar's workspace list.
 const SELECTOR_SESSION_NAME: &str = "flock-selector";
 
+/// Context key tagging a `Ctrl-r` reinstall with the host it targets.
+const REINSTALL_CONTEXT_KEY: &str = "flock_remote_reinstall";
+
 #[derive(Default)]
 struct State {
     /// Granted once our permission request resolves; until then we can't scan or
@@ -172,6 +175,29 @@ struct State {
     ssh_error: Option<String>,
     /// Progress notice while an SSH bootstrap runs.
     ssh_notice: Option<String>,
+    /// An open that would change something on the remote, waiting on its `y`.
+    pending_start: Option<PendingStart>,
+    /// Host or workspace a Ctrl-r reinstall is running against.
+    pending_reinstall: Option<String>,
+}
+
+/// An open that has been resolved but not yet run, because running it would
+/// start or install something on the far end. Holding the resolved session name
+/// and previous session here means answering `y` performs exactly the open that
+/// was described, with no chance of re-resolving to something else.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PendingStart {
+    /// The confirm row's text, already phrased for the specific cost.
+    prompt: String,
+    target: PendingStartTarget,
+    session_name: String,
+    previous_session: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PendingStartTarget {
+    Coder { identifier: String },
+    Ssh { host: ssh::SshHost },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -278,18 +304,52 @@ mod tests {
         state.handle_ssh_wizard_key(KeyWithModifier::new(BareKey::Backspace));
         assert_eq!(state.ssh_wizard.as_ref().unwrap().name, "de");
         state.handle_ssh_wizard_key(KeyWithModifier::new(BareKey::Char('v')));
-        state.handle_ssh_wizard_key(KeyWithModifier::new(BareKey::Enter));
+
+        // Down moves between fields without validating, so a half-filled form
+        // can be navigated freely.
+        state.handle_ssh_wizard_key(KeyWithModifier::new(BareKey::Down));
         assert_eq!(
             state.ssh_wizard.as_ref().unwrap().phase,
             ssh::HostPhase::Destination
         );
-        state.handle_ssh_wizard_key(KeyWithModifier::new(BareKey::Enter));
-        assert!(state.ssh_wizard.as_ref().unwrap().error.is_some());
-        state.handle_ssh_wizard_key(KeyWithModifier::new(BareKey::Esc));
+        state.handle_ssh_wizard_key(KeyWithModifier::new(BareKey::Up));
         assert_eq!(
             state.ssh_wizard.as_ref().unwrap().phase,
             ssh::HostPhase::Name
         );
+
+        // Enter saves from any field; an invalid destination fails and pulls
+        // focus to the field at fault rather than the one we typed in.
+        state.handle_ssh_wizard_key(KeyWithModifier::new(BareKey::Enter));
+        let wizard = state.ssh_wizard.as_ref().expect("still open");
+        assert!(wizard.error.is_some());
+        assert_eq!(wizard.phase, ssh::HostPhase::Destination);
+
+        for character in "abel@dev.example.com".chars() {
+            state.handle_ssh_wizard_key(KeyWithModifier::new(BareKey::Char(character)));
+        }
+        state.handle_ssh_wizard_key(KeyWithModifier::new(BareKey::Enter));
+        assert!(state.ssh_wizard.is_none());
+        assert_eq!(state.ssh_hosts.len(), 1);
+        assert_eq!(state.ssh_hosts[0].name, "dev");
+        assert_eq!(state.ssh_hosts[0].destination, "abel@dev.example.com");
+    }
+
+    #[test]
+    fn esc_leaves_the_host_form_from_any_field() {
+        // There are no phases to unwind any more: every field is on screen, so
+        // Esc means cancel wherever the cursor is.
+        let mut state = State {
+            permissions_granted: true,
+            mode: PickerMode::Ssh,
+            config: SelectorConfig {
+                ssh_enabled: true,
+                ..SelectorConfig::default()
+            },
+            ssh_wizard: Some(ssh::HostWizard::add()),
+            ..State::default()
+        };
+        state.handle_ssh_wizard_key(KeyWithModifier::new(BareKey::Down));
         state.handle_ssh_wizard_key(KeyWithModifier::new(BareKey::Esc));
         assert!(state.ssh_wizard.is_none());
     }
@@ -319,6 +379,87 @@ mod tests {
         assert!(state.request_ssh_delete());
         state.handle_ssh_delete_key(KeyWithModifier::new(BareKey::Char('y')));
         assert!(state.ssh_hosts.is_empty());
+    }
+
+    fn ssh_state_with_one_host() -> State {
+        State {
+            permissions_granted: true,
+            mode: PickerMode::Ssh,
+            config: SelectorConfig {
+                ssh_enabled: true,
+                ..SelectorConfig::default()
+            },
+            ssh_hosts: vec![ssh::SshHost {
+                name: "dev".into(),
+                destination: "abel@dev.example.com".into(),
+                extra_args: Vec::new(),
+            }],
+            ..State::default()
+        }
+    }
+
+    #[test]
+    fn opening_an_ssh_host_asks_before_installing_anything() {
+        let mut state = ssh_state_with_one_host();
+        state.confirm_ssh_selection();
+        let pending = state.pending_start.as_ref().expect("a confirm");
+        // The prompt names the host and the cost, and nothing has run yet.
+        assert!(pending.prompt.starts_with("connect to dev?"));
+        assert!(pending.prompt.contains("installs the flock agent"));
+        assert!(state.pending_ssh_open.is_none());
+
+        // Anything other than `y` backs out without touching the far end.
+        state.handle_pending_start_key(KeyWithModifier::new(BareKey::Char('n')));
+        assert!(state.pending_start.is_none());
+        assert!(state.pending_ssh_open.is_none());
+    }
+
+    #[test]
+    fn only_an_open_that_changes_the_remote_is_gated() {
+        // The gate keys on the same Create/Switch split the picker already
+        // resolves: Switch runs no remote command, so it must not be gated —
+        // a prompt there would be friction on the picker's hottest path.
+        let mut state = ssh_state_with_one_host();
+        let host = state.selected_ssh_host().expect("the host");
+        assert!(matches!(
+            ssh::resolve_open(&host, &state.existing_ssh_sessions()),
+            coder::OpenAction::Create { .. }
+        ));
+
+        state.sessions = vec![SessionInfo {
+            name: "dev".into(),
+            remote_backend: Some(RemoteBackend::Ssh {
+                name: "dev".into(),
+                destination: "abel@dev.example.com".into(),
+                extra_args: Vec::new(),
+                local_session_id: String::new(),
+            }),
+            ..SessionInfo::default()
+        }];
+        assert!(matches!(
+            ssh::resolve_open(&host, &state.existing_ssh_sessions()),
+            coder::OpenAction::Switch { .. }
+        ));
+    }
+
+    #[test]
+    fn a_confirm_freezes_the_open_it_described() {
+        // Holding the resolved session name and host means answering `y` opens
+        // exactly what the prompt named, even if the list moved underneath it.
+        let mut state = ssh_state_with_one_host();
+        state.confirm_ssh_selection();
+        let pending = state.pending_start.as_ref().expect("a confirm");
+        assert_eq!(
+            pending.target,
+            PendingStartTarget::Ssh {
+                host: ssh::SshHost {
+                    name: "dev".into(),
+                    destination: "abel@dev.example.com".into(),
+                    extra_args: Vec::new(),
+                }
+            }
+        );
+        assert!(!pending.session_name.is_empty());
     }
 
     #[test]
@@ -587,6 +728,32 @@ impl ZellijPlugin for State {
                     // with reality.
                     self.fire_codespace_list();
                     should_render = true;
+                } else if let Some(target) = context.get(REINSTALL_CONTEXT_KEY) {
+                    self.pending_reinstall = None;
+                    let notice = if exit_code == Some(0) {
+                        format!("Reinstalled the flock agent on {target}")
+                    } else {
+                        remote_bootstrap::classify_bootstrap_failure(
+                            exit_code,
+                            &String::from_utf8_lossy(&stderr),
+                        )
+                        .describe(target)
+                    };
+                    // Report on whichever tab asked, using that tab's own line.
+                    if self.mode == PickerMode::Ssh {
+                        if exit_code == Some(0) {
+                            self.ssh_notice = Some(notice);
+                            self.ssh_error = None;
+                        } else {
+                            self.ssh_error = Some(notice);
+                        }
+                    } else if exit_code == Some(0) {
+                        self.coder_create_notice = Some(notice);
+                        self.coder_error = None;
+                    } else {
+                        self.coder_error = Some(coder::CoderError::Other(notice));
+                    }
+                    should_render = true;
                 } else if self.config.coder_enabled
                     && context.contains_key(coder::BOOTSTRAP_CONTEXT_KEY)
                 {
@@ -605,14 +772,16 @@ impl ZellijPlugin for State {
                         }
                     } else {
                         self.coder_create_notice = None;
+                        let host = context
+                            .get(coder::BOOTSTRAP_CONTEXT_KEY)
+                            .map(String::as_str)
+                            .unwrap_or("the workspace");
                         self.coder_error = Some(coder::CoderError::Other(
-                            String::from_utf8_lossy(&stderr)
-                                .lines()
-                                .rev()
-                                .find(|line| !line.trim().is_empty())
-                                .unwrap_or("remote Zellij bootstrap failed")
-                                .trim()
-                                .to_owned(),
+                            remote_bootstrap::classify_bootstrap_failure(
+                                exit_code,
+                                &String::from_utf8_lossy(&stderr),
+                            )
+                            .describe(host),
                         ));
                     }
                     should_render = true;
@@ -634,14 +803,16 @@ impl ZellijPlugin for State {
                             close_self();
                         }
                     } else {
+                        let host = context
+                            .get(ssh::BOOTSTRAP_CONTEXT_KEY)
+                            .map(String::as_str)
+                            .unwrap_or("the host");
                         self.ssh_error = Some(
-                            String::from_utf8_lossy(&stderr)
-                                .lines()
-                                .rev()
-                                .find(|line| !line.trim().is_empty())
-                                .unwrap_or("remote Zellij bootstrap failed")
-                                .trim()
-                                .to_owned(),
+                            remote_bootstrap::classify_bootstrap_failure(
+                                exit_code,
+                                &String::from_utf8_lossy(&stderr),
+                            )
+                            .describe(host),
                         );
                     }
                     should_render = true;
@@ -776,6 +947,7 @@ impl ZellijPlugin for State {
         let ssh_results = ssh::rank(&self.ssh_hosts, &self.query);
         let bound_ssh_destinations = self.bound_ssh_destinations();
         let enabled_modes = self.enabled_modes();
+        let remote_agent_versions = self.remote_agent_versions();
 
         let output = ui::render(ui::RenderInput {
             permissions_granted: self.permissions_granted,
@@ -799,6 +971,10 @@ impl ZellijPlugin for State {
             pending_coder_stop: self.pending_coder_stop.as_deref(),
             coder_create: self.coder_create.as_ref(),
             coder_create_notice: self.coder_create_notice.as_deref(),
+            pending_start: self.pending_start.as_ref().map(|p| p.prompt.as_str()),
+            pending_reinstall: self.pending_reinstall.as_deref(),
+            remote_agent_versions: &remote_agent_versions,
+            local_version: VERSION,
             ssh_results: &ssh_results,
             bound_ssh_destinations: &bound_ssh_destinations,
             ssh_wizard: self.ssh_wizard.as_ref(),
@@ -945,6 +1121,9 @@ impl State {
         if self.pending_ssh_delete.is_some() {
             return self.handle_ssh_delete_key(key);
         }
+        if self.pending_start.is_some() {
+            return self.handle_pending_start_key(key);
+        }
         if self.pending_coder_open.is_some() || self.pending_ssh_open.is_some() {
             return true;
         }
@@ -1040,6 +1219,9 @@ impl State {
                         return true;
                     }
                     return false;
+                },
+                BareKey::Char('r') if matches!(self.mode, PickerMode::Coder | PickerMode::Ssh) => {
+                    return self.reinstall_selected_remote();
                 },
                 _ => return false,
             }
@@ -1384,6 +1566,30 @@ impl State {
             .collect()
     }
 
+    /// The agent build running on each bound remote, keyed by the identifier
+    /// its row is listed under. Reported by the bridge as pane health, so a
+    /// remote that has drifted behind is visible before you open it — and the
+    /// row can say so rather than leaving the discovery to the sidebar after
+    /// the fact.
+    fn remote_agent_versions(&self) -> BTreeMap<String, String> {
+        let mut versions = BTreeMap::new();
+        for session in &self.sessions {
+            let key = match &session.remote_backend {
+                Some(RemoteBackend::Coder { workspace, .. }) => workspace.clone(),
+                Some(RemoteBackend::Ssh { destination, .. }) => destination.clone(),
+                _ => continue,
+            };
+            if let Some(version) = session
+                .remote_panes
+                .values()
+                .find_map(|pane| pane.health.daemon_version.clone())
+            {
+                versions.insert(key, version);
+            }
+        }
+        versions
+    }
+
     fn existing_coder_sessions(&self) -> Vec<coder::ExistingSession> {
         self.sessions
             .iter()
@@ -1584,10 +1790,41 @@ impl State {
                 self.discard_throwaway_session(current_session_name.as_deref());
             },
             coder::OpenAction::Create { name } => {
-                self.pending_coder_open = Some(PendingCoderOpen {
-                    identifier: identifier.clone(),
+                // Opening a Coder workspace runs `coder ssh --wait yes`, which
+                // starts a stopped workspace and blocks until it is fully up.
+                // That provisions compute, so it is asked about rather than
+                // simply done. Switching to a live session changes nothing on
+                // the far end and stays a single keypress.
+                let prompt = if workspace.state_kind() == coder::StateKind::Running {
+                    format!("connect to {identifier}?  installs the flock agent if it is missing")
+                } else {
+                    format!("start {identifier} and connect?  the workspace is not running")
+                };
+                self.pending_start = Some(PendingStart {
+                    prompt,
+                    target: PendingStartTarget::Coder {
+                        identifier: identifier.clone(),
+                    },
                     session_name: name,
                     previous_session: current_session_name,
+                });
+                return;
+            },
+        }
+        close_self();
+    }
+
+    /// Run the open the user just confirmed.
+    fn start_pending(&mut self) {
+        let Some(pending) = self.pending_start.take() else {
+            return;
+        };
+        match pending.target {
+            PendingStartTarget::Coder { identifier } => {
+                self.pending_coder_open = Some(PendingCoderOpen {
+                    identifier: identifier.clone(),
+                    session_name: pending.session_name,
+                    previous_session: pending.previous_session,
                 });
                 self.coder_create_notice = Some(format!(
                     "Preparing persistent session in {} — waiting for workspace setup…",
@@ -1596,11 +1833,96 @@ impl State {
                 let argv = coder::bootstrap_argv(&identifier, self.remote_agent_binary.as_deref());
                 let refs: Vec<&str> = argv.iter().map(String::as_str).collect();
                 run_command(&refs, coder::bootstrap_context(&identifier));
-                self.arm_spinner_timer();
-                return;
+            },
+            PendingStartTarget::Ssh { host } => {
+                self.ssh_error = None;
+                self.ssh_notice = Some(format!(
+                    "Preparing persistent session on {}…",
+                    host.destination
+                ));
+                let argv = ssh::bootstrap_argv(&host, self.remote_agent_binary.as_deref());
+                let refs: Vec<&str> = argv.iter().map(String::as_str).collect();
+                run_command(&refs, ssh::bootstrap_context(&host.destination));
+                self.pending_ssh_open = Some(PendingSshOpen {
+                    host,
+                    session_name: pending.session_name,
+                    previous_session: pending.previous_session,
+                });
             },
         }
-        close_self();
+        self.arm_spinner_timer();
+    }
+
+    /// Reinstall the remote agent on the selected host (`Ctrl-r`). This is the
+    /// manual escape hatch for when health detection is wrong, or a remote is
+    /// wedged on a binary that the normal bootstrap would skip re-fetching
+    /// because its version directory already exists.
+    fn reinstall_selected_remote(&mut self) -> bool {
+        if self.pending_reinstall.is_some() {
+            return false;
+        }
+        let Some(executable) = self.flock_executable.clone() else {
+            return false;
+        };
+        let mut argv = vec![
+            executable,
+            "remote-upgrade".to_owned(),
+            "--provider".to_owned(),
+        ];
+        let target = match self.mode {
+            PickerMode::Coder => {
+                let ranked = coder::rank(&self.coder_workspaces, &self.query);
+                let Some(identifier) = ranked
+                    .get(self.selected)
+                    .map(|ranked| ranked.workspace.identifier())
+                else {
+                    return false;
+                };
+                argv.push("coder".to_owned());
+                argv.push("--workspace".to_owned());
+                argv.push(identifier.clone());
+                identifier
+            },
+            PickerMode::Ssh => {
+                let Some(host) = self.selected_ssh_host() else {
+                    return false;
+                };
+                argv.push("ssh".to_owned());
+                argv.push("--destination".to_owned());
+                argv.push(host.destination.clone());
+                for arg in &host.extra_args {
+                    argv.push("--ssh-arg".to_owned());
+                    argv.push(arg.clone());
+                }
+                host.name
+            },
+            _ => return false,
+        };
+        let refs: Vec<&str> = argv.iter().map(String::as_str).collect();
+        run_command(
+            &refs,
+            BTreeMap::from_iter([(REINSTALL_CONTEXT_KEY.to_owned(), target.clone())]),
+        );
+        self.pending_reinstall = Some(target);
+        self.arm_spinner_timer();
+        true
+    }
+
+    /// The start confirm owns the keyboard: `y` opens, anything else backs out.
+    /// Same shape as the delete-host confirm, so the picker has one answer to
+    /// "how do I say yes".
+    fn handle_pending_start_key(&mut self, key: KeyWithModifier) -> bool {
+        if self.pending_start.is_none() {
+            return false;
+        }
+        let confirm = key.has_no_modifiers()
+            && matches!(key.bare_key, BareKey::Char('y') | BareKey::Char('Y'));
+        if confirm {
+            self.start_pending();
+        } else {
+            self.pending_start = None;
+        }
+        true
     }
 
     fn stop_selected_coder_workspace(&mut self) -> bool {
@@ -1727,13 +2049,21 @@ impl State {
     fn handle_ssh_wizard_key(&mut self, key: KeyWithModifier) -> bool {
         if key.has_no_modifiers() {
             match key.bare_key {
+                // Esc leaves the form. There is no phase to step back through
+                // any more — every field is on screen and reachable directly.
                 BareKey::Esc => {
-                    let cancel = self
-                        .ssh_wizard
-                        .as_mut()
-                        .is_some_and(|wizard| !wizard.back());
-                    if cancel {
-                        self.ssh_wizard = None;
+                    self.ssh_wizard = None;
+                    return true;
+                },
+                BareKey::Up => {
+                    if let Some(wizard) = self.ssh_wizard.as_mut() {
+                        wizard.focus_prev();
+                    }
+                    return true;
+                },
+                BareKey::Down | BareKey::Tab => {
+                    if let Some(wizard) = self.ssh_wizard.as_mut() {
+                        wizard.focus_next();
                     }
                     return true;
                 },
@@ -1741,7 +2071,7 @@ impl State {
                     let Some(mut wizard) = self.ssh_wizard.take() else {
                         return false;
                     };
-                    match wizard.advance(&self.ssh_hosts) {
+                    match wizard.submit(&self.ssh_hosts) {
                         Some(finished) => {
                             self.ssh_hosts = ssh::apply_wizard(
                                 &self.ssh_hosts,
@@ -1751,6 +2081,7 @@ impl State {
                             ssh::save_hosts(&self.ssh_hosts);
                             self.reset_selection();
                         },
+                        // `submit` has already moved focus to the bad field.
                         None => self.ssh_wizard = Some(wizard),
                     }
                     return true;
@@ -1827,20 +2158,16 @@ impl State {
                 self.discard_throwaway_session(current_session_name.as_deref());
             },
             coder::OpenAction::Create { name } => {
-                self.ssh_error = None;
-                self.ssh_notice = Some(format!(
-                    "Preparing persistent session on {}…",
-                    host.destination
-                ));
-                let argv = ssh::bootstrap_argv(&host, self.remote_agent_binary.as_deref());
-                let refs: Vec<&str> = argv.iter().map(String::as_str).collect();
-                run_command(&refs, ssh::bootstrap_context(&host.destination));
-                self.pending_ssh_open = Some(PendingSshOpen {
-                    host,
+                // A first open installs the agent on the host, so it asks.
+                self.pending_start = Some(PendingStart {
+                    prompt: format!(
+                        "connect to {}?  installs the flock agent if it is missing",
+                        host.name
+                    ),
+                    target: PendingStartTarget::Ssh { host },
                     session_name: name,
                     previous_session: current_session_name,
                 });
-                self.arm_spinner_timer();
                 return;
             },
         }

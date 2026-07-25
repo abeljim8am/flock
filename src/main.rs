@@ -54,6 +54,19 @@ fn main() {
                     pane_id,
                 } => remote_transport(&provider, workspace, destination, ssh_arg, workspace_folder)
                     .and_then(|transport| remote_agent::remote_close(transport, &pane_id)),
+                RemoteAgentCommand::RemoteUpgrade {
+                    provider,
+                    workspace,
+                    destination,
+                    ssh_arg,
+                    workspace_folder,
+                } => remote_transport(&provider, workspace, destination, ssh_arg, workspace_folder)
+                    .and_then(|transport| {
+                        remote_agent::remote_upgrade(
+                            transport,
+                            &zellij_utils::remote_bootstrap::reinstall_script(),
+                        )
+                    }),
                 RemoteAgentCommand::ReportState {
                     pane_id,
                     state,

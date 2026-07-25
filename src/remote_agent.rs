@@ -22,6 +22,7 @@ use std::sync::{mpsc, Arc, Condvar, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 use uuid::Uuid;
+use zellij_utils::data::{RemotePaneHealth, RemoteProtocolStatus};
 
 pub const PROTOCOL_VERSION: u16 = 3;
 const MAX_FRAME_BYTES: usize = 16 * 1024 * 1024;
@@ -72,6 +73,12 @@ pub enum ClientMessage {
     ClosePane {
         pane_id: Uuid,
     },
+    /// Ask the daemon to stand down so the next connect starts the freshly
+    /// installed build. A daemon holding panes cannot exit without killing
+    /// their PTYs, so it arms a flag and exits when its last pane closes; an
+    /// idle daemon exits immediately. Either way the caller's bridges
+    /// reconnect at their saved cursors onto the new daemon.
+    Retire,
     ReportAgentState {
         pane_id: Uuid,
         state: RemoteAgentRunState,
@@ -269,6 +276,64 @@ impl RemoteTransport {
         }
     }
 
+    /// Run an arbitrary POSIX `sh` script on the far end. Quoting follows the
+    /// same rule as [`Self::connect_command`]: ssh-style transports join the
+    /// trailing words into one string for the remote login shell, so the script
+    /// must ride inside single quotes; `devcontainer exec` passes argv through
+    /// verbatim. Scripts therefore may not contain single quotes — the
+    /// generators assert this.
+    fn script_command(&self, script: &str) -> Command {
+        assert!(
+            !script.contains('\''),
+            "remote scripts must not contain single quotes"
+        );
+        match self {
+            Self::Coder { workspace } => {
+                let mut command = Command::new("coder");
+                command.args([
+                    "ssh",
+                    "--wait",
+                    "yes",
+                    workspace,
+                    "--",
+                    "sh",
+                    "-c",
+                    &format!("'{script}'"),
+                ]);
+                command
+            },
+            Self::Devcontainer { workspace_folder } => {
+                let mut command = Command::new("devcontainer");
+                command.args([
+                    "exec",
+                    "--workspace-folder",
+                    workspace_folder,
+                    "sh",
+                    "-c",
+                    script,
+                ]);
+                command
+            },
+            Self::Ssh {
+                destination,
+                ssh_args,
+            } => {
+                let mut command = Command::new("ssh");
+                command.args([
+                    "-o",
+                    "BatchMode=yes",
+                    "-o",
+                    "StrictHostKeyChecking=accept-new",
+                ]);
+                command.args(ssh_args);
+                command.arg("--");
+                command.arg(destination);
+                command.args(["sh", "-c", &format!("'{script}'")]);
+                command
+            },
+        }
+    }
+
     fn close_spec(&self) -> zellij_utils::remote_session_cleanup::RemoteCloseTransport {
         use zellij_utils::remote_session_cleanup::RemoteCloseTransport;
         match self {
@@ -334,6 +399,11 @@ pub enum ServerMessage {
     },
     AgentStateAccepted {
         pane_id: Uuid,
+    },
+    /// Answer to [`ClientMessage::Retire`]. `panes_held` is how many panes must
+    /// close before the daemon exits — zero means it is exiting now.
+    Retiring {
+        panes_held: usize,
     },
 }
 
@@ -1036,6 +1106,9 @@ pub fn remote_pty(
         .and_then(|cursor| cursor.trim().parse().ok())
         .unwrap_or(0);
     let mut delay = Duration::from_millis(250);
+    // Health carries across reconnects: a protocol rejection learned at the
+    // first handshake must survive the retries that follow it.
+    let mut health = RemotePaneHealth::default();
 
     loop {
         match run_remote_transport(
@@ -1047,6 +1120,7 @@ pub fn remote_pty(
             cwd.as_deref(),
             input_router.clone(),
             agent_state_tx.as_ref(),
+            &mut health,
         ) {
             Ok(TransportEnd::Exited(status)) => {
                 persist_connection(&cursor_path, "disconnected")?;
@@ -1057,6 +1131,12 @@ pub fn remote_pty(
                 cursor = last_cursor;
             },
             Err(error) => {
+                // The retry picture belongs in the sidebar, where it persists;
+                // the pane still gets one line so a user watching the terminal
+                // is not left guessing during the first reconnect.
+                health.retry_count = health.retry_count.saturating_add(1);
+                health.last_error = Some(humanize_transport_error(&error));
+                persist_health(&cursor_path, &health);
                 writeln!(
                     io::stderr(),
                     "\r\nflock: {} connection lost ({error}); reconnecting…",
@@ -1146,6 +1226,98 @@ fn validate_agent_label(agent: &str) -> Result<()> {
         bail!("agent label must be non-empty and cannot contain ',' or '='");
     }
     Ok(())
+}
+
+/// Bring a remote host onto this build: reinstall the agent binary, then ask
+/// the running daemon to stand down so the next reconnect starts the new one.
+///
+/// This is what makes the sidebar's confirm honest. Nothing here closes a pane:
+/// the daemon keeps serving until its panes drain on their own, each bridge
+/// reconnects at its saved cursor, and a failed reinstall leaves the old daemon
+/// exactly as it was.
+pub fn remote_upgrade(transport: RemoteTransport, reinstall_script: &str) -> Result<()> {
+    let mut install = transport.script_command(reinstall_script);
+    let output = install
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .with_context(|| format!("run the {} reinstall", transport.label()))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let detail = stderr
+            .lines()
+            .rev()
+            .map(str::trim)
+            .find(|line| !line.is_empty())
+            .unwrap_or("remote install failed");
+        bail!("{detail}");
+    }
+    // The reinstall is the part that must succeed. Retirement is best-effort:
+    // if the daemon is already gone, or refuses the message because it predates
+    // it, the new binary is still installed and the next connect picks it up.
+    match request_retire(&transport) {
+        Ok(panes_held) => {
+            if panes_held > 0 {
+                eprintln!(
+                    "flock: {} upgraded; the daemon retires when its last {panes_held} pane(s) close",
+                    transport.label()
+                );
+            }
+            Ok(())
+        },
+        Err(error) => {
+            eprintln!(
+                "flock: {} upgraded, but the daemon did not accept the retire request ({error:#}); it will pick up the new build on its next restart",
+                transport.label()
+            );
+            Ok(())
+        },
+    }
+}
+
+/// Ask the daemon to retire, returning how many panes it is still holding.
+fn request_retire(transport: &RemoteTransport) -> Result<usize> {
+    let mut child = transport
+        .connect_command()
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    let result = exchange_retire_frames(&mut child);
+    let _ = child.kill();
+    let _ = child.wait();
+    result
+}
+
+fn exchange_retire_frames(child: &mut std::process::Child) -> Result<usize> {
+    let mut writer = child.stdin.take().context("open retire stdin")?;
+    let mut reader = child.stdout.take().context("open retire stdout")?;
+    write_frame(
+        &mut writer,
+        &ClientMessage::Hello {
+            protocol: PROTOCOL_VERSION,
+            client_version: env!("CARGO_PKG_VERSION").into(),
+        },
+    )?;
+    match read_frame::<_, ServerMessage>(&mut reader)? {
+        ServerMessage::Hello {
+            protocol: PROTOCOL_VERSION,
+            ..
+        } => {},
+        // An idle daemon that already noticed the new install retires itself at
+        // hello and says so; that is the outcome we were asking for.
+        ServerMessage::Error { message } if message.contains("retiring") => return Ok(0),
+        response => bail!("unexpected retire handshake: {response:?}"),
+    }
+    write_frame(&mut writer, &ClientMessage::Retire)?;
+    loop {
+        match read_frame::<_, ServerMessage>(&mut reader)? {
+            ServerMessage::Retiring { panes_held } => return Ok(panes_held),
+            ServerMessage::Error { message } => bail!("{message}"),
+            _ => {},
+        }
+    }
 }
 
 pub fn remote_close(transport: RemoteTransport, pane_id: &str) -> Result<()> {
@@ -1331,6 +1503,7 @@ fn run_remote_transport(
     cwd: Option<&Path>,
     input_router: Arc<InputRouter>,
     agent_state_tx: Option<&mpsc::Sender<RemoteAgentStateEvent>>,
+    health: &mut RemotePaneHealth,
 ) -> Result<TransportEnd> {
     let mut child = transport
         .connect_command()
@@ -1357,18 +1530,37 @@ fn run_remote_transport(
         } => {
             // Same protocol, different build: the daemon kept running because
             // it still holds panes (an idle daemon retires itself at hello).
-            // Tell the user why the remote may lag behind local fixes, and
-            // report the mismatch to the sidebar so it can offer the upgrade.
-            if agent_version != env!("CARGO_PKG_VERSION") {
-                write!(
-                    io::stdout().lock(),
-                    "\r\n[flock: remote daemon is v{agent_version}, local is v{}; the remote upgrades once its last pane closes]\r\n",
-                    env!("CARGO_PKG_VERSION"),
-                )?;
-                report_daemon_version_to_local_plugin(&agent_version);
-            }
+            // Record the skew so the sidebar can offer the upgrade; the pane
+            // itself keeps working, so nothing is written into the terminal.
+            *health = RemotePaneHealth {
+                status: if agent_version == env!("CARGO_PKG_VERSION") {
+                    RemoteProtocolStatus::Ok
+                } else {
+                    RemoteProtocolStatus::VersionSkew
+                },
+                daemon_version: Some(agent_version.clone()),
+                local_version: Some(env!("CARGO_PKG_VERSION").to_owned()),
+                retry_count: 0,
+                last_error: None,
+            };
+            persist_health(cursor_path, health);
         },
-        ServerMessage::Error { message } => bail!("{message}"),
+        ServerMessage::Error { message } => {
+            // A protocol rejection is terminal: the pane cannot be served by
+            // this daemon at all, and only a reinstall changes that. Record it
+            // before bailing so the sidebar can offer the one useful action.
+            if message.contains("incompatible protocol version") {
+                *health = RemotePaneHealth {
+                    status: RemoteProtocolStatus::ProtocolIncompatible,
+                    daemon_version: None,
+                    local_version: Some(env!("CARGO_PKG_VERSION").to_owned()),
+                    retry_count: health.retry_count,
+                    last_error: Some(message.clone()),
+                };
+                persist_health(cursor_path, health);
+            }
+            bail!("{message}")
+        },
         message => bail!("unexpected handshake response: {message:?}"),
     }
 
@@ -1594,6 +1786,43 @@ fn persist_connection(cursor_path: &Path, state: &str) -> Result<()> {
     Ok(())
 }
 
+/// Write this pane's health picture next to its cursor. The server reads it
+/// back on every session-info tick, so the sidebar's view self-clears the
+/// moment the bridge writes a healthy record — no revocation message needed.
+/// Health is advisory: a write failure must never break the transport, so
+/// callers ignore the result.
+fn persist_health(cursor_path: &Path, health: &RemotePaneHealth) {
+    let path = cursor_path.with_extension("health");
+    let Some(parent) = path.parent() else {
+        return;
+    };
+    if fs::create_dir_all(parent).is_err() {
+        return;
+    }
+    let Ok(encoded) = serde_json::to_string(health) else {
+        return;
+    };
+    // Same write-then-rename the cursor uses: the server may read this file at
+    // any moment and must never see a half-written record.
+    let temporary = path.with_extension(format!("health.{}", std::process::id()));
+    if fs::write(&temporary, encoded).is_ok() {
+        let _ = fs::rename(&temporary, &path);
+    }
+}
+
+/// Strip the noise off an `anyhow` chain so the sidebar can render the cause on
+/// one narrow row. Keeps the outermost message, which is the one written for a
+/// human.
+fn humanize_transport_error(error: &anyhow::Error) -> String {
+    let message = error.to_string();
+    let message = message.trim();
+    if message.is_empty() {
+        "connection failed".to_owned()
+    } else {
+        message.to_owned()
+    }
+}
+
 fn start_local_agent_state_forwarder() -> Option<mpsc::Sender<RemoteAgentStateEvent>> {
     let pane_id = std::env::var("FLOCK_PANE_ID").ok()?;
     pane_id.parse::<u32>().ok()?;
@@ -1633,48 +1862,6 @@ fn forward_agent_state_to_local_plugin(
 ) -> Result<()> {
     let args = local_agent_state_args(pane_id, event);
     publish_local_pipe(executable, "flock-state", &args)
-}
-
-/// The pipe name the sidebar listens on for remote daemon version reports —
-/// must stay in sync with `DAEMON_VERSION_PIPE_NAME` in
-/// `default-plugins/flock-sidebar/src/hook.rs`.
-const DAEMON_VERSION_PIPE_NAME: &str = "flock-daemon-version";
-
-/// Fire-and-forget report of the remote daemon's version to the sidebar, so
-/// it can offer closing this pane to let the daemon upgrade. Sent from the
-/// handshake path, so the pipe publisher runs on its own thread — a wedged
-/// local `flock pipe` must not stall the reconnect.
-fn report_daemon_version_to_local_plugin(agent_version: &str) {
-    // The version lands in a `key=value,` wire format; a daemon whose version
-    // string could split it is not worth reporting.
-    if agent_version.is_empty() || agent_version.contains([',', '=']) {
-        return;
-    }
-    let Some(pane_id) = std::env::var("FLOCK_PANE_ID")
-        .ok()
-        .filter(|id| id.parse::<u32>().is_ok())
-    else {
-        return;
-    };
-    let Some(executable) = std::env::var_os("FLOCK_EXECUTABLE")
-        .map(PathBuf::from)
-        .or_else(|| std::env::current_exe().ok())
-    else {
-        return;
-    };
-    let args = daemon_version_args(&pane_id, agent_version);
-    thread::spawn(move || {
-        if let Err(error) = publish_local_pipe(&executable, DAEMON_VERSION_PIPE_NAME, &args) {
-            eprintln!("flock: failed to report remote daemon version: {error:#}");
-        }
-    });
-}
-
-fn daemon_version_args(pane_id: &str, agent_version: &str) -> String {
-    format!(
-        "pane_id={pane_id},daemon_version={agent_version},local_version={}",
-        env!("CARGO_PKG_VERSION")
-    )
 }
 
 fn publish_local_pipe(executable: &Path, pipe_name: &str, args: &str) -> Result<()> {
@@ -1775,6 +1962,19 @@ fn daemon_is_live(socket: &Path) -> bool {
 /// against the file on disk only retires when a respawn actually changes
 /// something. Device+inode identity survives the in-place `mv` replace that
 /// leaves `/proc/self/exe` pointing at a deleted path.
+/// Set once a client has asked this daemon to stand down. A daemon holding
+/// panes cannot exit without killing their PTYs, so retirement waits for the
+/// last one to close.
+static RETIRE_REQUESTED: AtomicBool = AtomicBool::new(false);
+
+/// Exit if a retirement is pending and the last pane has just gone. Called
+/// wherever a pane leaves the map.
+fn exit_if_retiring_and_idle(panes: &Panes) {
+    if RETIRE_REQUESTED.load(Ordering::SeqCst) && panes.lock().unwrap().is_empty() {
+        std::process::exit(0);
+    }
+}
+
 fn installed_binary_differs() -> bool {
     let Some(home) = std::env::var_os("HOME") else {
         return false;
@@ -1947,6 +2147,20 @@ fn handle_client(stream: UnixStream, panes: Panes) -> Result<()> {
                     tx.send(ServerMessage::PaneClosed { pane_id })?;
                 } else {
                     tx.send(ServerMessage::PaneClosed { pane_id })?;
+                }
+                exit_if_retiring_and_idle(&panes);
+            },
+            ClientMessage::Retire => {
+                RETIRE_REQUESTED.store(true, Ordering::SeqCst);
+                let panes_held = panes.lock().unwrap().len();
+                tx.send(ServerMessage::Retiring { panes_held })?;
+                if panes_held == 0 {
+                    // The reply goes out on the writer thread, so give it a
+                    // moment to flush before the process disappears under it.
+                    thread::spawn(|| {
+                        thread::sleep(Duration::from_millis(200));
+                        std::process::exit(0);
+                    });
                 }
             },
             ClientMessage::ReportAgentState {
@@ -2713,13 +2927,37 @@ mod tests {
             ),
             "pane_id=7,state=idle,agent=opencode,source=flock:coder-remote,presence=heartbeat"
         );
+    }
+
+    #[test]
+    fn health_records_survive_a_json_round_trip() {
+        // The bridge writes this file and the server parses it; a serde change
+        // that broke the pair would silently degrade every remote to healthy.
+        let health = RemotePaneHealth {
+            status: RemoteProtocolStatus::VersionSkew,
+            daemon_version: Some("26.5.0".into()),
+            local_version: Some("26.7.0".into()),
+            retry_count: 3,
+            last_error: Some("connection lost".into()),
+        };
+        let encoded = serde_json::to_string(&health).unwrap();
         assert_eq!(
-            daemon_version_args("7", "26.4.0"),
-            format!(
-                "pane_id=7,daemon_version=26.4.0,local_version={}",
-                env!("CARGO_PKG_VERSION")
-            )
+            serde_json::from_str::<RemotePaneHealth>(&encoded).unwrap(),
+            health
         );
+        // An absent or unreadable file must read as healthy, never as a fault
+        // the bridge never reported.
+        assert_eq!(RemotePaneHealth::default().status, RemoteProtocolStatus::Ok);
+    }
+
+    #[test]
+    fn a_protocol_rejection_is_recognised_from_the_daemon_message() {
+        // `run_remote_transport` keys the terminal ProtocolIncompatible status
+        // off this wording, which `ensure_protocol_version` produces.
+        let error = ensure_protocol_version(PROTOCOL_VERSION + 1)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("incompatible protocol version"));
     }
 
     #[test]

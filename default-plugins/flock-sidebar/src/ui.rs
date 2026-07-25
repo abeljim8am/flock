@@ -36,7 +36,7 @@ use std::collections::BTreeMap;
 use unicode_width::UnicodeWidthStr;
 use zellij_tile::prelude::{
     AgentRunState, DockMode, PaletteColor, PaneAgentStatus, PaneId, PaneManifest, RemoteBackend,
-    RemoteConnectionState, SessionInfo, TabInfo,
+    RemoteConnectionState, RemoteProtocolStatus, SessionInfo, TabInfo,
 };
 
 use crate::detect::{identify_agent_from_command, AgentState};
@@ -58,7 +58,7 @@ const SPINNERS: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "�
 ///
 /// A layout's `closed_size` therefore has to be below this for the rail to appear
 /// when collapsed.
-const THIN_WIDTH: usize = 16;
+pub(crate) const THIN_WIDTH: usize = 16;
 
 /// Blank rows kept above and below the sidebar content (both the thin/mini rail
 /// and the full labeled view), so it gets a little breathing room from the
@@ -207,8 +207,8 @@ fn connection_state_color(state: Option<RemoteConnectionState>, p: &Theme) -> Pa
     match state {
         Some(RemoteConnectionState::Connected) => p.blue,
         Some(RemoteConnectionState::Connecting | RemoteConnectionState::Reconnecting) => p.yellow,
-        Some(RemoteConnectionState::Disconnected) => p.muted,
-        None => p.blue,
+        // Unknown is not the same claim as connected, and must not look like it.
+        Some(RemoteConnectionState::Disconnected) | None => p.muted,
     }
 }
 
@@ -314,6 +314,10 @@ pub(crate) enum Row {
         binding: Option<crate::RemoteBinding>,
         connection_state: Option<RemoteConnectionState>,
     },
+    /// A remote problem belonging to the session listed directly above it. It
+    /// is a list row rather than a banner so that navigation, clicking and
+    /// scrolling all work without a second code path.
+    RemoteIssue(RemoteIssue),
     Agent(AgentEntry),
 }
 
@@ -322,8 +326,100 @@ pub(crate) enum Row {
 pub enum Target {
     /// Switch to (or focus) the session with this name.
     Session(String),
+    /// Act on the remote problem belonging to this session.
+    RemoteIssue(String),
     /// Focus this agent pane.
     Pane(PaneId),
+}
+
+/// Why a session's remote panes need attention, worst case first. Ordering is
+/// the priority used when a session's panes disagree.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum RemoteIssueKind {
+    /// A transport that keeps dropping. Informational — retrying is already
+    /// happening and there is nothing for the user to decide.
+    Reconnecting,
+    /// A daemon on a different build of flock. The panes still work.
+    VersionSkew,
+    /// Bootstrapping the remote binary failed.
+    InstallFailed,
+    /// A daemon speaking a protocol we cannot talk to. The panes are dead.
+    ProtocolIncompatible,
+}
+
+impl RemoteIssueKind {
+    /// Whether the user can do something about this. Reconnecting resolves
+    /// itself or does not; offering a button for it would be a lie.
+    pub fn is_actionable(&self) -> bool {
+        !matches!(self, RemoteIssueKind::Reconnecting)
+    }
+}
+
+/// One session's remote problem, rolled up from its panes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemoteIssue {
+    pub session: String,
+    pub kind: RemoteIssueKind,
+    pub daemon_version: Option<String>,
+    pub local_version: Option<String>,
+    /// Remote panes belonging to this session — the count that would reconnect.
+    pub pane_count: usize,
+    /// Highest consecutive-failure count across the session's panes.
+    pub retry_count: u32,
+}
+
+/// How far an in-flight upgrade has got. Absent means the row is at rest.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UpgradeProgress {
+    Working,
+    Done { version: String, panes: usize },
+    Failed { reason: String },
+}
+
+/// Roll a session's per-pane health into at most one issue. Returns `None` for
+/// a session with no remote panes or nothing wrong with them — the common case,
+/// which must add no row.
+pub fn session_remote_issue(session: &SessionInfo) -> Option<RemoteIssue> {
+    if session.remote_panes.is_empty() {
+        return None;
+    }
+    let mut kind: Option<RemoteIssueKind> = None;
+    let mut daemon_version = None;
+    let mut local_version = None;
+    let mut retry_count = 0;
+    for pane in session.remote_panes.values() {
+        let health = &pane.health;
+        let pane_kind = match health.status {
+            RemoteProtocolStatus::ProtocolIncompatible => {
+                Some(RemoteIssueKind::ProtocolIncompatible)
+            },
+            RemoteProtocolStatus::InstallFailed => Some(RemoteIssueKind::InstallFailed),
+            RemoteProtocolStatus::VersionSkew => Some(RemoteIssueKind::VersionSkew),
+            // A healthy pane still reports a problem while it is retrying.
+            RemoteProtocolStatus::Ok if health.retry_count > 0 => {
+                Some(RemoteIssueKind::Reconnecting)
+            },
+            RemoteProtocolStatus::Ok => None,
+        };
+        retry_count = retry_count.max(health.retry_count);
+        // Keep the versions from whichever pane raised the worst issue, so the
+        // row's numbers describe the problem it is naming.
+        if let Some(pane_kind) = pane_kind {
+            if kind.is_none_or(|current| pane_kind > current) {
+                daemon_version = health.daemon_version.clone();
+                local_version = health.local_version.clone();
+            }
+            kind = Some(kind.map_or(pane_kind, |current| current.max(pane_kind)));
+        }
+    }
+    Some(RemoteIssue {
+        session: session.name.clone(),
+        kind: kind?,
+        daemon_version,
+        local_version,
+        pane_count: session.remote_panes.len(),
+        retry_count,
+    })
 }
 
 /// A rendered row's click target: which absolute pane row it occupies and which
@@ -334,33 +430,80 @@ pub struct ClickTarget {
     pub index: usize,
 }
 
-/// The remote-daemon upgrade prompt, drawn over the sidebar's top padding row
-/// when a bridge reports a version mismatch. Two-step: an unarmed banner
-/// invites the click; the armed banner asks for the confirming second click.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct UpgradeBanner {
-    pub daemon_version: String,
-    pub local_version: String,
-    pub pane_count: usize,
-    pub armed: bool,
+/// The glyph and text for a remote-issue row, given how far any upgrade of it
+/// has got. Kept narrow on purpose: the sidebar is routinely 28 content columns
+/// wide, and a row that truncates has failed at the one job it has.
+///
+/// The armed state names the real cost — panes *reconnect*, they are not
+/// destroyed — and asks for `y`, matching the saved-host delete confirm.
+pub fn remote_issue_text(
+    issue: &RemoteIssue,
+    armed: bool,
+    progress: Option<&UpgradeProgress>,
+    spinner: &'static str,
+) -> (String, IssueTone) {
+    if let Some(progress) = progress {
+        return match progress {
+            UpgradeProgress::Working => (
+                format!("{spinner} installing {}…", version_or(&issue.local_version)),
+                IssueTone::Busy,
+            ),
+            UpgradeProgress::Done { version, panes } => {
+                (format!("✓ {version} · {panes} panes back"), IssueTone::Good)
+            },
+            UpgradeProgress::Failed { reason } => (format!("✗ {reason}  ⏎ retry"), IssueTone::Bad),
+        };
+    }
+    if armed {
+        return (
+            format!("⇪ {} panes reconnect  [y]", issue.pane_count),
+            IssueTone::Armed,
+        );
+    }
+    match issue.kind {
+        RemoteIssueKind::VersionSkew => (
+            format!(
+                "⇪ v{} → {}",
+                version_or(&issue.daemon_version),
+                version_or(&issue.local_version)
+            ),
+            IssueTone::Warn,
+        ),
+        RemoteIssueKind::ProtocolIncompatible => {
+            ("✗ reinstall needed  ⏎".to_owned(), IssueTone::Bad)
+        },
+        RemoteIssueKind::InstallFailed => ("✗ install failed  ⏎".to_owned(), IssueTone::Bad),
+        RemoteIssueKind::Reconnecting => (
+            format!("{spinner} reconnecting · try {}", issue.retry_count),
+            IssueTone::Busy,
+        ),
+    }
 }
 
-/// The banner's one-line text; the confirm wording spells out the cost
-/// (closing panes) because the action restarts every affected remote shell.
-pub fn upgrade_banner_text(banner: &UpgradeBanner) -> String {
-    if banner.armed {
-        let panes = if banner.pane_count == 1 {
-            "1 remote pane".to_string()
-        } else {
-            format!("{} remote panes", banner.pane_count)
-        };
-        format!(" ⇪ close {panes} to upgrade? click again")
-    } else {
-        format!(
-            " ⇪ remote flock v{} (local v{}) — click to upgrade",
-            banner.daemon_version, banner.local_version
-        )
+/// How a remote-issue row is coloured. Separate from the palette so the text
+/// builder stays testable without a theme.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IssueTone {
+    Warn,
+    Bad,
+    Busy,
+    Good,
+    Armed,
+}
+
+impl IssueTone {
+    fn color(self, p: &Theme) -> PaletteColor {
+        match self {
+            IssueTone::Warn | IssueTone::Busy => p.yellow,
+            IssueTone::Bad => p.red,
+            IssueTone::Good => p.green,
+            IssueTone::Armed => p.blue,
+        }
     }
+}
+
+fn version_or(version: &Option<String>) -> String {
+    version.clone().unwrap_or_else(|| "?".to_owned())
 }
 
 /// Build the agent list for the *current* session from its live panes, in tab
@@ -493,6 +636,12 @@ pub(crate) fn build_rows(
             )
             .then_some(session.remote_connection_state),
         });
+        // A remote problem hangs directly off the session it belongs to, so
+        // position identifies the host and the row's text does not have to
+        // spend its scarce columns repeating the name.
+        if let Some(issue) = session_remote_issue(session) {
+            rows.push(Row::RemoteIssue(issue));
+        }
     }
     // Bottom section: the current session's own agents, one row each. Only the
     // current session's panes are observable from here, so this is the live
@@ -510,6 +659,7 @@ pub(crate) fn build_rows(
 fn row_target(row: &Row) -> Target {
     match row {
         Row::Session { name, .. } => Target::Session(name.clone()),
+        Row::RemoteIssue(issue) => Target::RemoteIssue(issue.session.clone()),
         Row::Agent(entry) => entry.target.clone(),
     }
 }
@@ -548,6 +698,14 @@ pub fn navigable_targets(
 /// Clamp a selection index to the navigable target count.
 pub fn clamp_selection(selected: usize, total: usize) -> usize {
     selected.min(total.saturating_sub(1))
+}
+
+/// Length of the leading workspaces run in [`build_rows`] output: session rows
+/// plus the issue rows hanging off them. Everything after it is an agent row.
+pub(crate) fn workspace_section_len(rows: &[Row]) -> usize {
+    rows.iter()
+        .take_while(|row| matches!(row, Row::Session { .. } | Row::RemoteIssue(_)))
+        .count()
 }
 
 /// One styled run of text within a rendered row.
@@ -666,9 +824,10 @@ pub struct RenderInput<'a> {
     pub spinner_tick: u32,
     pub rows: usize,
     pub cols: usize,
-    /// Remote-daemon upgrade prompt to draw over the top padding row (open
-    /// mode only; the thin rail has no room for it).
-    pub upgrade_banner: Option<UpgradeBanner>,
+    /// The session whose remote-issue row is armed for its `y` confirm, if any.
+    pub armed_issue: Option<&'a str>,
+    /// In-flight or just-finished upgrades, keyed by session name.
+    pub upgrade_progress: &'a BTreeMap<String, UpgradeProgress>,
 }
 
 /// The full sidebar render output.
@@ -683,9 +842,6 @@ pub struct RenderOutput {
     pub scroll_agents: usize,
     /// Click targets for the rows drawn this frame.
     pub click_map: Vec<ClickTarget>,
-    /// The absolute row the upgrade banner occupies this frame, for mouse
-    /// hit-testing (None when no banner was drawn).
-    pub banner_row: Option<usize>,
 }
 
 /// Render the whole sidebar to a raw-ANSI string plus the click map.
@@ -721,7 +877,6 @@ pub fn render(input: RenderInput) -> RenderOutput {
             scroll_sessions: 0,
             scroll_agents: 0,
             click_map,
-            banner_row: None,
         };
     }
 
@@ -738,28 +893,6 @@ pub fn render(input: RenderInput) -> RenderOutput {
     let divider_x = cols.saturating_sub(1);
     let content_cols = divider_x;
 
-    // The upgrade prompt rides the top padding row (RAIL_VPAD keeps it blank
-    // otherwise), so it never disturbs the section layout below.
-    let mut banner_row = None;
-    if let Some(banner) = &input.upgrade_banner {
-        if rows > 0 {
-            let color = if banner.armed { p.red } else { p.yellow };
-            render_row(
-                &mut out,
-                0,
-                0,
-                content_cols,
-                None,
-                &[Span::new(
-                    truncate_text(&upgrade_banner_text(banner), content_cols),
-                    color,
-                )
-                .bold()],
-            );
-            banner_row = Some(0);
-        }
-    }
-
     // Match the thin rail's breathing room: keep RAIL_VPAD blank rows above and
     // below the content, so the full view and the rail line up at the same top
     // offset and neither sits flush against the pane edges.
@@ -774,12 +907,9 @@ pub fn render(input: RenderInput) -> RenderOutput {
         bottom_limit
     };
 
-    // Every session row sorts ahead of every agent row in `rows_data`, so the
-    // leading run of sessions is the top section and the rest are the agents.
-    let session_count = rows_data
-        .iter()
-        .take_while(|row| matches!(row, Row::Session { .. }))
-        .count();
+    // The workspaces section is the leading run of session rows and the issue
+    // rows attached to them; every agent row follows it.
+    let session_count = workspace_section_len(&rows_data);
     let agent_count = rows_data.len() - session_count;
 
     // ---- top section: workspaces overview ----
@@ -816,6 +946,8 @@ pub fn render(input: RenderInput) -> RenderOutput {
             spinner_tick: input.spinner_tick,
             cols: content_cols,
             p,
+            armed_issue: input.armed_issue,
+            upgrade_progress: input.upgrade_progress,
         },
     );
 
@@ -853,6 +985,8 @@ pub fn render(input: RenderInput) -> RenderOutput {
             spinner_tick: input.spinner_tick,
             cols: content_cols,
             p,
+            armed_issue: input.armed_issue,
+            upgrade_progress: input.upgrade_progress,
         },
     );
     render_divider(&mut out, divider_x, rows, p);
@@ -862,7 +996,6 @@ pub fn render(input: RenderInput) -> RenderOutput {
         scroll_sessions,
         scroll_agents,
         click_map,
-        banner_row,
     }
 }
 
@@ -900,6 +1033,9 @@ struct SectionInput<'a> {
     spinner_tick: u32,
     cols: usize,
     p: &'a Theme,
+    /// Session whose issue row is armed for its `y` confirm.
+    armed_issue: Option<&'a str>,
+    upgrade_progress: &'a BTreeMap<String, UpgradeProgress>,
 }
 
 /// Render one stacked section's body: its rows from `scroll` down, an empty
@@ -933,7 +1069,17 @@ fn render_section(out: &mut String, click_map: &mut Vec<ClickTarget>, s: Section
         let index = s.index_offset + local;
         // The cursor only shows while the sidebar is focused.
         let cursor = index == s.selected && s.focused;
-        draw_row(out, row, row_y, content_width, cursor, s.spinner_tick, p);
+        draw_row(
+            out,
+            row,
+            row_y,
+            content_width,
+            cursor,
+            s.spinner_tick,
+            p,
+            s.armed_issue,
+            s.upgrade_progress,
+        );
         click_map.push(ClickTarget { row: row_y, index });
         row_y += 1;
     }
@@ -955,6 +1101,7 @@ fn render_section(out: &mut String, click_map: &mut Vec<ClickTarget>, s: Section
 /// Draw one sidebar row — a session overview dot or an agent state icon — at
 /// `row_y`. A current session and the focused agent pane stay emphasized even
 /// without the cursor; the selected row also gets the selection background.
+#[allow(clippy::too_many_arguments)]
 fn draw_row(
     out: &mut String,
     row: &Row,
@@ -963,6 +1110,8 @@ fn draw_row(
     cursor: bool,
     spinner_tick: u32,
     p: &Theme,
+    armed_issue: Option<&str>,
+    upgrade_progress: &BTreeMap<String, UpgradeProgress>,
 ) {
     let row_bg = cursor.then_some(p.selection_bg);
     match row {
@@ -1021,6 +1170,29 @@ fn draw_row(
             spans.push(name_span);
             render_row(out, 0, row_y, content_width, row_bg, &spans);
         },
+        Row::RemoteIssue(issue) => {
+            let armed = armed_issue == Some(issue.session.as_str());
+            let (text, tone) = remote_issue_text(
+                issue,
+                armed,
+                upgrade_progress.get(&issue.session),
+                spinner_frame(spinner_tick),
+            );
+            // Indented one cell past the session dot so the row reads as
+            // belonging to the session above it, the way agent rows do.
+            let budget = content_width.saturating_sub(3);
+            render_row(
+                out,
+                0,
+                row_y,
+                content_width,
+                row_bg,
+                &[
+                    Span::new("   ", p.text),
+                    Span::new(truncate_text(&text, budget), tone.color(p)).bold(),
+                ],
+            );
+        },
         Row::Agent(entry) => {
             let (icon, icon_color) = agent_icon(entry.state, entry.seen, spinner_tick, p);
             let emphasized = cursor || entry.is_active;
@@ -1071,21 +1243,39 @@ fn render_thin(
     // in the columns to its left.
     let (rail_width, divider_x) = divider_geometry(cols);
 
-    // One glyph per session row. Sessions are the leading run in `rows_data`, so
-    // their local indices are still the same selection indices used by targets.
-    let session_count = rows_data
+    // One glyph per session, carrying its flat selection index so a rail click
+    // maps onto the same target list the expanded view uses. A session with a
+    // remote problem shows the problem's glyph in place of its activity dot:
+    // one cell can carry one message, so it carries the one needing a decision.
+    let workspace_len = workspace_section_len(rows_data);
+    let selected = clamp_selection(selected, rows_data.len());
+    let mut glyphs: Vec<(usize, &'static str, PaletteColor)> = Vec::new();
+    for (index, row) in rows_data.iter().enumerate().take(workspace_len) {
+        match row {
+            Row::Session { activity, .. } => {
+                let (glyph, color) = activity_dot(*activity, p);
+                glyphs.push((index, glyph, color));
+            },
+            Row::RemoteIssue(issue) => {
+                if let Some(entry) = glyphs.last_mut() {
+                    let (glyph, tone) = rail_issue_glyph(issue, input.spinner_tick);
+                    entry.1 = glyph;
+                    entry.2 = tone.color(p);
+                }
+            },
+            Row::Agent(_) => {},
+        }
+    }
+
+    // The rail cursor sits on a session. When the flat selection is on an issue
+    // or agent row, highlight the session that owns it rather than nothing, and
+    // report that session back as the selection so the rail's own Up/Down keeps
+    // moving between workspaces instead of through rows it cannot draw.
+    let rail_selected = glyphs
         .iter()
-        .take_while(|row| matches!(row, Row::Session { .. }))
-        .count();
-    let selected = clamp_selection(selected, session_count);
-    let glyphs: Vec<(&'static str, PaletteColor)> = rows_data
-        .iter()
-        .take(session_count)
-        .map(|row| match row {
-            Row::Session { activity, .. } => activity_dot(*activity, p),
-            Row::Agent(_) => unreachable!("agent rows are outside the sessions prefix"),
-        })
-        .collect();
+        .rposition(|(index, _, _)| *index <= selected)
+        .unwrap_or(0);
+    let selected = glyphs.get(rail_selected).map_or(0, |(index, _, _)| *index);
 
     // Keep a little breathing room above and below the glyphs so they don't sit
     // flush against the pane's top and bottom edges.
@@ -1096,17 +1286,19 @@ fn render_thin(
     let mut scroll = input
         .scroll_sessions
         .min(glyphs.len().saturating_sub(body_height.max(1)));
-    if selected < scroll {
-        scroll = selected;
-    } else if body_height > 0 && selected >= scroll + body_height {
-        scroll = selected + 1 - body_height;
+    if rail_selected < scroll {
+        scroll = rail_selected;
+    } else if body_height > 0 && rail_selected >= scroll + body_height {
+        scroll = rail_selected + 1 - body_height;
     }
 
     // Center the single glyph within the rail (the columns left of the divider).
     let pad = rail_width.saturating_sub(1) / 2;
-    for (index, &(glyph, color)) in glyphs.iter().enumerate().skip(scroll).take(body_height) {
-        let y = top + (index - scroll);
-        let cursor = index == selected && input.focused;
+    for (position, &(index, glyph, color)) in
+        glyphs.iter().enumerate().skip(scroll).take(body_height)
+    {
+        let y = top + (position - scroll);
+        let cursor = position == rail_selected && input.focused;
         let row_bg = cursor.then_some(p.selection_bg);
         let mut glyph_span = Span::new(glyph, color);
         if cursor {
@@ -1129,7 +1321,17 @@ fn render_thin(
         scroll_sessions: scroll,
         scroll_agents: input.scroll_agents,
         click_map,
-        banner_row: None,
+    }
+}
+
+/// The single glyph standing in for a session's remote problem on the rail.
+fn rail_issue_glyph(issue: &RemoteIssue, spinner_tick: u32) -> (&'static str, IssueTone) {
+    match issue.kind {
+        RemoteIssueKind::VersionSkew => ("⇪", IssueTone::Warn),
+        RemoteIssueKind::ProtocolIncompatible | RemoteIssueKind::InstallFailed => {
+            ("✗", IssueTone::Bad)
+        },
+        RemoteIssueKind::Reconnecting => (spinner_frame(spinner_tick), IssueTone::Busy),
     }
 }
 
@@ -1233,28 +1435,107 @@ mod tests {
         assert_eq!(index_at_row(&map, 2), None);
     }
 
+    fn skew_issue() -> RemoteIssue {
+        RemoteIssue {
+            session: "api-dev".into(),
+            kind: RemoteIssueKind::VersionSkew,
+            daemon_version: Some("26.5.0".into()),
+            local_version: Some("26.7.0".into()),
+            pane_count: 3,
+            retry_count: 0,
+        }
+    }
+
     #[test]
-    fn upgrade_banner_text_covers_both_steps() {
-        let mut banner = UpgradeBanner {
-            daemon_version: "26.5.0".into(),
-            local_version: "26.6.0".into(),
-            pane_count: 1,
-            armed: false,
-        };
+    fn issue_row_walks_the_whole_upgrade_sequence() {
+        let issue = skew_issue();
         assert_eq!(
-            upgrade_banner_text(&banner),
-            " ⇪ remote flock v26.5.0 (local v26.6.0) — click to upgrade"
+            remote_issue_text(&issue, false, None, "⠙").0,
+            "⇪ v26.5.0 → 26.7.0"
         );
-        banner.armed = true;
+        // The armed step names the real cost: panes reconnect, they are not
+        // closed, and `y` is the key that commits.
         assert_eq!(
-            upgrade_banner_text(&banner),
-            " ⇪ close 1 remote pane to upgrade? click again"
+            remote_issue_text(&issue, true, None, "⠙").0,
+            "⇪ 3 panes reconnect  [y]"
         );
-        banner.pane_count = 3;
         assert_eq!(
-            upgrade_banner_text(&banner),
-            " ⇪ close 3 remote panes to upgrade? click again"
+            remote_issue_text(&issue, false, Some(&UpgradeProgress::Working), "⠙").0,
+            "⠙ installing 26.7.0…"
         );
+        assert_eq!(
+            remote_issue_text(
+                &issue,
+                false,
+                Some(&UpgradeProgress::Done {
+                    version: "26.7.0".into(),
+                    panes: 3
+                }),
+                "⠙"
+            )
+            .0,
+            "✓ 26.7.0 · 3 panes back"
+        );
+        assert_eq!(
+            remote_issue_text(
+                &issue,
+                false,
+                Some(&UpgradeProgress::Failed {
+                    reason: "host unreachable".into()
+                }),
+                "⠙"
+            )
+            .0,
+            "✗ host unreachable  ⏎ retry"
+        );
+    }
+
+    #[test]
+    fn every_issue_row_fits_the_narrowest_sidebar() {
+        // A 30-column sidebar leaves 29 content columns and the row is indented
+        // three. The old banner was truncated mid-sentence at this width, which
+        // is what made it unusable; nothing here may repeat that.
+        const BUDGET: usize = 29 - 3;
+        let mut issue = skew_issue();
+        let mut texts = vec![
+            remote_issue_text(&issue, false, None, "⠙").0,
+            remote_issue_text(&issue, true, None, "⠙").0,
+            remote_issue_text(&issue, false, Some(&UpgradeProgress::Working), "⠙").0,
+            remote_issue_text(
+                &issue,
+                false,
+                Some(&UpgradeProgress::Done {
+                    version: "26.7.0".into(),
+                    panes: 3,
+                }),
+                "⠙",
+            )
+            .0,
+        ];
+        for kind in [
+            RemoteIssueKind::ProtocolIncompatible,
+            RemoteIssueKind::InstallFailed,
+            RemoteIssueKind::Reconnecting,
+        ] {
+            issue.kind = kind;
+            issue.retry_count = 3;
+            texts.push(remote_issue_text(&issue, false, None, "⠙").0);
+        }
+        for text in texts {
+            assert!(
+                text.width() <= BUDGET,
+                "{text:?} is {} cols, over the {BUDGET} available",
+                text.width()
+            );
+        }
+    }
+
+    #[test]
+    fn reconnecting_offers_no_action_but_every_fault_does() {
+        assert!(!RemoteIssueKind::Reconnecting.is_actionable());
+        assert!(RemoteIssueKind::VersionSkew.is_actionable());
+        assert!(RemoteIssueKind::ProtocolIncompatible.is_actionable());
+        assert!(RemoteIssueKind::InstallFailed.is_actionable());
     }
 
     #[test]
@@ -1351,7 +1632,17 @@ mod tests {
                 connection_state: None,
             };
             let mut output = String::new();
-            draw_row(&mut output, &row, 0, 20, false, 0, &Theme::default());
+            draw_row(
+                &mut output,
+                &row,
+                0,
+                20,
+                false,
+                0,
+                &Theme::default(),
+                None,
+                &BTreeMap::new(),
+            );
             assert!(output.contains("☁︎  "));
         }
     }
@@ -1396,7 +1687,8 @@ mod tests {
             spinner_tick: 0,
             rows: 8,
             cols: THIN_WIDTH - 1,
-            upgrade_banner: None,
+            armed_issue: None,
+            upgrade_progress: &BTreeMap::new(),
         });
 
         assert!(!output.ansi.contains("workspaces"));
@@ -1426,7 +1718,8 @@ mod tests {
             spinner_tick: 0,
             rows: 8,
             cols: 40,
-            upgrade_banner: None,
+            armed_issue: None,
+            upgrade_progress: &BTreeMap::new(),
         });
 
         assert!(output.ansi.contains("workspace-a"));
@@ -1454,21 +1747,57 @@ mod tests {
             spinner_tick: 0,
             rows: 8,
             cols: 40,
-            upgrade_banner: None,
+            armed_issue: None,
+            upgrade_progress: &BTreeMap::new(),
         });
 
         assert!(output.ansi.contains("│"));
     }
 
+    /// A session holding one remote pane whose daemon runs an older build.
+    fn skewed_session(name: &str) -> SessionInfo {
+        let mut session = sess(name, "/home/u/proj");
+        session.remote_panes.insert(
+            PaneId::Terminal(1),
+            zellij_tile::prelude::RemotePaneMetadata {
+                pane_uuid: "uuid".into(),
+                replay_cursor: 0,
+                close_pending: false,
+                foreground_argv: Vec::new(),
+                health: zellij_tile::prelude::RemotePaneHealth {
+                    status: RemoteProtocolStatus::VersionSkew,
+                    daemon_version: Some("26.5.0".into()),
+                    local_version: Some("26.7.0".into()),
+                    retry_count: 0,
+                    last_error: None,
+                },
+            },
+        );
+        session
+    }
+
     #[test]
-    fn open_sidebar_draws_upgrade_banner_on_top_row() {
+    fn a_remote_issue_is_a_navigable_row_under_its_session() {
+        let sessions = vec![skewed_session("api-dev")];
+        let rows = build_rows(&PaneManifest::default(), &[], &BTreeMap::new(), &sessions);
+        // The issue hangs directly off its session, so position names the host.
+        assert!(matches!(rows[0], Row::Session { .. }));
+        assert!(matches!(rows[1], Row::RemoteIssue(_)));
+        // Being a row is what makes it reachable: it lands in the target list
+        // that both the keyboard and the click map index into.
+        let targets = navigable_targets(&PaneManifest::default(), &[], &BTreeMap::new(), &sessions);
+        assert_eq!(targets[1], Target::RemoteIssue("api-dev".into()));
+    }
+
+    #[test]
+    fn the_rail_shows_the_issue_the_old_banner_hid() {
         let panes = PaneManifest::default();
         let tabs = Vec::new();
         let agents = BTreeMap::new();
-        let sessions = vec![sess("workspace-a", "/home/u/proj")];
+        let sessions = vec![skewed_session("api-dev")];
         let palette = Theme::default();
-
-        let output = render(RenderInput {
+        let progress = BTreeMap::new();
+        let input = |cols: usize| RenderInput {
             permissions_granted: true,
             panes: &panes,
             tabs: &tabs,
@@ -1481,42 +1810,63 @@ mod tests {
             scroll_agents: 0,
             spinner_tick: 0,
             rows: 8,
-            cols: 60,
-            upgrade_banner: Some(UpgradeBanner {
-                daemon_version: "26.5.0".into(),
-                local_version: "26.6.0".into(),
-                pane_count: 2,
-                armed: false,
-            }),
-        });
+            cols,
+            armed_issue: None,
+            upgrade_progress: &progress,
+        };
 
-        assert_eq!(output.banner_row, Some(0));
-        assert!(output.ansi.contains("click to upgrade"));
+        let full = render(input(60));
+        assert!(full.ansi.contains("v26.5.0 → 26.7.0"));
 
-        // The thin rail has no room for the banner. Narrow, not "closed mode":
-        // width is the only thing that selects the rail now.
-        let thin = render(RenderInput {
-            permissions_granted: true,
-            panes: &panes,
-            tabs: &tabs,
-            agents: &agents,
-            sessions: &sessions,
-            palette: &palette,
-            focused: false,
-            selected: 0,
-            scroll_sessions: 0,
-            scroll_agents: 0,
-            spinner_tick: 0,
-            rows: 8,
-            cols: THIN_WIDTH - 1,
-            upgrade_banner: Some(UpgradeBanner {
-                daemon_version: "26.5.0".into(),
-                local_version: "26.6.0".into(),
-                pane_count: 2,
-                armed: false,
-            }),
-        });
-        assert_eq!(thin.banner_row, None);
+        // The rail used to draw no banner at all, so a user living in it could
+        // neither see the problem nor act on it. Now the session's own glyph
+        // carries the warning.
+        let thin = render(input(THIN_WIDTH - 1));
+        assert!(thin.ansi.contains('⇪'));
+    }
+
+    #[test]
+    fn a_healthy_remote_session_adds_no_row() {
+        let mut session = sess("api-dev", "/home/u/proj");
+        session.remote_panes.insert(
+            PaneId::Terminal(1),
+            zellij_tile::prelude::RemotePaneMetadata {
+                pane_uuid: "uuid".into(),
+                replay_cursor: 0,
+                close_pending: false,
+                foreground_argv: Vec::new(),
+                health: Default::default(),
+            },
+        );
+        assert!(session_remote_issue(&session).is_none());
+        let rows = build_rows(&PaneManifest::default(), &[], &BTreeMap::new(), &[session]);
+        assert_eq!(rows.len(), 1);
+    }
+
+    #[test]
+    fn the_worst_pane_decides_the_session_issue() {
+        let mut session = skewed_session("api-dev");
+        session.remote_panes.insert(
+            PaneId::Terminal(2),
+            zellij_tile::prelude::RemotePaneMetadata {
+                pane_uuid: "other".into(),
+                replay_cursor: 0,
+                close_pending: false,
+                foreground_argv: Vec::new(),
+                health: zellij_tile::prelude::RemotePaneHealth {
+                    status: RemoteProtocolStatus::ProtocolIncompatible,
+                    daemon_version: None,
+                    local_version: Some("26.7.0".into()),
+                    retry_count: 2,
+                    last_error: Some("incompatible protocol version 2".into()),
+                },
+            },
+        );
+        let issue = session_remote_issue(&session).expect("an issue");
+        // A dead pane outranks a merely-stale one, and the count covers both.
+        assert_eq!(issue.kind, RemoteIssueKind::ProtocolIncompatible);
+        assert_eq!(issue.pane_count, 2);
+        assert_eq!(issue.retry_count, 2);
     }
 
     #[test]
@@ -1562,7 +1912,8 @@ mod tests {
             spinner_tick: 0,
             rows: 8,
             cols: THIN_WIDTH - 1,
-            upgrade_banner: None,
+            armed_issue: None,
+            upgrade_progress: &BTreeMap::new(),
         });
 
         assert_eq!(output.selected, 0);

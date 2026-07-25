@@ -113,6 +113,15 @@ pub struct RenderInput<'a> {
     pub coder_create: Option<&'a CreateWizard>,
     /// Transient success message after a no-wait create returns.
     pub coder_create_notice: Option<&'a str>,
+    /// An open that would start or install something on the far end, waiting
+    /// on its `y`. Owns the keyboard and draws over the bottom result row.
+    pub pending_start: Option<&'a str>,
+    /// Host a Ctrl-r reinstall is currently running against.
+    pub pending_reinstall: Option<&'a str>,
+    /// Agent build running on each bound remote, keyed by row identifier.
+    pub remote_agent_versions: &'a std::collections::BTreeMap<String, String>,
+    /// This build's version, to compare those against.
+    pub local_version: &'a str,
     /// Ranked saved SSH hosts (Ssh mode).
     pub ssh_results: &'a [RankedSshHost<'a>],
     /// Destinations that currently have a live bound session.
@@ -173,6 +182,10 @@ pub fn render(input: RenderInput) -> RenderOutput {
         pending_coder_stop,
         coder_create,
         coder_create_notice,
+        pending_start,
+        pending_reinstall,
+        remote_agent_versions,
+        local_version,
         ssh_results,
         bound_ssh_destinations,
         ssh_wizard,
@@ -392,6 +405,7 @@ pub fn render(input: RenderInput) -> RenderOutput {
                     idx == selected,
                     is_bound,
                     is_stopping,
+                    agent_version_span(remote_agent_versions.get(&identifier), local_version, p),
                     p,
                 );
                 row_map.push((y, idx));
@@ -402,7 +416,20 @@ pub fn render(input: RenderInput) -> RenderOutput {
                 let y = input_y - 1 - k;
                 let r = &ssh_results[idx];
                 let is_bound = bound_ssh_destinations.contains(&r.host.destination);
-                render_ssh_row(&mut out, y, cols, r, idx == selected, is_bound, p);
+                render_ssh_row(
+                    &mut out,
+                    y,
+                    cols,
+                    r,
+                    idx == selected,
+                    is_bound,
+                    agent_version_span(
+                        remote_agent_versions.get(&r.host.destination),
+                        local_version,
+                        p,
+                    ),
+                    p,
+                );
                 row_map.push((y, idx));
             }
         },
@@ -486,6 +513,45 @@ pub fn render(input: RenderInput) -> RenderOutput {
         }
     }
 
+    // A reinstall is a background repair, so it only reports progress.
+    if let Some(target) = pending_reinstall {
+        let glyph = spinner_frame.unwrap_or('◌');
+        render_row(
+            &mut out,
+            0,
+            input_y.saturating_sub(1),
+            cols,
+            None,
+            &[
+                Span::new(format!(" {} ", glyph), p.yellow),
+                Span::new(format!("reinstalling the flock agent on {target}…"), p.text).bold(),
+            ],
+        );
+    }
+
+    // The start confirm owns the keyboard, so it draws last and over everything
+    // else — whatever notice it covers is not what the next keypress answers.
+    if let Some(prompt) = pending_start {
+        let (question, detail) = match prompt.split_once("?  ") {
+            Some((question, detail)) => (format!("{question}?"), Some(detail)),
+            None => (prompt.to_owned(), None),
+        };
+        let mut spans = vec![
+            Span::new(" ▶ ", p.yellow),
+            Span::new(question, p.text).bold(),
+        ];
+        if let Some(detail) = detail {
+            spans.push(Span::new(format!("  {detail}"), p.muted).dim());
+        }
+        let used: usize = spans.iter().map(|span| span.text.width()).sum();
+        let keys = "[y]es · [n]o ";
+        if used + keys.width() < cols {
+            spans.push(Span::new(" ".repeat(cols - used - keys.width()), p.text));
+            spans.push(Span::new(keys, p.accent));
+        }
+        render_row(&mut out, 0, input_y.saturating_sub(1), cols, None, &spans);
+    }
+
     // The input line on the bottom row: prompt + query + a block cursor, with a
     // right-aligned shown/total count.
     render_input_row(&mut out, input_y, cols, query, total, total_candidates, p);
@@ -536,22 +602,34 @@ fn render_header_row(
         spans.push(styled(label, style_for(*enabled)));
     }
 
-    let hint = if creating_coder {
-        "Esc back · Enter next "
+    // Longest first: a narrow pane falls back to a shorter form rather than
+    // dropping the hint entirely, which used to leave the tab's key bindings
+    // completely undiscoverable.
+    let hints: &[&str] = if creating_coder {
+        &["Esc back · Enter next ", "Esc · Enter "]
     } else {
         match mode {
-            PickerMode::Sessions => "Tab switch · Ctrl-x close ",
-            PickerMode::Projects => "Tab ",
-            PickerMode::Codespaces => "Tab switch · Ctrl-x stop ",
-            PickerMode::Coder => "Tab switch · Ctrl-o create · Ctrl-x stop ",
-            PickerMode::Ssh => "Tab switch · Ctrl-o add · Ctrl-e edit · Ctrl-x delete ",
+            PickerMode::Sessions => &["Tab switch · Ctrl-x close ", "Ctrl-x close ", "? "],
+            PickerMode::Projects => &["Tab switch ", "Tab "],
+            PickerMode::Codespaces => &["Tab switch · Ctrl-x stop ", "Ctrl-x stop ", "? "],
+            PickerMode::Coder => &[
+                "Tab switch · Ctrl-o create · Ctrl-r reinstall · Ctrl-x stop ",
+                "Ctrl-o create · Ctrl-r reinstall · Ctrl-x stop ",
+                "Ctrl-o · Ctrl-r · Ctrl-x ",
+                "? ",
+            ],
+            PickerMode::Ssh => &[
+                "Tab switch · Ctrl-o add · Ctrl-e edit · Ctrl-r reinstall · Ctrl-x delete ",
+                "Ctrl-o add · Ctrl-e edit · Ctrl-r reinstall · Ctrl-x delete ",
+                "Ctrl-o · Ctrl-e · Ctrl-r · Ctrl-x ",
+                "? ",
+            ],
         }
     };
     let left_w: usize = spans.iter().map(|s| s.text.width()).sum();
-    let hint_w = hint.width();
-    if left_w + hint_w < cols {
-        spans.push(Span::new(" ".repeat(cols - left_w - hint_w), p.text));
-        spans.push(Span::new(hint, p.muted).dim());
+    if let Some(hint) = hints.iter().find(|hint| left_w + hint.width() < cols) {
+        spans.push(Span::new(" ".repeat(cols - left_w - hint.width()), p.text));
+        spans.push(Span::new(*hint, p.muted).dim());
     }
     render_row(out, 0, 0, cols, None, &spans);
 }
@@ -723,7 +801,20 @@ fn render_coder_create(
     }
 }
 
+/// The agent build a bound remote is running, dim when it matches this build
+/// and yellow when it does not — so a drifted remote is legible without the
+/// reader having to compare two version numbers character by character.
+fn agent_version_span(version: Option<&String>, local_version: &str, p: &Theme) -> Option<Span> {
+    let version = version?;
+    Some(if version == local_version {
+        Span::new(format!("v{version}"), p.text).dim()
+    } else {
+        Span::new(format!("v{version}"), p.yellow)
+    })
+}
+
 /// One saved SSH host row: `<●?> <name>  <dim destination>  <dim extra args>`.
+#[allow(clippy::too_many_arguments)]
 fn render_ssh_row(
     out: &mut String,
     y: usize,
@@ -731,6 +822,7 @@ fn render_ssh_row(
     r: &RankedSshHost,
     selected: bool,
     is_bound: bool,
+    agent_version: Option<Span>,
     p: &Theme,
 ) {
     let row_bg = selected.then_some(p.selection_bg);
@@ -780,18 +872,37 @@ fn render_ssh_row(
     if !r.host.extra_args.is_empty() {
         let used: usize = spans.iter().map(|span| span.text.width()).sum();
         let args = r.host.extra_args.join(" ");
-        let args_budget = cols.saturating_sub(used + 2);
+        let args_budget = cols.saturating_sub(used + version_width(&agent_version) + 2);
         if args_budget > 1 {
             spans.push(Span::new("  ", p.text));
             spans.push(Span::new(truncate_text(&args, args_budget), p.muted).dim());
         }
     }
+    push_agent_version(&mut spans, agent_version, cols, p);
     render_row(out, 0, y, cols, row_bg, &spans);
 }
 
-/// The SSH host add/edit form: previously entered fields render as summary
-/// rows, the active field is the input row, and a phase-specific hint row
-/// explains the constraints (key-based auth, token-per-arg).
+fn version_width(version: &Option<Span>) -> usize {
+    version.as_ref().map_or(0, |span| span.text.width() + 2)
+}
+
+/// Append the version, right after the row's content, only if it fits. A row
+/// that would have to truncate its name to show a version shows neither.
+fn push_agent_version(spans: &mut Vec<Span>, version: Option<Span>, cols: usize, p: &Theme) {
+    let Some(version) = version else {
+        return;
+    };
+    let used: usize = spans.iter().map(|span| span.text.width()).sum();
+    if used + version.text.width() + 2 <= cols {
+        spans.push(Span::new("  ", p.text));
+        spans.push(version);
+    }
+}
+
+/// The SSH host add/edit form as a field list: every field is on screen at
+/// once with the focused one carrying the cursor, so correcting a single value
+/// on a saved host does not mean retyping the others. The hint line tracks
+/// focus and explains that field's constraint.
 fn render_ssh_wizard(
     mut out: String,
     rows: usize,
@@ -800,6 +911,23 @@ fn render_ssh_wizard(
     p: &Theme,
 ) -> RenderOutput {
     let input_y = rows.saturating_sub(1);
+    let hint = match wizard.phase {
+        HostPhase::Name => {
+            " a display label; sessions bind to the destination, so renaming is always safe"
+        },
+        HostPhase::Destination if wizard.editing.is_some() => {
+            " user@host or a ~/.ssh/config alias — changing it re-homes this host's remote panes"
+        },
+        HostPhase::Destination => {
+            " user@host or a ~/.ssh/config alias — key/agent auth required (BatchMode)"
+        },
+        HostPhase::ExtraArgs => {
+            " optional, whitespace-separated tokens, e.g. -p 2222 -i ~/.ssh/key"
+        },
+    };
+
+    // Lay the rows out bottom-up like the rest of the picker: hint just above
+    // the input, fields above that in declaration order.
     let mut y = input_y.saturating_sub(1);
     if let Some(error) = wizard.error.as_ref() {
         render_row(
@@ -812,63 +940,6 @@ fn render_ssh_wizard(
         );
         y = y.saturating_sub(1);
     }
-    let (label, hint) = match wizard.phase {
-        HostPhase::Name => (
-            "Host name",
-            " a display label; sessions bind to the destination, so renaming is always safe",
-        ),
-        HostPhase::Destination => (
-            "Destination",
-            " user@host or a ~/.ssh/config alias — key/agent auth required (BatchMode)",
-        ),
-        HostPhase::ExtraArgs => (
-            "Extra ssh args",
-            " optional, whitespace-separated tokens, e.g. -p 2222 -i ~/.ssh/key — Enter saves",
-        ),
-    };
-    if wizard.phase >= HostPhase::Destination {
-        render_row(
-            &mut out,
-            0,
-            y,
-            cols,
-            None,
-            &[
-                Span::new(" Name  ", p.muted).dim(),
-                Span::new(wizard.name.as_str(), p.text).bold(),
-            ],
-        );
-        y = y.saturating_sub(1);
-    }
-    if wizard.phase >= HostPhase::ExtraArgs {
-        render_row(
-            &mut out,
-            0,
-            y,
-            cols,
-            None,
-            &[
-                Span::new(" Destination  ", p.muted).dim(),
-                Span::new(wizard.destination.as_str(), p.text).bold(),
-            ],
-        );
-        y = y.saturating_sub(1);
-    }
-    if wizard.editing.is_some() && wizard.phase == HostPhase::Destination {
-        render_row(
-            &mut out,
-            0,
-            y,
-            cols,
-            None,
-            &[Span::new(
-                " editing — changing the destination re-homes the host's remote panes",
-                p.muted,
-            )
-            .dim()],
-        );
-        y = y.saturating_sub(1);
-    }
     render_row(
         &mut out,
         0,
@@ -877,12 +948,54 @@ fn render_ssh_wizard(
         None,
         &[Span::new(hint, p.muted).dim()],
     );
-    let value = match wizard.phase {
-        HostPhase::Name => &wizard.name,
-        HostPhase::Destination => &wizard.destination,
-        HostPhase::ExtraArgs => &wizard.extra_args_input,
+
+    for field in HostWizard::FIELDS.iter().rev() {
+        y = y.saturating_sub(1);
+        let (label, value) = match field {
+            HostPhase::Name => ("Name", &wizard.name),
+            HostPhase::Destination => ("Destination", &wizard.destination),
+            HostPhase::ExtraArgs => ("Extra ssh args", &wizard.extra_args_input),
+        };
+        let focused = *field == wizard.phase;
+        let mut spans = vec![
+            Span::new(if focused { " › " } else { "   " }, p.accent).bold(),
+            Span::new(format!("{label:<15}"), p.muted).dim(),
+        ];
+        let budget = cols.saturating_sub(20).max(1);
+        if value.is_empty() && !focused {
+            spans.push(Span::new("—", p.muted).dim());
+        } else {
+            spans.push(Span::new(tail_text(value, budget), p.text).bold());
+        }
+        if focused {
+            spans.push(Span::new("▏", p.accent));
+        }
+        render_row(
+            &mut out,
+            0,
+            y,
+            cols,
+            focused.then_some(p.selection_bg),
+            &spans,
+        );
+    }
+
+    // The bottom row names the operation and the keys rather than echoing the
+    // focused field, which is already visible in the list above.
+    let title = if wizard.editing.is_some() {
+        "Edit host"
+    } else {
+        "Add host"
     };
-    render_wizard_input(&mut out, input_y, cols, label, value, 0, 0, p);
+    let keys = "↑↓ field · Enter saves · Esc cancels ";
+    let mut spans = vec![Span::new(format!(" {title}"), p.accent).bold()];
+    let used: usize = spans.iter().map(|span| span.text.width()).sum();
+    if used + keys.width() < cols {
+        spans.push(Span::new(" ".repeat(cols - used - keys.width()), p.text));
+        spans.push(Span::new(keys, p.muted).dim());
+    }
+    render_row(&mut out, 0, input_y, cols, None, &spans);
+
     out.push_str(RESET);
     RenderOutput {
         ansi: out,
@@ -1210,6 +1323,7 @@ fn render_codespace_row(
 }
 
 /// Render one Coder row: `<badge> <owner/name>  <template>  <status>`.
+#[allow(clippy::too_many_arguments)]
 fn render_coder_row(
     out: &mut String,
     y: usize,
@@ -1218,6 +1332,7 @@ fn render_coder_row(
     selected: bool,
     is_bound: bool,
     is_stopping: bool,
+    agent_version: Option<Span>,
     p: &Theme,
 ) {
     let row_bg = selected.then_some(p.selection_bg);
@@ -1264,7 +1379,8 @@ fn render_coder_row(
 
     if !r.workspace.template.is_empty() {
         let used: usize = spans.iter().map(|span| span.text.width()).sum();
-        let template_budget = cols.saturating_sub(used + state_width + 2);
+        let template_budget =
+            cols.saturating_sub(used + state_width + version_width(&agent_version) + 2);
         if template_budget > 1 {
             let template_style = Style {
                 fg: p.text,
@@ -1285,7 +1401,7 @@ fn render_coder_row(
 
     if !state_text.is_empty() {
         let used: usize = spans.iter().map(|span| span.text.width()).sum();
-        if used + state_width <= cols {
+        if used + state_width + version_width(&agent_version) <= cols {
             spans.push(Span::new("  ", p.text));
             let mut state = Span::new(state_text, state_color);
             if state_dim {
@@ -1294,6 +1410,7 @@ fn render_coder_row(
             spans.push(state);
         }
     }
+    push_agent_version(&mut spans, agent_version, cols, p);
     render_row(out, 0, y, cols, row_bg, &spans);
 }
 
@@ -1620,6 +1737,10 @@ mod tests {
             pending_coder_stop: None,
             coder_create: None,
             coder_create_notice: None,
+            pending_start: None,
+            pending_reinstall: None,
+            remote_agent_versions: &std::collections::BTreeMap::new(),
+            local_version: "26.7.0",
             ssh_results: &[],
             bound_ssh_destinations: &std::collections::HashSet::new(),
             ssh_wizard: None,
@@ -1687,6 +1808,10 @@ mod tests {
             pending_coder_stop: None,
             coder_create: None,
             coder_create_notice: None,
+            pending_start: None,
+            pending_reinstall: None,
+            remote_agent_versions: &std::collections::BTreeMap::new(),
+            local_version: "26.7.0",
             ssh_results: &[],
             bound_ssh_destinations: &std::collections::HashSet::new(),
             ssh_wizard: None,
@@ -1706,6 +1831,57 @@ mod tests {
         assert!(output.ansi.contains("running"));
         assert!(output.ansi.contains("Coder"));
         assert!(!output.ansi.contains("Codespaces"));
+        // Ctrl-r must be discoverable from the tab that offers it.
+        assert!(output.ansi.contains("Ctrl-r"));
+
+        // A bound remote's agent build shows on the row, so a drifted host is
+        // visible before it is opened rather than after.
+        let versions =
+            std::collections::BTreeMap::from([("alice/api".to_owned(), "26.5.0".to_owned())]);
+        let output_with_version = render(RenderInput {
+            remote_agent_versions: &versions,
+            ..RenderInput {
+                permissions_granted: true,
+                configured: false,
+                query: "",
+                mode: PickerMode::Coder,
+                enabled_modes: &[PickerMode::Coder],
+                session_results: &[],
+                results: &[],
+                open_paths: &std::collections::HashSet::new(),
+                codespace_results: &[],
+                bound_codespaces: &std::collections::HashSet::new(),
+                codespaces_error: None,
+                codespaces_refreshing: false,
+                pending_stop: None,
+                coder_results: &ranked,
+                bound_coder_workspaces: &std::collections::HashSet::new(),
+                coder_error: None,
+                coder_refreshing: false,
+                pending_coder_stop: None,
+                coder_create: None,
+                coder_create_notice: None,
+                pending_start: None,
+                pending_reinstall: None,
+                remote_agent_versions: &std::collections::BTreeMap::new(),
+                local_version: "26.7.0",
+                ssh_results: &[],
+                bound_ssh_destinations: &std::collections::HashSet::new(),
+                ssh_wizard: None,
+                ssh_error: None,
+                ssh_notice: None,
+                pending_ssh_delete: None,
+                pending_devcontainer: None,
+                spinner_frame: None,
+                palette: &theme,
+                selected: 0,
+                scroll: 0,
+                total_candidates: 1,
+                rows: 5,
+                cols: 80,
+            }
+        });
+        assert!(output_with_version.ansi.contains("v26.5.0"));
 
         let output_with_error = render(RenderInput {
             coder_error: Some(&crate::coder::CoderError::Other("bootstrap failed".into())),
@@ -1734,6 +1910,10 @@ mod tests {
                 pending_coder_stop: None,
                 coder_create: None,
                 coder_create_notice: None,
+                pending_start: None,
+                pending_reinstall: None,
+                remote_agent_versions: &std::collections::BTreeMap::new(),
+                local_version: "26.7.0",
                 ssh_results: &[],
                 bound_ssh_destinations: &std::collections::HashSet::new(),
                 ssh_wizard: None,
@@ -1795,6 +1975,10 @@ mod tests {
                 pending_coder_stop: None,
                 coder_create: Some(wizard),
                 coder_create_notice: None,
+                pending_start: None,
+                pending_reinstall: None,
+                remote_agent_versions: &std::collections::BTreeMap::new(),
+                local_version: "26.7.0",
                 ssh_results: &[],
                 bound_ssh_destinations: &std::collections::HashSet::new(),
                 ssh_wizard: None,

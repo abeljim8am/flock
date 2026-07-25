@@ -1962,6 +1962,56 @@ pub enum RemoteConnectionState {
     Disconnected,
 }
 
+/// Why a remote pane's daemon cannot serve it correctly, if anything. This is
+/// the single condition the sidebar renders and offers an action for; the
+/// bridge is the only writer, the server only relays.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RemoteProtocolStatus {
+    /// The daemon speaks our protocol and runs our build.
+    #[default]
+    Ok,
+    /// Same protocol, older or newer build. Recoverable by upgrading, and the
+    /// pane keeps working in the meantime.
+    VersionSkew,
+    /// The daemon speaks a protocol we cannot talk to. The pane is dead; only
+    /// a reinstall fixes it.
+    ProtocolIncompatible,
+    /// Bootstrapping the remote binary failed outright.
+    InstallFailed,
+}
+
+impl RemoteProtocolStatus {
+    /// Whether this status needs the user to do something. `Ok` never does.
+    pub fn needs_attention(&self) -> bool {
+        !matches!(self, RemoteProtocolStatus::Ok)
+    }
+}
+
+/// The bridge's view of one remote pane's health, written next to its replay
+/// cursor and read back by the server on every session-info tick. Deriving it
+/// from a file the bridge already maintains — rather than a one-shot pipe
+/// message — means the picture self-clears when the condition goes away and
+/// survives a plugin reload.
+#[derive(Debug, Default, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub struct RemotePaneHealth {
+    #[serde(default)]
+    pub status: RemoteProtocolStatus,
+    /// The daemon's build, when the handshake got far enough to learn it.
+    #[serde(default)]
+    pub daemon_version: Option<String>,
+    /// The bridge's own build, so a plugin that is not workspace-versioned can
+    /// still render the comparison.
+    #[serde(default)]
+    pub local_version: Option<String>,
+    /// Consecutive failed connection attempts; 0 while connected.
+    #[serde(default)]
+    pub retry_count: u32,
+    /// The most recent transport or handshake failure, already humanized.
+    #[serde(default)]
+    pub last_error: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 pub struct RemotePaneMetadata {
     pub pane_uuid: String,
@@ -1970,6 +2020,8 @@ pub struct RemotePaneMetadata {
     pub close_pending: bool,
     #[serde(default)]
     pub foreground_argv: Vec<String>,
+    #[serde(default)]
+    pub health: RemotePaneHealth,
 }
 
 pub fn stable_remote_pane_uuid(workspace: &str, session: &str, pane_id: PaneId) -> String {

@@ -5773,6 +5773,11 @@ impl SessionInfo {
                                         .collect()
                                 })
                                 .unwrap_or_default(),
+                            // Health is live state, re-read from the bridge's
+                            // sidecar files on every session-info tick. A
+                            // resurrected session must not carry a stale
+                            // problem forward from whenever it was written.
+                            health: Default::default(),
                         },
                     );
                 }
@@ -7550,6 +7555,7 @@ fn session_info_remote_backend_and_pane_cursor_round_trip() {
             replay_cursor: 42,
             close_pending: true,
             foreground_argv: vec!["codex".into(), "--resume".into()],
+            health: Default::default(),
         },
     );
     let serialized = session_info.to_string();

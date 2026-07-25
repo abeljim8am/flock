@@ -200,6 +200,7 @@ fn remote_panes_for_backend(
                 zellij_utils::data::RemotePaneMetadata {
                     replay_cursor: local_remote_cursor(&pane_uuid),
                     foreground_argv: local_remote_foreground(&pane_uuid),
+                    health: local_remote_health(&pane_uuid),
                     pane_uuid,
                     close_pending: false,
                 },
@@ -208,41 +209,45 @@ fn remote_panes_for_backend(
         .collect()
 }
 
-fn local_remote_cursor(pane_uuid: &str) -> u64 {
+/// Read one of the bridge's per-pane sidecar files (`<uuid>.<extension>` under
+/// the cache root). Every remote-pane fact the server relays comes from one of
+/// these, so they share the root lookup.
+fn local_remote_sidecar(pane_uuid: &str, extension: &str) -> Option<String> {
     let root = std::env::var_os("XDG_CACHE_HOME")
         .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".cache")));
-    root.and_then(|root| {
-        std::fs::read_to_string(
-            root.join("flock")
-                .join("remote-panes")
-                .join(format!("{pane_uuid}.cursor")),
-        )
-        .ok()
-    })
-    .and_then(|cursor| cursor.trim().parse().ok())
-    .unwrap_or_default()
+        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".cache")))?;
+    std::fs::read_to_string(
+        root.join("flock")
+            .join("remote-panes")
+            .join(format!("{pane_uuid}.{extension}")),
+    )
+    .ok()
+}
+
+fn local_remote_cursor(pane_uuid: &str) -> u64 {
+    local_remote_sidecar(pane_uuid, "cursor")
+        .and_then(|cursor| cursor.trim().parse().ok())
+        .unwrap_or_default()
 }
 
 fn local_remote_foreground(pane_uuid: &str) -> Vec<String> {
-    let root = std::env::var_os("XDG_CACHE_HOME")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".cache")));
-    root.and_then(|root| {
-        std::fs::read_to_string(
-            root.join("flock")
-                .join("remote-panes")
-                .join(format!("{pane_uuid}.foreground")),
-        )
-        .ok()
-    })
-    .map(|argv| {
-        argv.split('\0')
-            .filter(|arg| !arg.is_empty())
-            .map(str::to_owned)
-            .collect()
-    })
-    .unwrap_or_default()
+    local_remote_sidecar(pane_uuid, "foreground")
+        .map(|argv| {
+            argv.split('\0')
+                .filter(|arg| !arg.is_empty())
+                .map(str::to_owned)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// The bridge's health record for this pane. A missing or unparseable file
+/// means "nothing known", which is the healthy default — health must never
+/// invent a problem out of its own absence.
+fn local_remote_health(pane_uuid: &str) -> zellij_utils::data::RemotePaneHealth {
+    local_remote_sidecar(pane_uuid, "health")
+        .and_then(|raw| serde_json::from_str(&raw).ok())
+        .unwrap_or_default()
 }
 
 fn remote_connection_state(
@@ -251,18 +256,7 @@ fn remote_connection_state(
     use zellij_utils::data::RemoteConnectionState::*;
     let mut state = Disconnected;
     for pane in panes.values() {
-        let root = std::env::var_os("XDG_CACHE_HOME")
-            .map(PathBuf::from)
-            .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".cache")));
-        let pane_state = root
-            .and_then(|root| {
-                std::fs::read_to_string(
-                    root.join("flock")
-                        .join("remote-panes")
-                        .join(format!("{}.connection", pane.pane_uuid)),
-                )
-                .ok()
-            })
+        let pane_state = local_remote_sidecar(&pane.pane_uuid, "connection")
             .map(|value| match value.trim() {
                 "connected" => Connected,
                 "connecting" => Connecting,

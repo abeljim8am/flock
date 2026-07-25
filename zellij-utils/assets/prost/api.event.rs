@@ -432,6 +432,23 @@ pub struct RemotePaneMetadata {
     pub close_pending: bool,
     #[prost(string, repeated, tag="5")]
     pub foreground_argv: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+    #[prost(message, optional, tag="6")]
+    pub health: ::core::option::Option<RemotePaneHealth>,
+}
+/// 0 ok, 1 version skew, 2 protocol incompatible, 3 install failed.
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct RemotePaneHealth {
+    #[prost(uint32, tag="1")]
+    pub status: u32,
+    #[prost(string, optional, tag="2")]
+    pub daemon_version: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(string, optional, tag="3")]
+    pub local_version: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(uint32, tag="4")]
+    pub retry_count: u32,
+    #[prost(string, optional, tag="5")]
+    pub last_error: ::core::option::Option<::prost::alloc::string::String>,
 }
 #[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Clone, PartialEq, ::prost::Message)]

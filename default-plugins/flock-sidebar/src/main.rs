@@ -49,10 +49,7 @@ use std::collections::{BTreeMap, HashSet};
 use std::time::Instant;
 
 use detect::{detect_agent, identify_agent_from_command, identify_agent_from_screen, AgentState};
-use hook::{
-    parse_daemon_version_report, parse_hook_report, DaemonVersionReport, HookReport, Presence,
-    DAEMON_VERSION_PIPE_NAME, HOOK_PIPE_NAME,
-};
+use hook::{parse_hook_report, HookReport, Presence, HOOK_PIPE_NAME};
 use palette::Theme;
 use sessionizer::SessionizerConfig;
 use state::PaneAgentState;
@@ -122,15 +119,15 @@ struct State {
     command_synced: HashSet<PaneId>,
     /// Per-pane agent detection + arbitrated state, keyed by pane id.
     agents: BTreeMap<PaneId, PaneAgentState>,
-    /// Remote daemon version mismatches reported by local `remote-pty` bridges
-    /// over the `flock-daemon-version` pipe, keyed by the reporting pane.
-    daemon_mismatches: BTreeMap<PaneId, DaemonVersionReport>,
-    /// Whether the upgrade banner's first click has armed the confirm; the
-    /// second click closes the reported panes. Any other activation disarms.
-    upgrade_confirm_armed: bool,
-    /// The row the upgrade banner occupied in the last frame, for mouse
-    /// hit-testing (mirrors `click_map`).
-    banner_row: Option<usize>,
+    /// The session whose remote-issue row has been armed and is waiting on its
+    /// `y` confirm. Any other key, or activating anything else, disarms it.
+    armed_issue: Option<String>,
+    /// In-flight and just-finished upgrades, keyed by session name. Entries are
+    /// dropped once the health record they were fixing comes back clean.
+    upgrade_progress: BTreeMap<String, ui::UpgradeProgress>,
+    /// The flock binary to invoke for `remote-upgrade`, from the session
+    /// environment. Absent means the upgrade action is unavailable.
+    flock_executable: Option<String>,
     /// The last per-pane agent status we published to the cross-session bus
     /// (Phase 7). Diffed against the freshly-built status on each update so we
     /// only `publish_agent_state` — and thus only re-serialize the session
@@ -196,11 +193,13 @@ impl ZellijPlugin for State {
         // - ChangeApplicationState: switch session / focus pane on activation,
         //   resize our pane, and publish cross-session sidebar state
         // - ReadCliPipes: agent hook reports via `zellij pipe` (Phase 5)
+        // - RunCommands: `flock remote-upgrade` from a remote-issue row
         request_permission(&[
             PermissionType::ReadApplicationState,
             PermissionType::ReadPaneContents,
             PermissionType::ChangeApplicationState,
             PermissionType::ReadCliPipes,
+            PermissionType::RunCommands,
         ]);
 
         subscribe(&[
@@ -215,7 +214,12 @@ impl ZellijPlugin for State {
             EventType::PermissionRequestResult,
             EventType::Visible,
             EventType::Timer,
+            EventType::RunCommandResult,
         ]);
+
+        self.flock_executable = get_session_environment_variables()
+            .remove("FLOCK_EXECUTABLE")
+            .filter(|executable| !executable.trim().is_empty());
 
         // Our own pane id, to detect when the sidebar itself is focused.
         self.own_plugin_id = get_plugin_ids().plugin_id;
@@ -333,17 +337,11 @@ impl ZellijPlugin for State {
                 },
                 Mouse::LeftClick(line, _) => {
                     if line >= 0 {
-                        if self.banner_row == Some(line as usize)
-                            && !self.daemon_mismatches.is_empty()
-                        {
-                            self.activate_upgrade_banner();
-                            should_render = true;
-                        } else if let Some(index) = ui::index_at_row(&self.click_map, line as usize)
-                        {
-                            // Clicking anywhere else backs out of a pending
-                            // upgrade confirm.
-                            self.upgrade_confirm_armed = false;
+                        if let Some(index) = ui::index_at_row(&self.click_map, line as usize) {
                             self.selected = index;
+                            // A second click on an armed issue row is the mouse
+                            // equivalent of `y`; clicking anything else backs
+                            // out of the pending confirm.
                             self.activate_selected();
                             should_render = true;
                         }
@@ -351,12 +349,32 @@ impl ZellijPlugin for State {
                 },
                 _ => {},
             },
+            Event::RunCommandResult(exit_code, _stdout, stderr, context) => {
+                if let Some(session) = context.get(UPGRADE_CONTEXT_KEY) {
+                    self.finish_upgrade(session.clone(), exit_code, &stderr);
+                    should_render = true;
+                }
+            },
             // Reports the *plugin's* own pane visibility, not an agent pane's,
             // so it doesn't bear on seen-tracking (that follows the focused
             // terminal pane via `PaneUpdate`). Kept subscribed for later phases.
             Event::Visible(_) => {},
             Event::Key(key) => {
                 if key.has_no_modifiers() {
+                    // An armed upgrade owns the keyboard until it is answered,
+                    // mirroring the picker's delete-host confirm: `y` commits,
+                    // anything else backs out. Enter is deliberately excluded —
+                    // Enter is what armed the row, and a double-tap while
+                    // navigating must never restart a host's remote shells.
+                    if self.armed_issue.is_some() {
+                        let session = self.armed_issue.take();
+                        if matches!(key.bare_key, BareKey::Char('y') | BareKey::Char('Y')) {
+                            if let Some(session) = session {
+                                self.start_upgrade(&session);
+                            }
+                        }
+                        return true;
+                    }
                     match key.bare_key {
                         // Keyboard-first navigation over sessions + agents.
                         BareKey::Up | BareKey::Char('k') => {
@@ -393,19 +411,6 @@ impl ZellijPlugin for State {
         if pipe_message.name == DOCK_TOGGLE_PIPE {
             self.toggle_dock();
             return false; // the server's resize triggers our re-render
-        }
-        // Local remote-pty bridges report remote daemon build mismatches here;
-        // the render turns them into the upgrade banner.
-        if pipe_message.name == DAEMON_VERSION_PIPE_NAME {
-            return match parse_daemon_version_report(&pipe_message.args) {
-                Ok(report) => self.apply_daemon_version_report(report),
-                Err(reason) => {
-                    eprintln!(
-                        "flock-sidebar: ignoring {DAEMON_VERSION_PIPE_NAME} report: {reason}"
-                    );
-                    false
-                },
-            };
         }
         // Only the agent self-report channel concerns us otherwise; ignore the
         // rest so we don't claim pipes meant for other plugins.
@@ -445,13 +450,13 @@ impl ZellijPlugin for State {
             spinner_tick: self.spinner_tick,
             rows,
             cols,
-            upgrade_banner: self.upgrade_banner(),
+            armed_issue: self.armed_issue.as_deref(),
+            upgrade_progress: &self.upgrade_progress,
         });
         self.selected = output.selected;
         self.scroll_sessions = output.scroll_sessions;
         self.scroll_agents = output.scroll_agents;
         self.click_map = output.click_map;
-        self.banner_row = output.banner_row;
         print!("{}", output.ansi);
     }
 }
@@ -584,6 +589,7 @@ impl State {
                 } else {
                     self.sessions = snapshot.live_sessions;
                     self.sync_dock_mode_from_sessions();
+                    self.retire_settled_upgrades();
                     true
                 }
             },
@@ -594,19 +600,25 @@ impl State {
         }
     }
 
-    /// The upgrade banner for the current mismatch picture, if any. Multiple
-    /// panes can report (even against different daemons); the banner shows the
-    /// first report's versions and the total pane count.
-    fn upgrade_banner(&self) -> Option<ui::UpgradeBanner> {
-        self.daemon_mismatches
-            .values()
-            .next()
-            .map(|report| ui::UpgradeBanner {
-                daemon_version: report.daemon_version.clone(),
-                local_version: report.local_version.clone(),
-                pane_count: self.daemon_mismatches.len(),
-                armed: self.upgrade_confirm_armed,
-            })
+    /// Drop finished upgrade notices once the health they were fixing reads
+    /// clean, so a `✓` row retires itself instead of needing a timer.
+    fn retire_settled_upgrades(&mut self) {
+        if self.upgrade_progress.is_empty() {
+            return;
+        }
+        let sessions = self.visible_sessions();
+        self.upgrade_progress.retain(|session, progress| {
+            // A run still in flight always stays; only a finished one is
+            // allowed to disappear when its session stops reporting a problem.
+            if matches!(progress, ui::UpgradeProgress::Working) {
+                return true;
+            }
+            sessions
+                .iter()
+                .find(|candidate| candidate.name == *session)
+                .and_then(ui::session_remote_issue)
+                .is_some()
+        });
     }
 
     /// The ordered navigable targets (sessions then agents). Rebuilt on demand;
@@ -742,23 +754,93 @@ impl State {
 
     /// Move the selection cursor up by `n`, clamped at the top.
     fn select_prev(&mut self, n: usize) {
-        self.selected = self.selected.saturating_sub(n);
+        self.selected = self.skip_unreachable(self.selected.saturating_sub(n), false);
     }
 
     /// Move the selection cursor down by `n`, clamped at the last target.
     fn select_next(&mut self, n: usize) {
         let last = self.targets().len().saturating_sub(1);
-        self.selected = self.selected.saturating_add(n).min(last);
+        self.selected = self.skip_unreachable(self.selected.saturating_add(n).min(last), true);
+    }
+
+    /// Step past targets the current render cannot show. The rail draws one
+    /// glyph per session and folds each session's remote issue into it, so
+    /// stopping the cursor on an issue row there would look like a dead key.
+    fn skip_unreachable(&self, mut index: usize, forward: bool) -> usize {
+        if self.cols >= ui::THIN_WIDTH {
+            return index;
+        }
+        let targets = self.targets();
+        while matches!(targets.get(index), Some(Target::RemoteIssue(_))) {
+            match if forward {
+                index.checked_add(1).filter(|next| *next < targets.len())
+            } else {
+                index.checked_sub(1)
+            } {
+                Some(next) => index = next,
+                // Nothing reachable that way; leave the cursor where it was.
+                None => break,
+            }
+        }
+        index
     }
 
     /// Act on the selected row: switch to a session, or focus an agent pane.
     fn activate_selected(&mut self) {
-        match self.targets().into_iter().nth(self.selected) {
+        let target = self.targets().into_iter().nth(self.selected);
+        // Activating anything at all clears a pending confirm; only the armed
+        // row's own activation re-arms below.
+        let previously_armed = self.armed_issue.take();
+        match target {
             Some(Target::Session(name)) => switch_session(Some(&name)),
+            Some(Target::RemoteIssue(session)) => {
+                // Clicking the armed row a second time is the mouse path
+                // through the same confirm the keyboard answers with `y`.
+                if previously_armed.as_deref() == Some(session.as_str()) {
+                    self.start_upgrade(&session);
+                } else if self.issue_is_actionable(&session) {
+                    self.armed_issue = Some(session);
+                }
+            },
             Some(Target::Pane(PaneId::Terminal(id))) => focus_terminal_pane(id, false, false),
             Some(Target::Pane(PaneId::Plugin(id))) => focus_plugin_pane(id, false, false),
             None => {},
         }
+    }
+
+    /// Whether this session's issue offers an action. A reconnecting transport
+    /// is already retrying, so arming a confirm over it would promise a fix the
+    /// button cannot deliver.
+    fn issue_is_actionable(&self, session: &str) -> bool {
+        self.visible_sessions()
+            .iter()
+            .find(|candidate| candidate.name == session)
+            .and_then(ui::session_remote_issue)
+            .is_some_and(|issue| issue.kind.is_actionable())
+    }
+
+    /// Run `flock remote-upgrade` for a session's remote backend: reinstall the
+    /// agent, retire the daemon once its panes drain, and let each bridge
+    /// reconnect at its saved cursor. The panes stay open throughout — this is
+    /// why the confirm can honestly promise "reconnect" rather than "close".
+    fn start_upgrade(&mut self, session: &str) {
+        let Some(backend) = self
+            .visible_sessions()
+            .into_iter()
+            .find(|candidate| candidate.name == session)
+            .and_then(|candidate| candidate.remote_backend)
+        else {
+            return;
+        };
+        let Some(argv) = remote_upgrade_argv(&backend, self.flock_executable.as_deref()) else {
+            return;
+        };
+        self.upgrade_progress
+            .insert(session.to_owned(), ui::UpgradeProgress::Working);
+        run_command(
+            &argv.iter().map(String::as_str).collect::<Vec<_>>(),
+            BTreeMap::from_iter([(UPGRADE_CONTEXT_KEY.to_owned(), session.to_owned())]),
+        );
     }
 
     /// Apply a parsed agent self-report (Phase 5 hook channel) to its target
@@ -793,42 +875,27 @@ impl State {
         }
     }
 
-    /// Track a remote daemon version report from a local bridge. Matching
-    /// versions clear the pane's entry (the daemon upgraded); a mismatch shows
-    /// the upgrade banner. Returns whether the sidebar needs a repaint.
-    fn apply_daemon_version_report(&mut self, report: DaemonVersionReport) -> bool {
-        let pane_id = report.pane_id;
-        let changed = if report.daemon_version == report.local_version {
-            self.daemon_mismatches.remove(&pane_id).is_some()
-        } else {
-            self.daemon_mismatches
-                .insert(pane_id, report.clone())
-                .as_ref()
-                != Some(&report)
-        };
-        if self.daemon_mismatches.is_empty() {
-            self.upgrade_confirm_armed = false;
-        }
-        changed
-    }
-
-    /// Act on an upgrade-banner click: the first arms the confirm, the second
-    /// closes every reported remote pane. Closing the local pane triggers the
-    /// server's remote close-pending cleanup, so the daemon-side pane closes
-    /// too; once the daemon holds no panes, the next connect retires it onto
-    /// the newly installed binary (reopen the session from the picker).
-    fn activate_upgrade_banner(&mut self) {
-        if !self.upgrade_confirm_armed {
-            self.upgrade_confirm_armed = true;
-            return;
-        }
-        for pane_id in self.daemon_mismatches.keys() {
-            if let PaneId::Terminal(id) = pane_id {
-                close_terminal_pane(*id);
+    /// Record how a `remote-upgrade` run ended. Success leaves a short-lived
+    /// confirmation on the row; failure keeps the reason there until the user
+    /// retries, because a silent failure is indistinguishable from a fix.
+    fn finish_upgrade(&mut self, session: String, exit_code: Option<i32>, stderr: &[u8]) {
+        let panes = self
+            .visible_sessions()
+            .iter()
+            .find(|candidate| candidate.name == session)
+            .map(|candidate| candidate.remote_panes.len())
+            .unwrap_or_default();
+        let progress = if exit_code == Some(0) {
+            ui::UpgradeProgress::Done {
+                version: VERSION.to_owned(),
+                panes,
             }
-        }
-        self.daemon_mismatches.clear();
-        self.upgrade_confirm_armed = false;
+        } else {
+            ui::UpgradeProgress::Failed {
+                reason: last_error_line(stderr),
+            }
+        };
+        self.upgrade_progress.insert(session, progress);
     }
 
     /// Build this session's per-pane agent status from the live tracked state
@@ -1085,14 +1152,55 @@ impl State {
         // Pane ids are reused; forgetting closed panes lets the manifest sync
         // re-query a fresh pane that takes over an old id.
         self.command_synced.retain(|pane_id| live.contains(pane_id));
-        // A closed pane's daemon mismatch is moot (its bridge is gone; a
-        // successor pane re-reports if the daemon is still outdated).
-        self.daemon_mismatches
-            .retain(|pane_id, _| live.contains(pane_id));
-        if self.daemon_mismatches.is_empty() {
-            self.upgrade_confirm_armed = false;
-        }
     }
+}
+
+/// Context key tagging a `remote-upgrade` run with the session it belongs to,
+/// so its result lands on the right row.
+const UPGRADE_CONTEXT_KEY: &str = "flock_remote_upgrade";
+
+/// The `flock remote-upgrade` argv for a session's backend. Devcontainers are
+/// rebuilt rather than upgraded in place, so they are deliberately excluded.
+fn remote_upgrade_argv(backend: &RemoteBackend, executable: Option<&str>) -> Option<Vec<String>> {
+    let mut argv = vec![
+        executable?.to_owned(),
+        "remote-upgrade".to_owned(),
+        "--provider".to_owned(),
+    ];
+    match backend {
+        RemoteBackend::Coder { workspace, .. } => {
+            argv.push("coder".to_owned());
+            argv.push("--workspace".to_owned());
+            argv.push(workspace.clone());
+        },
+        RemoteBackend::Ssh {
+            destination,
+            extra_args,
+            ..
+        } => {
+            argv.push("ssh".to_owned());
+            argv.push("--destination".to_owned());
+            argv.push(destination.clone());
+            for arg in extra_args {
+                argv.push("--ssh-arg".to_owned());
+                argv.push(arg.clone());
+            }
+        },
+        RemoteBackend::Devcontainer { .. } => return None,
+    }
+    Some(argv)
+}
+
+/// The last non-empty line of a failed command's stderr, trimmed to something a
+/// narrow row can hold. Callers have already decided this is a failure.
+fn last_error_line(stderr: &[u8]) -> String {
+    String::from_utf8_lossy(stderr)
+        .lines()
+        .rev()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .map(|line| line.to_owned())
+        .unwrap_or_else(|| "upgrade failed".to_owned())
 }
 
 /// Which remote transport a session/pane binding uses. Both kinds behave the
