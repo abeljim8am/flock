@@ -5397,6 +5397,11 @@ impl Screen {
 
             let tiled_panes: Vec<PaneLayoutMetadata> = tab
                 .get_tiled_panes()
+                // The dock is emitted as the layout's `dock` node, not as a pane.
+                // Dumping it here too would resurrect *both*, i.e. a duplicate
+                // sidebar — and the geoms feeding the percentage reconstruction
+                // would be computed against the wrong space.
+                .filter(|(_, p)| !p.is_dock())
                 .map(|(pane_id, p)| {
                     // here we look to see if this pane triggers any suppressed pane,
                     // and if so we take that suppressed pane - we do this because this
@@ -5938,6 +5943,9 @@ fn find_already_running_panes(
     let mut layout_tiled_instructions = tiled_layout.extract_run_instructions();
     let running_tiled_instructions: Vec<Option<Run>> = active_tab
         .get_tiled_panes()
+        // The dock is not in the layout's pane tree, so it can never match one of
+        // its run instructions.
+        .filter(|(_, pane)| !pane.is_dock())
         .map(|(_, pane)| pane.invoked_with().clone())
         .collect();
 

@@ -1919,6 +1919,37 @@ impl<'a> KdlLayoutParser<'a> {
         }
         Ok(())
     }
+    /// Whether this pane runs the same plugin as the dock.
+    ///
+    /// Migration for layouts written before the dock existed, where the sidebar was
+    /// an ordinary pane. A layout that declares both — a dumped-and-resurrected
+    /// session, or a hand-edited one — would otherwise come up with two sidebars,
+    /// which is the very bug the dock exists to prevent. The dock declaration wins
+    /// and the pane is dropped.
+    fn pane_duplicates_the_dock(&self, pane: &TiledPaneLayout) -> bool {
+        let Some(dock) = self.dock.as_ref() else {
+            return false;
+        };
+        let Some(dock_location) = dock
+            .run
+            .get_run_plugin()
+            .map(|run_plugin| run_plugin.location.display())
+        else {
+            return false;
+        };
+        // Only a leaf pane can be the stray sidebar; never discard a pane with
+        // children, which would take real content with it.
+        if !pane.children.is_empty() {
+            return false;
+        }
+        match &pane.run {
+            Some(Run::Plugin(run)) => run
+                .get_run_plugin()
+                .map(|run_plugin| run_plugin.location.display() == dock_location)
+                .unwrap_or(false),
+            _ => false,
+        }
+    }
     fn parse_dock_node(&self, dock_node: &KdlNode) -> Result<DockLayout, ConfigError> {
         let mut run = None;
         if let Some(children) = kdl_children_nodes!(dock_node) {
@@ -2394,6 +2425,9 @@ impl<'a> KdlLayoutParser<'a> {
         if child_name == "pane" {
             let is_part_of_stack = false;
             let mut pane_node = self.parse_pane_node(child, is_part_of_stack)?;
+            if self.pane_duplicates_the_dock(&pane_node) {
+                return Ok(());
+            }
             if let Some(global_cwd) = &self.global_cwd {
                 pane_node.add_cwd_to_layout(&global_cwd);
             }

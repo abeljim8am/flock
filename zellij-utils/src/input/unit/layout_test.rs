@@ -2784,3 +2784,48 @@ fn dock_inside_a_swap_layout_is_an_error() {
         error
     );
 }
+
+#[test]
+fn a_pane_duplicating_the_dock_is_dropped() {
+    // Migration: a layout dumped before the dock existed declares the sidebar as a
+    // pane. If it also has a dock, honouring both would resurrect two sidebars —
+    // exactly the bug the dock exists to prevent. The dock wins.
+    let kdl_layout = r#"
+        layout {
+            dock size=40 closed_size=5 {
+                plugin location="zellij:status-bar"
+            }
+            pane size=1 borderless=true {
+                plugin location="zellij:status-bar"
+            }
+            pane
+        }
+    "#;
+    let layout = Layout::from_kdl(kdl_layout, Some("layout_file_name".into()), None, None).unwrap();
+    assert!(layout.dock.is_some());
+    let template = layout.template.as_ref().unwrap();
+    assert_eq!(
+        template.0.children.len(),
+        1,
+        "the stray sidebar pane should be gone, leaving only the content pane"
+    );
+    assert_eq!(template.0.children[0].run, None);
+}
+
+#[test]
+fn a_pane_with_children_is_never_dropped_as_a_dock_duplicate() {
+    // Guard on the migration above: never discard a pane that holds content.
+    let kdl_layout = r#"
+        layout {
+            dock size=40 closed_size=5 {
+                plugin location="zellij:status-bar"
+            }
+            pane split_direction="vertical" {
+                pane
+                pane
+            }
+        }
+    "#;
+    let layout = Layout::from_kdl(kdl_layout, Some("layout_file_name".into()), None, None).unwrap();
+    assert_eq!(layout.pane_count(), 2);
+}
