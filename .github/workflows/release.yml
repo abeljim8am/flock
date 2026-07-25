@@ -9,7 +9,7 @@ on:
       tag:
         description: Release tag to create
         required: true
-        default: v26.7.0
+        default: v26.8.0
         type: string
 
 permissions:

@@ -21,6 +21,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
   it. Previously the stale instances could flip it back and the toggle settled on the
   wrong state.
 
+## [26.8.0] - 2026-07-25
+* feat(remote): show real remote health and version drift, classify bootstrap failures,
+  offer reinstall/upgrade actions, and confirm remote workspace starts and installs.
+
 ## [26.7.0] - 2026-07-24
 * feat(dock)!: redesign the flock sidebar as a first-class `dock` — a layout-level
   declaration (`dock size=40 closed_size=5 { plugin location="…" }`) for a plugin
