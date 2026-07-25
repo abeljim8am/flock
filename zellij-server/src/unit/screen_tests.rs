@@ -2804,7 +2804,10 @@ pub fn send_cli_scroll_up_action() {
     std::thread::sleep(std::time::Duration::from_millis(100));
     // we send two actions here because only the last line in the pane is empty, so one action
     // won't show in a render
+    // this test asserts every render event, so each action needs to clear the render debounce
+    // window in order to produce a snapshot of its own
     send_cli_action_to_server(&session_metadata, cli_action.clone(), client_id);
+    std::thread::sleep(std::time::Duration::from_millis(100)); // give time for the async render
     send_cli_action_to_server(&session_metadata, cli_action.clone(), client_id);
     std::thread::sleep(std::time::Duration::from_millis(100));
     mock_screen.teardown(vec![server_instruction, screen_thread]);
@@ -2894,11 +2897,16 @@ pub fn send_cli_scroll_to_bottom_action() {
         pane_contents.as_bytes().to_vec(),
     ));
     std::thread::sleep(std::time::Duration::from_millis(100));
-    // scroll up some
+    // scroll up some - this test asserts every render event, so each action needs to clear the
+    // render debounce window in order to produce a snapshot of its own
     send_cli_action_to_server(&session_metadata, scroll_up_cli_action.clone(), client_id);
+    std::thread::sleep(std::time::Duration::from_millis(100)); // give time for the async render
     send_cli_action_to_server(&session_metadata, scroll_up_cli_action.clone(), client_id);
+    std::thread::sleep(std::time::Duration::from_millis(100)); // give time for the async render
     send_cli_action_to_server(&session_metadata, scroll_up_cli_action.clone(), client_id);
+    std::thread::sleep(std::time::Duration::from_millis(100)); // give time for the async render
     send_cli_action_to_server(&session_metadata, scroll_up_cli_action.clone(), client_id);
+    std::thread::sleep(std::time::Duration::from_millis(100)); // give time for the async render
 
     // scroll to bottom
     send_cli_action_to_server(
