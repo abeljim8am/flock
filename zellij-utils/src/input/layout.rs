@@ -216,11 +216,15 @@ impl RunPluginOrAlias {
             (
                 RunPluginOrAlias::Alias(self_alias),
                 Some(Run::Plugin(RunPluginOrAlias::RunPlugin(other_run_plugin))),
-            ) => self_alias.run_plugin.as_ref() == Some(other_run_plugin),
+            ) => self_alias
+                .run_plugin
+                .as_ref()
+                .map(|self_run_plugin| self_run_plugin.is_request_satisfied_by(other_run_plugin))
+                .unwrap_or(false),
             (
                 RunPluginOrAlias::RunPlugin(self_run_plugin),
                 Some(Run::Plugin(RunPluginOrAlias::RunPlugin(other_run_plugin))),
-            ) => self_run_plugin == other_run_plugin,
+            ) => self_run_plugin.is_request_satisfied_by(other_run_plugin),
             _ => false,
         }
     }
@@ -515,6 +519,17 @@ impl PluginAlias {
     }
 }
 
+impl RunPlugin {
+    /// Whether `running` is an instance this run-plugin is asking to find: same
+    /// location, and every configuration key we specify matching. See
+    /// [`PluginUserConfiguration::is_satisfied_by`] for why this is a subset test
+    /// rather than equality.
+    pub fn is_request_satisfied_by(&self, running: &RunPlugin) -> bool {
+        self.location == running.location
+            && self.configuration.is_satisfied_by(&running.configuration)
+    }
+}
+
 #[allow(clippy::derive_hash_xor_eq)]
 impl PartialEq for RunPlugin {
     fn eq(&self, other: &Self) -> bool {
@@ -549,6 +564,28 @@ impl PluginUserConfiguration {
     }
     pub fn inner(&self) -> &BTreeMap<String, String> {
         &self.0
+    }
+    /// Whether this configuration, read as a *request to find a running plugin*, is
+    /// satisfied by the configuration that plugin was actually launched with.
+    ///
+    /// Keys the request does not mention are "don't care". An empty request
+    /// therefore matches any instance of the plugin.
+    ///
+    /// Identity-by-exact-configuration is right for *launching* — two instances with
+    /// different settings are genuinely different plugins — but wrong for *finding*
+    /// one, and its failure mode is silent and destructive: the caller concludes
+    /// nothing is running and launches a duplicate in a new pane. A keybinding
+    /// naming a plugin cannot reasonably be expected to restate every argument the
+    /// layout happened to launch it with, and a binding that restates *most* of them
+    /// is the worst case of all — it looks correct and still misses.
+    ///
+    /// `caller_cwd` is ignored: it is injected during alias resolution rather than
+    /// written by the user.
+    pub fn is_satisfied_by(&self, running: &PluginUserConfiguration) -> bool {
+        self.0
+            .iter()
+            .filter(|(key, _)| key.as_str() != "caller_cwd")
+            .all(|(key, value)| running.inner().get(key) == Some(value))
     }
     pub fn insert(&mut self, config_key: impl Into<String>, config_value: impl Into<String>) {
         self.0.insert(config_key.into(), config_value.into());

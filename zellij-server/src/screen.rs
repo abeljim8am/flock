@@ -973,7 +973,10 @@ pub enum ScreenInstruction {
     },
     RerunCommandPane(u32, Option<NotificationEnd>), // u32 - terminal pane id
     ResizePaneWithId(ResizeStrategy, PaneId),
-    SetDockMode(DockMode),
+    SetDockMode {
+        mode: DockMode,
+        expected: Option<DockMode>,
+    },
     ToggleDock,
     EditScrollbackForPaneWithId(PaneId, Option<NotificationEnd>),
     WriteToPaneId(Vec<u8>, PaneId, Option<NotificationEnd>),
@@ -1313,7 +1316,7 @@ impl From<&ScreenInstruction> for ScreenContext {
             ScreenInstruction::Reconfigure { .. } => ScreenContext::Reconfigure,
             ScreenInstruction::RerunCommandPane { .. } => ScreenContext::RerunCommandPane,
             ScreenInstruction::ResizePaneWithId(..) => ScreenContext::ResizePaneWithId,
-            ScreenInstruction::SetDockMode(..) => ScreenContext::SetDockMode,
+            ScreenInstruction::SetDockMode { .. } => ScreenContext::SetDockMode,
             ScreenInstruction::ToggleDock => ScreenContext::ToggleDock,
             ScreenInstruction::EditScrollbackForPaneWithId(..) => {
                 ScreenContext::EditScrollbackForPaneWithId
@@ -4427,13 +4430,19 @@ impl Screen {
     /// `Screen` is the single writer of dock state. That is what makes all tabs
     /// agree, makes the operation idempotent, and means a plugin can converge on a
     /// mode adopted from another session without racing anything.
-    pub fn set_dock_mode(&mut self, mode: DockMode) -> Result<()> {
-        let already_in_mode = self
-            .published_dock_state
-            .map(|state| state.mode == mode)
-            .unwrap_or(false);
-        if already_in_mode {
+    pub fn set_dock_mode(&mut self, mode: DockMode, expected: Option<DockMode>) -> Result<()> {
+        let current = self.current_dock_mode();
+        if current == mode {
             return Ok(());
+        }
+        // Compare-and-swap: a dock is materialized per tab, so one broadcast toggle
+        // reaches N plugin instances, each having decided on `mode` from its own
+        // cached view. Only the one whose view still matches reality wins; the rest
+        // are stale and must not flip it back.
+        if let Some(expected) = expected {
+            if expected != current {
+                return Ok(());
+            }
         }
         for tab in self.tabs.values_mut() {
             tab.set_dock_mode(mode);
@@ -4450,21 +4459,22 @@ impl Screen {
         self.log_and_report_session_state()?;
         Ok(())
     }
+    /// This session's dock mode: what we published, else whatever a tab
+    /// materialized, else the default.
+    fn current_dock_mode(&self) -> DockMode {
+        self.published_dock_state
+            .map(|state| state.mode)
+            .or_else(|| self.tabs.values().find_map(|tab| tab.dock_mode()))
+            .unwrap_or_default()
+    }
     /// Flip every tab's dock between open and collapsed.
     pub fn toggle_dock(&mut self) -> Result<()> {
-        let current = self
-            .published_dock_state
-            .map(|state| state.mode)
-            .or_else(|| {
-                // No mode established yet: take it from whatever a tab materialized.
-                self.tabs.values().find_map(|tab| tab.dock_mode())
-            })
-            .unwrap_or_default();
+        let current = self.current_dock_mode();
         let next = match current {
             DockMode::Open => DockMode::Closed,
             DockMode::Closed => DockMode::Open,
         };
-        self.set_dock_mode(next)
+        self.set_dock_mode(next, Some(current))
     }
     pub fn break_pane(
         &mut self,
@@ -9281,8 +9291,8 @@ pub(crate) fn screen_thread_main(
                 // cells are cleared rather than left as garbage.
                 screen.render(None)?;
             },
-            ScreenInstruction::SetDockMode(mode) => {
-                screen.set_dock_mode(mode)?;
+            ScreenInstruction::SetDockMode { mode, expected } => {
+                screen.set_dock_mode(mode, expected)?;
                 // Repaint so the band change is reflected and the cells the dock
                 // vacated are cleared rather than left as garbage.
                 screen.render(None)?;

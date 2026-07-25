@@ -389,6 +389,11 @@ message DockState {
 
 message SetDockModePayload {
   uint32 mode = 1;
+  // The mode the caller believed was current when it decided on `mode`. The server
+  // applies the change only if this still matches — a compare-and-swap, so that N
+  // dock plugin instances all reacting to one broadcast toggle produce exactly one
+  // flip instead of N.
+  optional uint32 expected = 2;
 }
 
 message PaneAgentStatus {

@@ -3862,7 +3862,17 @@ pub enum PluginCommand {
     /// applies it to every tab, stamps the timestamp, and republishes it on
     /// `SessionInfo`. A plugin never sets a width, so it can never fight the
     /// layout engine.
-    SetDockMode(DockMode),
+    ///
+    /// `expected` makes this a compare-and-swap: when `Some`, the server applies the
+    /// change only if that is still the current mode. A dock is materialized once
+    /// per tab, so one broadcast toggle reaches N plugin instances; each computes
+    /// the flip from its own cached view of the mode, and without the guard the
+    /// flips race and can settle on the wrong state. Cross-session adoption passes
+    /// `None`, since there it genuinely wants "converge to this mode".
+    SetDockMode {
+        mode: DockMode,
+        expected: Option<DockMode>,
+    },
 }
 
 // Response type for plugin API methods that open a pane in a new tab

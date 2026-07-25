@@ -690,8 +690,11 @@ impl State {
     /// against the tab, and applies it to every tab. We never touch geometry, so we
     /// can no longer fight the layout engine.
     fn toggle_dock(&mut self) {
-        let next = self.sidebar_mode.toggled();
-        set_dock_mode(next.into());
+        // Pass the mode we believe is current so the server can compare-and-swap.
+        // A dock exists per tab, so this broadcast reaches every instance; only the
+        // one whose view is still accurate should flip it.
+        let current = self.sidebar_mode;
+        set_dock_mode(current.toggled().into(), Some(current.into()));
     }
 
     /// Track the server's dock mode, and adopt a newer one from another session.
@@ -731,8 +734,9 @@ impl State {
         if mode == self.sidebar_mode {
             return should_render;
         }
-        // `SetDockMode` is idempotent, so converging cannot race or ping-pong.
-        set_dock_mode(mode.into());
+        // Unconditional: this is "converge to the mode another session published",
+        // not a flip, so there is nothing to compare against.
+        set_dock_mode(mode.into(), None);
         should_render
     }
 

@@ -5,6 +5,21 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
 
 ## [Unreleased]
+* fix(plugins): stop a keybinding that names a plugin from spawning a duplicate of
+  it. Finding a running plugin required the caller to restate the exact configuration
+  it was launched with, so `MessagePlugin "zellij:flock-sidebar" { name "..." }`
+  (no configuration of its own) and `LaunchOrFocusPlugin "flock-selector" { ...ten of
+  the layout's eleven keys... }` both missed the instance the layout declared — and
+  each then launched a second copy into a new pane. Matching is now a subset test:
+  configuration keys the request names must match, keys it omits are "don't care".
+  Applies to both the pipe/`MessagePlugin` path and the `LaunchOrFocusPlugin` focus
+  path. A caller wanting a fresh instance still asks with `launch_new`.
+* fix(dock): make the toggle deterministic when a dock exists in several tabs.
+  `SetDockMode` gained an `expected` mode, making it a compare-and-swap: one
+  broadcast toggle reaches every dock plugin instance, each deciding a target from
+  its own cached view, and only the instance whose view still matches reality flips
+  it. Previously the stale instances could flip it back and the toggle settled on the
+  wrong state.
 
 ## [26.7.0] - 2026-07-24
 * feat(dock)!: redesign the flock sidebar as a first-class `dock` — a layout-level

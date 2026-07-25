@@ -159,10 +159,12 @@ impl PluginMap {
             .filter(|(_, (running_plugin, _subscriptions, _workers))| {
                 let running_plugin = running_plugin.lock().unwrap();
                 let plugin_config = &running_plugin.store.data().plugin;
-                let running_plugin_location = &plugin_config.location;
-                let running_plugin_configuration = &plugin_config.initial_userspace_configuration;
-                running_plugin_location == plugin_location
-                    && running_plugin_configuration == plugin_configuration
+                running_plugin_satisfies_request(
+                    &plugin_config.location,
+                    &plugin_config.initial_userspace_configuration,
+                    plugin_location,
+                    plugin_configuration,
+                )
             })
             .map(|((plugin_id, _client_id), _)| *plugin_id)
             .collect();
@@ -461,5 +463,146 @@ impl RunningPlugin {
     }
     pub fn intercepting_key_presses(&self) -> bool {
         self.store.data().intercepting_key_presses
+    }
+}
+
+/// Whether a running plugin satisfies a request to find one at `requested_location`.
+///
+/// An **empty** `requested_configuration` means "don't care": it matches any
+/// instance at that location, whatever it happened to be launched with.
+///
+/// This is deliberately lenient. Requiring a caller to restate the configuration a
+/// plugin was launched with is a footgun whose failure mode is silent and
+/// destructive: a keybinding like
+///
+/// ```kdl
+/// bind "Super b" { MessagePlugin "zellij:flock-sidebar" { name "flock-toggle-dock" } }
+/// ```
+///
+/// carries no configuration of its own (`name` is a reserved word, stripped by
+/// `PluginUserConfiguration::new`), so an exact match misses the instance the
+/// layout declared — which usually *does* carry configuration — and the caller
+/// then loads a duplicate plugin and opens it in a brand new pane. The user asked
+/// to message the sidebar and got a second sidebar.
+///
+/// A caller that genuinely wants a fresh instance says so with `launch_new`, which
+/// is resolved before any of this.
+pub fn running_plugin_satisfies_request(
+    running_location: &RunPluginLocation,
+    running_configuration: &PluginUserConfiguration,
+    requested_location: &RunPluginLocation,
+    requested_configuration: &PluginUserConfiguration,
+) -> bool {
+    if running_location != requested_location {
+        return false;
+    }
+    requested_configuration.is_satisfied_by(running_configuration)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::BTreeMap;
+
+    fn location() -> RunPluginLocation {
+        RunPluginLocation::parse("zellij:flock-sidebar", None).unwrap()
+    }
+
+    fn config(pairs: &[(&str, &str)]) -> PluginUserConfiguration {
+        PluginUserConfiguration::new(
+            pairs
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect::<BTreeMap<String, String>>(),
+        )
+    }
+
+    #[test]
+    fn a_request_without_configuration_matches_a_configured_instance() {
+        // The reported bug: `MessagePlugin "zellij:flock-sidebar" { name "…" }`
+        // carries no configuration, while the layout launched the sidebar with dir
+        // args. This used to miss and spawn a second sidebar pane.
+        let running = config(&[("devcontainers_enabled", "true"), ("ssh_enabled", "true")]);
+        assert!(running_plugin_satisfies_request(
+            &location(),
+            &running,
+            &location(),
+            &config(&[]),
+        ));
+    }
+
+    #[test]
+    fn a_request_naming_a_key_with_a_different_value_does_not_match() {
+        let running = config(&[("ssh_enabled", "true")]);
+        assert!(!running_plugin_satisfies_request(
+            &location(),
+            &running,
+            &location(),
+            &config(&[("ssh_enabled", "false")]),
+        ));
+        assert!(running_plugin_satisfies_request(
+            &location(),
+            &running,
+            &location(),
+            &config(&[("ssh_enabled", "true")]),
+        ));
+    }
+
+    #[test]
+    fn a_different_location_never_matches() {
+        let other = RunPluginLocation::parse("zellij:status-bar", None).unwrap();
+        assert!(!running_plugin_satisfies_request(
+            &other,
+            &config(&[]),
+            &location(),
+            &config(&[]),
+        ));
+    }
+    #[test]
+    fn a_request_whose_configuration_is_a_subset_matches() {
+        // The `Super s` / flock-selector case: the keybinding restates ten of the
+        // layout's eleven configuration keys, missing only `session_name`. Requiring
+        // equality made this miss and launch a second selector — the worst kind of
+        // near-miss, because the binding looks correct.
+        let running = config(&[
+            ("coder_enabled", "false"),
+            ("session_layout", "flock-project"),
+            ("session_name", "flock-selector"),
+            ("ssh_enabled", "true"),
+        ]);
+        let requested = config(&[
+            ("coder_enabled", "false"),
+            ("session_layout", "flock-project"),
+            ("ssh_enabled", "true"),
+        ]);
+        assert!(running_plugin_satisfies_request(
+            &location(),
+            &running,
+            &location(),
+            &requested,
+        ));
+    }
+
+    #[test]
+    fn a_request_naming_a_key_the_instance_lacks_does_not_match() {
+        let running = config(&[("ssh_enabled", "true")]);
+        assert!(!running_plugin_satisfies_request(
+            &location(),
+            &running,
+            &location(),
+            &config(&[("ssh_enabled", "true"), ("coder_enabled", "true")]),
+        ));
+    }
+
+    #[test]
+    fn caller_cwd_is_ignored_when_matching() {
+        // Injected during alias resolution, not written by the user.
+        let running = config(&[("ssh_enabled", "true")]);
+        assert!(running_plugin_satisfies_request(
+            &location(),
+            &running,
+            &location(),
+            &config(&[("ssh_enabled", "true"), ("caller_cwd", "/somewhere")]),
+        ));
     }
 }
