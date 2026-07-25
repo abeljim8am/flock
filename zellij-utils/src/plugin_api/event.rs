@@ -45,9 +45,8 @@ use crate::data::{
     FileMetadata, HostTerminalThemeMode, InputMode, KeyWithModifier, LayoutInfo, LayoutMetadata,
     ModeInfo, Mouse, PaneAgentStatus, PaneContents, PaneId, PaneInfo, PaneManifest, PaneMetadata,
     PaneScrollbackResponse, PermissionStatus, PluginCapabilities, PluginInfo, RemoteBackend,
-    RemoteConnectionState, RemotePaneHealth, RemotePaneMetadata, RemoteProtocolStatus, SelectedText,
-    SessionInfo, Style, TabInfo,
-    TabMetadata, WebServerStatus, WebSharing,
+    RemoteConnectionState, RemotePaneHealth, RemotePaneMetadata, RemoteProtocolStatus,
+    SelectedText, SessionInfo, Style, TabInfo, TabMetadata, WebServerStatus, WebSharing,
 };
 
 use crate::errors::prelude::*;

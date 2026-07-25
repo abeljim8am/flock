@@ -9,6 +9,6 @@
 
 #[allow(unused_imports)]
 pub use zellij_utils::remote_bootstrap::{
-    debug_install_script, install_script, quote_remote_script_arg, release_tag, reinstall_script,
-    RELEASE_BASE_URL,
+    classify_bootstrap_failure, debug_install_script, install_script, quote_remote_script_arg,
+    reinstall_script, release_tag, BootstrapFailure, RELEASE_BASE_URL,
 };

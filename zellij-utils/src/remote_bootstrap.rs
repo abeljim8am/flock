@@ -22,7 +22,7 @@ pub fn release_tag() -> String {
 const ARCH_CASE: &str = r#"case "$(uname -s)/$(uname -m)" in
 Linux/x86_64) triple=x86_64-unknown-linux-musl ;;
 Linux/aarch64|Linux/arm64) triple=aarch64-unknown-linux-musl ;;
-*) echo "flock: persistent remote sessions require Linux x86_64 or aarch64" >&2; exit 65 ;;
+*) echo "flock: unsupported remote platform $(uname -s)/$(uname -m)" >&2; exit 65 ;;
 esac"#;
 
 /// Bootstrap the fork into a versioned user directory on the remote host.
@@ -101,6 +101,85 @@ ln -sfn "$dest/flock" "$HOME/.local/bin/flock""#,
     )
 }
 
+/// Why a bootstrap failed. The install scripts above already exit with a
+/// distinct code per cause; without this the caller can only show the last line
+/// of stderr, which is whatever `tar` or `sh` happened to say last.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BootstrapFailure {
+    /// Exit 65: the remote is not Linux x86_64/aarch64.
+    UnsupportedPlatform { platform: Option<String> },
+    /// Exit 69: no curl, wget or python3 to fetch the release with.
+    NoDownloader,
+    /// Exit 74: the downloaded archive did not match its published checksum.
+    ChecksumMismatch,
+    /// Exit 66: the explicitly configured debug binary is not on disk.
+    MissingDebugBinary,
+    /// Anything else — carries the most useful line we could find.
+    Other(String),
+}
+
+impl BootstrapFailure {
+    /// A one-line, host-named explanation ending in what to do about it.
+    pub fn describe(&self, host: &str) -> String {
+        match self {
+            BootstrapFailure::UnsupportedPlatform { platform } => match platform {
+                Some(platform) => {
+                    format!("{host} is {platform} — flock needs Linux x86_64 or aarch64")
+                },
+                None => format!("{host} is not Linux x86_64 or aarch64"),
+            },
+            BootstrapFailure::NoDownloader => {
+                format!("{host} has no curl, wget or python3 — install one to bootstrap")
+            },
+            BootstrapFailure::ChecksumMismatch => {
+                format!("download to {host} failed its checksum — retry to re-fetch")
+            },
+            BootstrapFailure::MissingDebugBinary => {
+                format!("FLOCK_REMOTE_AGENT_BINARY is not a file — cannot stream it to {host}")
+            },
+            BootstrapFailure::Other(detail) => format!("{host}: {detail}"),
+        }
+    }
+}
+
+/// Classify a failed bootstrap from the exit code its script chose, falling
+/// back to the last meaningful line of stderr.
+pub fn classify_bootstrap_failure(exit_code: Option<i32>, stderr: &str) -> BootstrapFailure {
+    match exit_code {
+        Some(65) => BootstrapFailure::UnsupportedPlatform {
+            platform: unsupported_platform(stderr),
+        },
+        Some(69) => BootstrapFailure::NoDownloader,
+        Some(74) => BootstrapFailure::ChecksumMismatch,
+        Some(66) => BootstrapFailure::MissingDebugBinary,
+        _ => BootstrapFailure::Other(last_meaningful_line(stderr)),
+    }
+}
+
+/// Pull the `uname -s/uname -m` pair out of the platform guard's own message.
+fn unsupported_platform(stderr: &str) -> Option<String> {
+    stderr
+        .lines()
+        .filter_map(|line| {
+            line.trim()
+                .strip_prefix("flock: unsupported remote platform ")
+        })
+        .map(|platform| platform.trim().to_ascii_lowercase())
+        .find(|platform| !platform.is_empty())
+}
+
+/// The last non-empty stderr line, minus the `flock: ` prefix our own scripts
+/// add — the caller re-attaches the host name itself.
+fn last_meaningful_line(stderr: &str) -> String {
+    stderr
+        .lines()
+        .rev()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .map(|line| line.strip_prefix("flock: ").unwrap_or(line).to_owned())
+        .unwrap_or_else(|| "remote bootstrap failed".to_owned())
+}
+
 /// SSH-style transports join command arguments into one command line for the
 /// remote login shell before invoking `sh`. A single-quoted argument is
 /// understood by both POSIX shells and Fish, but there is no shared way to
@@ -130,6 +209,52 @@ mod tests {
         assert!(script.contains("flock-$triple.tar.gz"));
         assert!(script.contains("flock-$triple.sha256sum"));
         assert!(!script.contains('\''));
+    }
+
+    #[test]
+    fn each_script_exit_code_maps_to_its_own_message() {
+        // Every code asserted here is emitted by the scripts above; they must
+        // stay in lockstep, which is why the classifier lives beside them.
+        assert_eq!(
+            classify_bootstrap_failure(Some(69), "").describe("build-box"),
+            "build-box has no curl, wget or python3 — install one to bootstrap"
+        );
+        assert_eq!(
+            classify_bootstrap_failure(Some(74), "").describe("build-box"),
+            "download to build-box failed its checksum — retry to re-fetch"
+        );
+        assert_eq!(
+            classify_bootstrap_failure(
+                Some(65),
+                "flock: unsupported remote platform Linux/armv7l\n"
+            )
+            .describe("build-box"),
+            "build-box is linux/armv7l — flock needs Linux x86_64 or aarch64"
+        );
+    }
+
+    #[test]
+    fn the_platform_guard_reports_what_it_actually_found() {
+        // Without the interpolated uname the classifier has nothing to name,
+        // and the message degrades to a bare "not Linux x86_64 or aarch64".
+        assert!(install_script().contains(r#"unsupported remote platform $(uname -s)/$(uname -m)"#));
+        assert_eq!(
+            classify_bootstrap_failure(Some(65), "").describe("build-box"),
+            "build-box is not Linux x86_64 or aarch64"
+        );
+    }
+
+    #[test]
+    fn an_unclassified_failure_keeps_its_last_useful_line() {
+        assert_eq!(
+            classify_bootstrap_failure(Some(2), "warming up\nflock: tar: short read\n\n")
+                .describe("build-box"),
+            "build-box: tar: short read"
+        );
+        assert_eq!(
+            classify_bootstrap_failure(None, "   ").describe("build-box"),
+            "build-box: remote bootstrap failed"
+        );
     }
 
     #[test]

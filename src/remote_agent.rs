@@ -2927,13 +2927,37 @@ mod tests {
             ),
             "pane_id=7,state=idle,agent=opencode,source=flock:coder-remote,presence=heartbeat"
         );
+    }
+
+    #[test]
+    fn health_records_survive_a_json_round_trip() {
+        // The bridge writes this file and the server parses it; a serde change
+        // that broke the pair would silently degrade every remote to healthy.
+        let health = RemotePaneHealth {
+            status: RemoteProtocolStatus::VersionSkew,
+            daemon_version: Some("26.5.0".into()),
+            local_version: Some("26.7.0".into()),
+            retry_count: 3,
+            last_error: Some("connection lost".into()),
+        };
+        let encoded = serde_json::to_string(&health).unwrap();
         assert_eq!(
-            daemon_version_args("7", "26.4.0"),
-            format!(
-                "pane_id=7,daemon_version=26.4.0,local_version={}",
-                env!("CARGO_PKG_VERSION")
-            )
+            serde_json::from_str::<RemotePaneHealth>(&encoded).unwrap(),
+            health
         );
+        // An absent or unreadable file must read as healthy, never as a fault
+        // the bridge never reported.
+        assert_eq!(RemotePaneHealth::default().status, RemoteProtocolStatus::Ok);
+    }
+
+    #[test]
+    fn a_protocol_rejection_is_recognised_from_the_daemon_message() {
+        // `run_remote_transport` keys the terminal ProtocolIncompatible status
+        // off this wording, which `ensure_protocol_version` produces.
+        let error = ensure_protocol_version(PROTOCOL_VERSION + 1)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("incompatible protocol version"));
     }
 
     #[test]

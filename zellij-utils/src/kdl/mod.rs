@@ -7555,6 +7555,7 @@ fn session_info_remote_backend_and_pane_cursor_round_trip() {
             replay_cursor: 42,
             close_pending: true,
             foreground_argv: vec!["codex".into(), "--resume".into()],
+            health: Default::default(),
         },
     );
     let serialized = session_info.to_string();

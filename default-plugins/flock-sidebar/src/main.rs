@@ -49,9 +49,7 @@ use std::collections::{BTreeMap, HashSet};
 use std::time::Instant;
 
 use detect::{detect_agent, identify_agent_from_command, identify_agent_from_screen, AgentState};
-use hook::{
-    parse_hook_report, HookReport, Presence, HOOK_PIPE_NAME,
-};
+use hook::{parse_hook_report, HookReport, Presence, HOOK_PIPE_NAME};
 use palette::Theme;
 use sessionizer::SessionizerConfig;
 use state::PaneAgentState;

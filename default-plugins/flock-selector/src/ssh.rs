@@ -362,71 +362,71 @@ impl HostWizard {
         }
     }
 
-    /// Advance past the current field. Returns the finished host on the last
-    /// phase; `None` (possibly with `self.error` set) otherwise.
-    pub fn advance(&mut self, existing: &[SshHost]) -> Option<SshHost> {
-        self.error = None;
-        match self.phase {
-            HostPhase::Name => {
-                let name = self.name.trim().to_owned();
-                if name.is_empty() {
-                    self.error = Some("name cannot be empty".into());
-                    return None;
-                }
-                let duplicate = existing
-                    .iter()
-                    .any(|host| host.name == name && self.editing.as_deref() != Some(&host.name));
-                if duplicate {
-                    self.error = Some(format!("a host named {name:?} already exists"));
-                    return None;
-                }
-                self.name = name;
-                self.phase = HostPhase::Destination;
-                None
-            },
-            HostPhase::Destination => {
-                let destination = self.destination.trim().to_owned();
-                if !valid_destination(&destination) {
-                    self.error = Some(
-                        "destination must be non-empty, without spaces, and cannot start with -"
-                            .into(),
-                    );
-                    return None;
-                }
-                self.destination = destination;
-                self.phase = HostPhase::ExtraArgs;
-                None
-            },
-            HostPhase::ExtraArgs => {
-                let extra_args: Vec<String> = self
-                    .extra_args_input
-                    .split_whitespace()
-                    .map(str::to_owned)
-                    .collect();
-                Some(SshHost {
-                    name: self.name.clone(),
-                    destination: self.destination.clone(),
-                    extra_args,
-                })
-            },
-        }
+    /// Every field, in display order.
+    pub const FIELDS: [HostPhase; 3] = [
+        HostPhase::Name,
+        HostPhase::Destination,
+        HostPhase::ExtraArgs,
+    ];
+
+    /// Move the focused field down the list, stopping at the last.
+    pub fn focus_next(&mut self) {
+        self.phase = match self.phase {
+            HostPhase::Name => HostPhase::Destination,
+            HostPhase::Destination | HostPhase::ExtraArgs => HostPhase::ExtraArgs,
+        };
     }
 
-    /// Step back one phase. Returns `false` when already on the first phase
-    /// (the caller closes the wizard).
-    pub fn back(&mut self) -> bool {
+    /// Move the focused field up the list, stopping at the first.
+    pub fn focus_prev(&mut self) {
+        self.phase = match self.phase {
+            HostPhase::Name | HostPhase::Destination => HostPhase::Name,
+            HostPhase::ExtraArgs => HostPhase::Destination,
+        };
+    }
+
+    /// Validate every field and produce the host. Enter saves from any field,
+    /// so correcting one value on a saved host no longer means retyping the
+    /// other two. A failure moves focus to the offending field, which is the
+    /// only way the error message can point at anything.
+    pub fn submit(&mut self, existing: &[SshHost]) -> Option<SshHost> {
         self.error = None;
-        match self.phase {
-            HostPhase::Name => false,
-            HostPhase::Destination => {
-                self.phase = HostPhase::Name;
-                true
-            },
-            HostPhase::ExtraArgs => {
-                self.phase = HostPhase::Destination;
-                true
-            },
+
+        let name = self.name.trim().to_owned();
+        if name.is_empty() {
+            self.phase = HostPhase::Name;
+            self.error = Some("name cannot be empty".into());
+            return None;
         }
+        let duplicate = existing
+            .iter()
+            .any(|host| host.name == name && self.editing.as_deref() != Some(&host.name));
+        if duplicate {
+            self.phase = HostPhase::Name;
+            self.error = Some(format!("a host named {name:?} already exists"));
+            return None;
+        }
+
+        let destination = self.destination.trim().to_owned();
+        if !valid_destination(&destination) {
+            self.phase = HostPhase::Destination;
+            self.error = Some(
+                "destination must be non-empty, without spaces, and cannot start with -".into(),
+            );
+            return None;
+        }
+
+        self.name = name.clone();
+        self.destination = destination.clone();
+        Some(SshHost {
+            name,
+            destination,
+            extra_args: self
+                .extra_args_input
+                .split_whitespace()
+                .map(str::to_owned)
+                .collect(),
+        })
     }
 }
 
@@ -607,30 +607,32 @@ mod tests {
     fn wizard_validates_and_produces_hosts() {
         let existing = vec![host("dev", "abel@dev.example.com", &[])];
         let mut wizard = HostWizard::add();
-        assert_eq!(wizard.advance(&existing), None);
+
+        // Every validation failure moves focus to the field at fault, so the
+        // message always has something on screen to point at.
+        wizard.phase = HostPhase::ExtraArgs;
+        assert_eq!(wizard.submit(&existing), None);
         assert!(wizard.error.is_some()); // empty name
+        assert_eq!(wizard.phase, HostPhase::Name);
 
         wizard.name = "dev".into();
-        assert_eq!(wizard.advance(&existing), None);
+        assert_eq!(wizard.submit(&existing), None);
         assert!(wizard.error.as_deref().unwrap().contains("already exists"));
+        assert_eq!(wizard.phase, HostPhase::Name);
 
         wizard.name = "staging".into();
-        assert_eq!(wizard.advance(&existing), None);
-        assert_eq!(wizard.phase, HostPhase::Destination);
-
         wizard.destination = "-oProxyCommand=evil".into();
-        assert_eq!(wizard.advance(&existing), None);
-        assert!(wizard.error.is_some());
+        assert_eq!(wizard.submit(&existing), None);
+        assert_eq!(wizard.phase, HostPhase::Destination);
         wizard.destination = "bad destination".into();
-        assert_eq!(wizard.advance(&existing), None);
+        assert_eq!(wizard.submit(&existing), None);
         assert!(wizard.error.is_some());
 
+        // Enter saves from wherever focus happens to be — no walk to the end.
         wizard.destination = "abel@staging.example.com".into();
-        assert_eq!(wizard.advance(&existing), None);
-        assert_eq!(wizard.phase, HostPhase::ExtraArgs);
-
         wizard.extra_args_input = "  -p 2222   -i ~/.ssh/key  ".into();
-        let finished = wizard.advance(&existing).unwrap();
+        wizard.phase = HostPhase::Name;
+        let finished = wizard.submit(&existing).unwrap();
         assert_eq!(
             finished,
             host(
@@ -640,21 +642,30 @@ mod tests {
             )
         );
 
-        // Editing keeps its own name valid and replaces in place.
+        // Editing keeps its own name valid and replaces in place, without
+        // retyping the fields that were already correct.
         let mut edit = HostWizard::edit(&existing[0]);
-        assert_eq!(edit.advance(&existing), None);
-        assert_eq!(edit.phase, HostPhase::Destination);
-        assert_eq!(edit.advance(&existing), None);
-        let finished = edit.advance(&existing).unwrap();
+        let finished = edit.submit(&existing).unwrap();
         let updated = apply_wizard(&existing, finished, Some("dev"));
         assert_eq!(updated.len(), 1);
         assert_eq!(updated[0].name, "dev");
+        assert_eq!(updated[0].destination, "abel@dev.example.com");
+    }
 
-        assert!(edit.back());
-        assert_eq!(edit.phase, HostPhase::Destination);
-        assert!(edit.back());
-        assert_eq!(edit.phase, HostPhase::Name);
-        assert!(!edit.back());
+    #[test]
+    fn field_focus_moves_freely_and_stops_at_the_ends() {
+        let mut wizard = HostWizard::add();
+        assert_eq!(wizard.phase, HostPhase::Name);
+        wizard.focus_prev();
+        assert_eq!(wizard.phase, HostPhase::Name);
+        wizard.focus_next();
+        assert_eq!(wizard.phase, HostPhase::Destination);
+        wizard.focus_next();
+        assert_eq!(wizard.phase, HostPhase::ExtraArgs);
+        wizard.focus_next();
+        assert_eq!(wizard.phase, HostPhase::ExtraArgs);
+        wizard.focus_prev();
+        assert_eq!(wizard.phase, HostPhase::Destination);
     }
 
     #[test]

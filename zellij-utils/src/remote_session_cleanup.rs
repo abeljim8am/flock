@@ -231,6 +231,7 @@ mod tests {
                     replay_cursor: id as u64,
                     close_pending: false,
                     foreground_argv: Vec::new(),
+                    health: Default::default(),
                 },
             );
         }
@@ -274,6 +275,7 @@ mod tests {
                 replay_cursor: 1,
                 close_pending: false,
                 foreground_argv: Vec::new(),
+                health: Default::default(),
             },
         );
         assert_eq!(

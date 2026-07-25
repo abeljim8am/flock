@@ -448,13 +448,10 @@ pub fn remote_issue_text(
                 format!("{spinner} installing {}…", version_or(&issue.local_version)),
                 IssueTone::Busy,
             ),
-            UpgradeProgress::Done { version, panes } => (
-                format!("✓ {version} · {panes} panes back"),
-                IssueTone::Good,
-            ),
-            UpgradeProgress::Failed { reason } => {
-                (format!("✗ {reason}  ⏎ retry"), IssueTone::Bad)
+            UpgradeProgress::Done { version, panes } => {
+                (format!("✓ {version} · {panes} panes back"), IssueTone::Good)
             },
+            UpgradeProgress::Failed { reason } => (format!("✗ {reason}  ⏎ retry"), IssueTone::Bad),
         };
     }
     if armed {
@@ -1782,12 +1779,7 @@ mod tests {
     #[test]
     fn a_remote_issue_is_a_navigable_row_under_its_session() {
         let sessions = vec![skewed_session("api-dev")];
-        let rows = build_rows(
-            &PaneManifest::default(),
-            &[],
-            &BTreeMap::new(),
-            &sessions,
-        );
+        let rows = build_rows(&PaneManifest::default(), &[], &BTreeMap::new(), &sessions);
         // The issue hangs directly off its session, so position names the host.
         assert!(matches!(rows[0], Row::Session { .. }));
         assert!(matches!(rows[1], Row::RemoteIssue(_)));
@@ -1847,12 +1839,7 @@ mod tests {
             },
         );
         assert!(session_remote_issue(&session).is_none());
-        let rows = build_rows(
-            &PaneManifest::default(),
-            &[],
-            &BTreeMap::new(),
-            &[session],
-        );
+        let rows = build_rows(&PaneManifest::default(), &[], &BTreeMap::new(), &[session]);
         assert_eq!(rows.len(), 1);
     }
 
