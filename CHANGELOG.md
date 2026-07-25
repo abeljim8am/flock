@@ -5,14 +5,15 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
 
 ## [Unreleased]
-* fix(dock): stop a keybinding that names a plugin by URL from spawning a duplicate
-  pane. Plugin-instance lookup required the caller to restate the configuration the
-  plugin was launched with; a binding like
-  `MessagePlugin "zellij:flock-sidebar" { name "..." }` carries no configuration of
-  its own, so the lookup missed the instance the layout declared (which does carry
-  configuration) and zellij loaded a second plugin into a new tiled pane in the
-  active tab. An empty requested configuration now means "match any instance at this
-  location"; a caller wanting a fresh instance still asks with `launch_new`.
+* fix(plugins): stop a keybinding that names a plugin from spawning a duplicate of
+  it. Finding a running plugin required the caller to restate the exact configuration
+  it was launched with, so `MessagePlugin "zellij:flock-sidebar" { name "..." }`
+  (no configuration of its own) and `LaunchOrFocusPlugin "flock-selector" { ...ten of
+  the layout's eleven keys... }` both missed the instance the layout declared — and
+  each then launched a second copy into a new pane. Matching is now a subset test:
+  configuration keys the request names must match, keys it omits are "don't care".
+  Applies to both the pipe/`MessagePlugin` path and the `LaunchOrFocusPlugin` focus
+  path. A caller wanting a fresh instance still asks with `launch_new`.
 * fix(dock): make the toggle deterministic when a dock exists in several tabs.
   `SetDockMode` gained an `expected` mode, making it a compare-and-swap: one
   broadcast toggle reaches every dock plugin instance, each deciding a target from

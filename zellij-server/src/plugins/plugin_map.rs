@@ -496,7 +496,7 @@ pub fn running_plugin_satisfies_request(
     if running_location != requested_location {
         return false;
     }
-    requested_configuration.inner().is_empty() || running_configuration == requested_configuration
+    requested_configuration.is_satisfied_by(running_configuration)
 }
 
 #[cfg(test)]
@@ -532,7 +532,7 @@ mod tests {
     }
 
     #[test]
-    fn a_configured_request_still_requires_an_exact_configuration_match() {
+    fn a_request_naming_a_key_with_a_different_value_does_not_match() {
         let running = config(&[("ssh_enabled", "true")]);
         assert!(!running_plugin_satisfies_request(
             &location(),
@@ -556,6 +556,53 @@ mod tests {
             &config(&[]),
             &location(),
             &config(&[]),
+        ));
+    }
+    #[test]
+    fn a_request_whose_configuration_is_a_subset_matches() {
+        // The `Super s` / flock-selector case: the keybinding restates ten of the
+        // layout's eleven configuration keys, missing only `session_name`. Requiring
+        // equality made this miss and launch a second selector — the worst kind of
+        // near-miss, because the binding looks correct.
+        let running = config(&[
+            ("coder_enabled", "false"),
+            ("session_layout", "flock-project"),
+            ("session_name", "flock-selector"),
+            ("ssh_enabled", "true"),
+        ]);
+        let requested = config(&[
+            ("coder_enabled", "false"),
+            ("session_layout", "flock-project"),
+            ("ssh_enabled", "true"),
+        ]);
+        assert!(running_plugin_satisfies_request(
+            &location(),
+            &running,
+            &location(),
+            &requested,
+        ));
+    }
+
+    #[test]
+    fn a_request_naming_a_key_the_instance_lacks_does_not_match() {
+        let running = config(&[("ssh_enabled", "true")]);
+        assert!(!running_plugin_satisfies_request(
+            &location(),
+            &running,
+            &location(),
+            &config(&[("ssh_enabled", "true"), ("coder_enabled", "true")]),
+        ));
+    }
+
+    #[test]
+    fn caller_cwd_is_ignored_when_matching() {
+        // Injected during alias resolution, not written by the user.
+        let running = config(&[("ssh_enabled", "true")]);
+        assert!(running_plugin_satisfies_request(
+            &location(),
+            &running,
+            &location(),
+            &config(&[("ssh_enabled", "true"), ("caller_cwd", "/somewhere")]),
         ));
     }
 }
