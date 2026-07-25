@@ -1762,11 +1762,16 @@ impl WasmBridge {
         plugin_location: &RunPluginLocation,
         plugin_configuration: &PluginUserConfiguration,
     ) -> Option<PluginId> {
+        // Same "empty configuration means don't care" rule as
+        // `PluginMap::all_plugin_ids_for_plugin_location` — otherwise a pipe that
+        // arrives while the plugin is still loading would start a second one.
+        let match_any_configuration = plugin_configuration.inner().is_empty();
         self.loading_plugins
             .iter()
             .find_map(|(plugin_id, run_plugin)| {
                 if &run_plugin.location == plugin_location
-                    && &run_plugin.configuration == plugin_configuration
+                    && (match_any_configuration
+                        || &run_plugin.configuration == plugin_configuration)
                 {
                     Some(*plugin_id)
                 } else {
@@ -1792,11 +1797,20 @@ impl WasmBridge {
         if self.cached_plugin_map.is_empty() {
             self.cached_plugin_map = self.plugin_map.lock().unwrap().clone_plugin_assets();
         }
-        match self
-            .cached_plugin_map
-            .get(plugin_location)
-            .and_then(|m| m.get(plugin_configuration))
-        {
+        let Some(by_configuration) = self.cached_plugin_map.get(plugin_location) else {
+            return vec![];
+        };
+        // Empty configuration means "don't care" (see
+        // `PluginMap::all_plugin_ids_for_plugin_location`): match every instance at
+        // this location rather than only the one launched with no arguments.
+        if plugin_configuration.inner().is_empty() {
+            return by_configuration
+                .values()
+                .flatten()
+                .map(|(plugin_id, client_id)| (*plugin_id, Some(*client_id)))
+                .collect();
+        }
+        match by_configuration.get(plugin_configuration) {
             Some(plugin_and_client_ids) => plugin_and_client_ids
                 .iter()
                 .map(|(plugin_id, client_id)| (*plugin_id, Some(*client_id)))

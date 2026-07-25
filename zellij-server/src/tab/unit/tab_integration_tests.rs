@@ -15272,3 +15272,58 @@ fn a_permission_prompt_keeps_the_dock_expanded() {
     tab.tiled_panes.reserve_dock_band();
     assert_eq!(dock_geom(&tab).cols.as_usize(), 5);
 }
+
+#[test]
+fn dock_geometry_is_a_fixed_point_under_repeated_relayout() {
+    // The client and server converse about size: the server applies a layout, asks
+    // the client for its terminal size, and re-resizes on the reply. If a round of
+    // resize/relayout does not land on the same geometry it started from, that
+    // conversation never terminates and the screen thread spins.
+    let size = Size {
+        cols: 120,
+        rows: 30,
+    };
+    let mut tab = create_tab_with_dock(size, 40, 5, DockMode::Open, 2, Default::default());
+
+    let mut seen = Vec::new();
+    for _ in 0..6 {
+        tab.resize_whole_tab(size).unwrap();
+        seen.push((dock_geom(&tab), content_geoms(&tab), *tab.viewport.borrow()));
+    }
+
+    for (i, state) in seen.iter().enumerate().skip(1) {
+        assert_eq!(
+            state, &seen[0],
+            "geometry changed on resize round {i}; it must be a fixed point\n\
+             round 0: dock={:?} viewport={:?}\n\
+             round {i}: dock={:?} viewport={:?}",
+            seen[0].0, seen[0].2, state.0, state.2
+        );
+    }
+}
+
+#[test]
+fn a_stale_toggle_cannot_flip_the_dock_back() {
+    // A dock is materialized once per tab, so one broadcast toggle reaches every
+    // dock plugin instance and each decides on a target from its own cached view of
+    // the mode. Without a compare-and-swap the stale ones flip it back and the
+    // toggle settles on the wrong state. This exercises the tab-level half: applying
+    // a mode is idempotent, so a repeat is a no-op rather than a flip.
+    let size = Size {
+        cols: 120,
+        rows: 30,
+    };
+    let mut tab = create_tab_with_dock(size, 40, 5, DockMode::Open, 2, Default::default());
+
+    tab.set_dock_mode(DockMode::Closed);
+    assert_eq!(dock_geom(&tab).cols.as_usize(), 5);
+
+    // Two more instances reacting to the same toggle, both having seen Open.
+    tab.set_dock_mode(DockMode::Closed);
+    tab.set_dock_mode(DockMode::Closed);
+    assert_eq!(
+        dock_geom(&tab).cols.as_usize(),
+        5,
+        "repeated application of the same mode must not oscillate"
+    );
+}

@@ -5,6 +5,20 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
 
 ## [Unreleased]
+* fix(dock): stop a keybinding that names a plugin by URL from spawning a duplicate
+  pane. Plugin-instance lookup required the caller to restate the configuration the
+  plugin was launched with; a binding like
+  `MessagePlugin "zellij:flock-sidebar" { name "..." }` carries no configuration of
+  its own, so the lookup missed the instance the layout declared (which does carry
+  configuration) and zellij loaded a second plugin into a new tiled pane in the
+  active tab. An empty requested configuration now means "match any instance at this
+  location"; a caller wanting a fresh instance still asks with `launch_new`.
+* fix(dock): make the toggle deterministic when a dock exists in several tabs.
+  `SetDockMode` gained an `expected` mode, making it a compare-and-swap: one
+  broadcast toggle reaches every dock plugin instance, each deciding a target from
+  its own cached view, and only the instance whose view still matches reality flips
+  it. Previously the stale instances could flip it back and the toggle settled on the
+  wrong state.
 
 ## [26.7.0] - 2026-07-24
 * feat(dock)!: redesign the flock sidebar as a first-class `dock` — a layout-level

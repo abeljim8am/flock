@@ -336,6 +336,12 @@ pub struct DockState {
 pub struct SetDockModePayload {
     #[prost(uint32, tag="1")]
     pub mode: u32,
+    /// The mode the caller believed was current when it decided on `mode`. The server
+    /// applies the change only if this still matches — a compare-and-swap, so that N
+    /// dock plugin instances all reacting to one broadcast toggle produce exactly one
+    /// flip instead of N.
+    #[prost(uint32, optional, tag="2")]
+    pub expected: ::core::option::Option<u32>,
 }
 #[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Clone, PartialEq, ::prost::Message)]

@@ -444,7 +444,9 @@ fn host_run_plugin_command(mut caller: Caller<'_, PluginEnv>) {
                     PluginCommand::PublishAgentState(agent_states) => {
                         publish_agent_state(env, agent_states)
                     },
-                    PluginCommand::SetDockMode(mode) => set_dock_mode(env, mode),
+                    PluginCommand::SetDockMode { mode, expected } => {
+                        set_dock_mode(env, mode, expected)
+                    },
                     PluginCommand::ScanHostFolder(folder_to_scan) => {
                         scan_host_folder(env, folder_to_scan)
                     },
@@ -3304,10 +3306,14 @@ fn publish_agent_state(
         .context("failed to publish agent state");
 }
 
-fn set_dock_mode(env: &PluginEnv, mode: zellij_utils::data::DockMode) {
+fn set_dock_mode(
+    env: &PluginEnv,
+    mode: zellij_utils::data::DockMode,
+    expected: Option<zellij_utils::data::DockMode>,
+) {
     let _ = env
         .senders
-        .send_to_screen(ScreenInstruction::SetDockMode(mode))
+        .send_to_screen(ScreenInstruction::SetDockMode { mode, expected })
         .context("failed to set dock mode");
 }
 
@@ -5509,7 +5515,7 @@ fn check_command_permission(
         | PluginCommand::HideFloatingPanes { .. }
         | PluginCommand::SetPaneRegexHighlights(..)
         | PluginCommand::PublishAgentState(..)
-        | PluginCommand::SetDockMode(..)
+        | PluginCommand::SetDockMode { .. }
         | PluginCommand::ClearPaneHighlights(..) => PermissionType::ChangeApplicationState,
         PluginCommand::UnblockCliPipeInput(..)
         | PluginCommand::BlockCliPipeInput(..)

@@ -1786,8 +1786,8 @@ pub fn resize_pane_with_id(resize_strategy: ResizeStrategy, pane_id: PaneId) {
 /// to every tab, and republishes it on `SessionInfo`. Idempotent, so it is safe
 /// to call while converging on a mode adopted from another session. A plugin
 /// cannot set a width directly, and so cannot fight the layout engine.
-pub fn set_dock_mode(mode: DockMode) {
-    let plugin_command = PluginCommand::SetDockMode(mode);
+pub fn set_dock_mode(mode: DockMode, expected: Option<DockMode>) {
+    let plugin_command = PluginCommand::SetDockMode { mode, expected };
     let protobuf_plugin_command: ProtobufPluginCommand = plugin_command.try_into().unwrap();
     object_to_stdout(&protobuf_plugin_command.encode_to_vec());
     unsafe { host_run_plugin_command() };

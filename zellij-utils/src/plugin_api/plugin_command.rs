@@ -1473,9 +1473,10 @@ impl TryFrom<ProtobufPluginCommand> for PluginCommand {
                 _ => Err("Mismatched payload for PublishAgentState"),
             },
             Some(CommandName::SetDockMode) => match protobuf_plugin_command.payload {
-                Some(Payload::SetDockModePayload(payload)) => Ok(PluginCommand::SetDockMode(
-                    DockMode::from_wire_u32(payload.mode),
-                )),
+                Some(Payload::SetDockModePayload(payload)) => Ok(PluginCommand::SetDockMode {
+                    mode: DockMode::from_wire_u32(payload.mode),
+                    expected: payload.expected.map(DockMode::from_wire_u32),
+                }),
                 _ => Err("Mismatched payload for SetDockMode"),
             },
             Some(CommandName::DumpSessionLayout) => match protobuf_plugin_command.payload {
@@ -3364,10 +3365,11 @@ impl TryFrom<PluginCommand> for ProtobufPluginCommand {
                     },
                 )),
             }),
-            PluginCommand::SetDockMode(mode) => Ok(ProtobufPluginCommand {
+            PluginCommand::SetDockMode { mode, expected } => Ok(ProtobufPluginCommand {
                 name: CommandName::SetDockMode as i32,
                 payload: Some(Payload::SetDockModePayload(SetDockModePayload {
                     mode: mode.as_wire_u32(),
+                    expected: expected.map(|expected| expected.as_wire_u32()),
                 })),
             }),
             PluginCommand::DumpSessionLayout { tab_index } => Ok(ProtobufPluginCommand {
@@ -5154,8 +5156,13 @@ mod publish_agent_state_tests {
 
     #[test]
     fn set_dock_mode_protobuf_round_trip() {
-        for mode in [DockMode::Open, DockMode::Closed] {
-            let command = PluginCommand::SetDockMode(mode);
+        for (mode, expected) in [
+            (DockMode::Open, None),
+            (DockMode::Closed, None),
+            (DockMode::Closed, Some(DockMode::Open)),
+            (DockMode::Open, Some(DockMode::Closed)),
+        ] {
+            let command = PluginCommand::SetDockMode { mode, expected };
 
             let protobuf: ProtobufPluginCommand = command.try_into().unwrap();
             let bytes = protobuf.encode_to_vec();
@@ -5163,8 +5170,12 @@ mod publish_agent_state_tests {
             let round_tripped: PluginCommand = decoded.try_into().unwrap();
 
             match round_tripped {
-                PluginCommand::SetDockMode(decoded_mode) => {
+                PluginCommand::SetDockMode {
+                    mode: decoded_mode,
+                    expected: decoded_expected,
+                } => {
                     assert_eq!(decoded_mode, mode);
+                    assert_eq!(decoded_expected, expected);
                 },
                 other => panic!("expected SetDockMode, got {:?}", other),
             }
