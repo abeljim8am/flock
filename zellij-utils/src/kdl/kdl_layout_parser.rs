@@ -2,9 +2,10 @@ use crate::input::{
     command::RunCommand,
     config::ConfigError,
     layout::{
-        FloatingPaneLayout, Layout, LayoutConstraint, PercentOrFixed, PluginUserConfiguration, Run,
-        RunPluginOrAlias, SplitDirection, SplitSize, SwapFloatingLayout, SwapTiledLayout,
-        TiledPaneLayout,
+        DockLayout, FloatingPaneLayout, Layout, LayoutConstraint, PercentOrFixed,
+        PluginUserConfiguration, Run, RunPluginOrAlias, SplitDirection, SplitSize,
+        SwapFloatingLayout, SwapTiledLayout, TiledPaneLayout, DEFAULT_DOCK_CLOSED_COLS,
+        DEFAULT_DOCK_OPEN_COLS,
     },
 };
 
@@ -40,6 +41,7 @@ pub struct KdlLayoutParser<'a> {
     pane_templates: HashMap<String, (PaneOrFloatingPane, KdlNode)>,
     default_tab_template: Option<(TiledPaneLayout, Vec<FloatingPaneLayout>, KdlNode)>,
     new_tab_template: Option<(TiledPaneLayout, Vec<FloatingPaneLayout>)>,
+    dock: Option<DockLayout>,
     file_name: Option<PathBuf>,
 }
 
@@ -55,6 +57,7 @@ impl<'a> KdlLayoutParser<'a> {
             pane_templates: HashMap::new(),
             default_tab_template: None,
             new_tab_template: None,
+            dock: None,
             global_cwd,
             file_name: file_name.map(|f| PathBuf::from(f)),
         }
@@ -86,6 +89,8 @@ impl<'a> KdlLayoutParser<'a> {
             || word == "swap_floating_layout"
             || word == "hide_floating_panes"
             || word == "contents_file"
+            || word == "dock"
+            || word == "closed_size"
     }
     fn is_a_valid_pane_property(&self, property_name: &str) -> bool {
         property_name == "borderless"
@@ -1886,6 +1891,149 @@ impl<'a> KdlLayoutParser<'a> {
         }
         Ok(())
     }
+    /// Parse the session-wide `dock` node, if any:
+    ///
+    /// ```kdl
+    /// dock size=40 closed_size=5 {
+    ///     plugin location="zellij:flock-sidebar"
+    /// }
+    /// ```
+    ///
+    /// A dock is deliberately not a `pane`: it does not appear in any
+    /// `TiledPaneLayout`, so it cannot occupy a swap-layout slot, cannot be
+    /// counted toward `max_panes`, and cannot be re-sized by a relayout. It is
+    /// declared once for the whole layout and materialized once per tab.
+    fn populate_dock(&mut self, layout_children: &[KdlNode]) -> Result<(), ConfigError> {
+        for child in layout_children.iter() {
+            if kdl_name!(child) != "dock" {
+                continue;
+            }
+            if self.dock.is_some() {
+                return Err(ConfigError::new_layout_kdl_error(
+                    "Only one dock node per layout allowed".into(),
+                    child.span().offset(),
+                    child.span().len(),
+                ));
+            }
+            self.dock = Some(self.parse_dock_node(child)?);
+        }
+        Ok(())
+    }
+    /// Whether this pane runs the same plugin as the dock.
+    ///
+    /// Migration for layouts written before the dock existed, where the sidebar was
+    /// an ordinary pane. A layout that declares both — a dumped-and-resurrected
+    /// session, or a hand-edited one — would otherwise come up with two sidebars,
+    /// which is the very bug the dock exists to prevent. The dock declaration wins
+    /// and the pane is dropped.
+    fn pane_duplicates_the_dock(&self, pane: &TiledPaneLayout) -> bool {
+        let Some(dock) = self.dock.as_ref() else {
+            return false;
+        };
+        let Some(dock_location) = dock
+            .run
+            .get_run_plugin()
+            .map(|run_plugin| run_plugin.location.display())
+        else {
+            return false;
+        };
+        // Only a leaf pane can be the stray sidebar; never discard a pane with
+        // children, which would take real content with it.
+        if !pane.children.is_empty() {
+            return false;
+        }
+        match &pane.run {
+            Some(Run::Plugin(run)) => run
+                .get_run_plugin()
+                .map(|run_plugin| run_plugin.location.display() == dock_location)
+                .unwrap_or(false),
+            _ => false,
+        }
+    }
+    fn parse_dock_node(&self, dock_node: &KdlNode) -> Result<DockLayout, ConfigError> {
+        let mut run = None;
+        if let Some(children) = kdl_children_nodes!(dock_node) {
+            for child in children {
+                let child_name = kdl_name!(child);
+                if child_name == "plugin" {
+                    if run.is_some() {
+                        return Err(ConfigError::new_layout_kdl_error(
+                            "A dock can only run one plugin".into(),
+                            child.span().offset(),
+                            child.span().len(),
+                        ));
+                    }
+                    run = self.parse_plugin_block(child)?;
+                } else if child_name == "command" || child_name == "edit" {
+                    return Err(ConfigError::new_layout_kdl_error(
+                        "A dock must run a plugin, not a command".into(),
+                        child.span().offset(),
+                        child.span().len(),
+                    ));
+                }
+            }
+        }
+        let run = match run {
+            Some(Run::Plugin(run_plugin_or_alias)) => run_plugin_or_alias,
+            _ => {
+                return Err(ConfigError::new_layout_kdl_error(
+                    "A dock must contain a plugin block, eg. dock { plugin location=\"zellij:status-bar\" }".into(),
+                    dock_node.span().offset(),
+                    dock_node.span().len(),
+                ));
+            },
+        };
+        let open_cols = kdl_get_int_property_or_child_value!(dock_node, "size")
+            .map(|size| size as usize)
+            .unwrap_or(DEFAULT_DOCK_OPEN_COLS);
+        let closed_cols = kdl_get_int_property_or_child_value!(dock_node, "closed_size")
+            .map(|size| size as usize)
+            .unwrap_or(DEFAULT_DOCK_CLOSED_COLS);
+        if open_cols == 0 || closed_cols == 0 {
+            return Err(ConfigError::new_layout_kdl_error(
+                "A dock's size and closed_size must be at least 1 column".into(),
+                dock_node.span().offset(),
+                dock_node.span().len(),
+            ));
+        }
+        if closed_cols > open_cols {
+            return Err(ConfigError::new_layout_kdl_error(
+                format!(
+                    "A dock's closed_size ({}) cannot exceed its size ({})",
+                    closed_cols, open_cols
+                ),
+                dock_node.span().offset(),
+                dock_node.span().len(),
+            ));
+        }
+        Ok(DockLayout {
+            run,
+            open_cols,
+            closed_cols,
+        })
+    }
+    /// A dock is session-wide and server-owned, so it is only meaningful at the
+    /// top level of a layout. Allowing it inside a tab, a template or — worst of
+    /// all — a swap layout would reintroduce the bug this design exists to kill:
+    /// a relayout re-asserting the dock's width and undoing the user's toggle.
+    fn assert_no_nested_dock(&self, parent: &KdlNode) -> Result<(), ConfigError> {
+        if let Some(children) = kdl_children_nodes!(parent) {
+            for child in children {
+                if kdl_name!(child) == "dock" {
+                    return Err(ConfigError::new_layout_kdl_error(
+                        format!(
+                            "A dock cannot be declared inside a '{}' node — declare it once at the top level of the layout",
+                            kdl_name!(parent)
+                        ),
+                        child.span().offset(),
+                        child.span().len(),
+                    ));
+                }
+                self.assert_no_nested_dock(child)?;
+            }
+        }
+        Ok(())
+    }
     fn populate_swap_tiled_layouts(
         &mut self,
         layout_children: &[KdlNode],
@@ -2140,6 +2288,7 @@ impl<'a> KdlLayoutParser<'a> {
             focused_tab_index,
             swap_tiled_layouts,
             swap_floating_layouts,
+            dock: self.dock.clone(),
             ..Default::default()
         })
     }
@@ -2192,6 +2341,7 @@ impl<'a> KdlLayoutParser<'a> {
             template: Some(template),
             swap_tiled_layouts,
             swap_floating_layouts,
+            dock: self.dock.clone(),
             ..Default::default()
         })
     }
@@ -2248,6 +2398,7 @@ impl<'a> KdlLayoutParser<'a> {
             template,
             swap_tiled_layouts,
             swap_floating_layouts,
+            dock: self.dock.clone(),
             ..Default::default()
         })
     }
@@ -2274,6 +2425,9 @@ impl<'a> KdlLayoutParser<'a> {
         if child_name == "pane" {
             let is_part_of_stack = false;
             let mut pane_node = self.parse_pane_node(child, is_part_of_stack)?;
+            if self.pane_duplicates_the_dock(&pane_node) {
+                return Ok(());
+            }
             if let Some(global_cwd) = &self.global_cwd {
                 pane_node.add_cwd_to_layout(&global_cwd);
             }
@@ -2482,6 +2636,14 @@ impl<'a> KdlLayoutParser<'a> {
         let mut swap_floating_layouts = vec![];
         if let Some(children) = kdl_children_nodes!(layout_node) {
             self.populate_global_cwd(layout_node)?;
+            // A dock is only legal as a direct child of `layout`; reject it anywhere
+            // deeper before anything else consumes those nodes.
+            for child in children {
+                if kdl_name!(child) != "dock" {
+                    self.assert_no_nested_dock(child)?;
+                }
+            }
+            self.populate_dock(children)?;
             self.populate_pane_templates(children, &kdl_layout)?;
             self.populate_tab_templates(children)?;
             self.populate_swap_tiled_layouts(children, &mut swap_tiled_layouts)?;

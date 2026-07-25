@@ -9,9 +9,9 @@ pub use super::generated_api::api::{
         ClientTabHistory as ProtobufClientTabHistory,
         CommandChangedPayload as ProtobufCommandChangedPayload, ContextItem as ProtobufContextItem,
         CopyDestination as ProtobufCopyDestination, CwdChangedPayload as ProtobufCwdChangedPayload,
-        Event as ProtobufEvent, EventNameList as ProtobufEventNameList,
-        EventType as ProtobufEventType, FileMetadata as ProtobufFileMetadata,
-        FlockSidebarState as ProtobufFlockSidebarState,
+        DockState as ProtobufDockState, Event as ProtobufEvent,
+        EventNameList as ProtobufEventNameList, EventType as ProtobufEventType,
+        FileMetadata as ProtobufFileMetadata,
         HostTerminalThemeChangedPayload as ProtobufHostTerminalThemeChangedPayload,
         HostTerminalThemeIndication as ProtobufHostTerminalThemeIndication,
         InputModeKeybinds as ProtobufInputModeKeybinds, KdlError as ProtobufKdlError,
@@ -40,12 +40,12 @@ pub use super::generated_api::api::{
 };
 #[allow(hidden_glob_reexports)]
 use crate::data::{
-    AgentRunState, ClientId, ClientInfo, CopyDestination, Event, EventType, FileMetadata,
-    FlockSidebarMode, FlockSidebarState, HostTerminalThemeMode, InputMode, KeyWithModifier,
-    LayoutInfo, LayoutMetadata, ModeInfo, Mouse, PaneAgentStatus, PaneContents, PaneId, PaneInfo,
-    PaneManifest, PaneMetadata, PaneScrollbackResponse, PermissionStatus, PluginCapabilities,
-    PluginInfo, RemoteBackend, RemoteConnectionState, RemotePaneMetadata, SelectedText,
-    SessionInfo, Style, TabInfo, TabMetadata, WebServerStatus, WebSharing,
+    AgentRunState, ClientId, ClientInfo, CopyDestination, DockMode, DockState, Event, EventType,
+    FileMetadata, HostTerminalThemeMode, InputMode, KeyWithModifier, LayoutInfo, LayoutMetadata,
+    ModeInfo, Mouse, PaneAgentStatus, PaneContents, PaneId, PaneInfo, PaneManifest, PaneMetadata,
+    PaneScrollbackResponse, PermissionStatus, PluginCapabilities, PluginInfo, RemoteBackend,
+    RemoteConnectionState, RemotePaneMetadata, SelectedText, SessionInfo, Style, TabInfo,
+    TabMetadata, WebServerStatus, WebSharing,
 };
 
 use crate::errors::prelude::*;
@@ -1253,11 +1253,9 @@ impl TryFrom<SessionInfo> for ProtobufSessionManifest {
                     })
                 })
                 .collect(),
-            flock_sidebar_state: session_info.flock_sidebar_state.map(|state| {
-                ProtobufFlockSidebarState {
-                    mode: state.mode.as_wire_u32(),
-                    updated_at_millis: state.updated_at_millis,
-                }
+            dock_state: session_info.dock_state.map(|state| ProtobufDockState {
+                mode: state.mode.as_wire_u32(),
+                updated_at_millis: state.updated_at_millis,
             }),
         })
     }
@@ -1421,11 +1419,9 @@ impl TryFrom<ProtobufSessionManifest> for SessionInfo {
             remote_connection_state,
             remote_panes,
             agent_states,
-            flock_sidebar_state: protobuf_session_manifest.flock_sidebar_state.map(|state| {
-                FlockSidebarState {
-                    mode: FlockSidebarMode::from_wire_u32(state.mode),
-                    updated_at_millis: state.updated_at_millis,
-                }
+            dock_state: protobuf_session_manifest.dock_state.map(|state| DockState {
+                mode: DockMode::from_wire_u32(state.mode),
+                updated_at_millis: state.updated_at_millis,
             }),
         })
     }
@@ -2918,8 +2914,8 @@ fn serialize_session_update_event_with_non_default_values() {
             );
             agent_states
         },
-        flock_sidebar_state: Some(FlockSidebarState {
-            mode: FlockSidebarMode::Closed,
+        dock_state: Some(DockState {
+            mode: DockMode::Closed,
             updated_at_millis: 42,
         }),
     };
@@ -2962,7 +2958,7 @@ fn serialize_session_update_event_with_non_default_values() {
         remote_connection_state: Default::default(),
         remote_panes: Default::default(),
         agent_states: Default::default(),
-        flock_sidebar_state: None,
+        dock_state: None,
     };
     let session_infos = vec![session_info_1, session_info_2];
     let resurrectable_sessions = vec![];

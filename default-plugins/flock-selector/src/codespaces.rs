@@ -134,24 +134,22 @@ pub fn parse_codespace_ssh(argv: &[String]) -> Option<&str> {
 /// codespace-bound session looks and behaves exactly like a regular flock
 /// session: tab-bar, docked sidebar, status-bar, and the flock_ui swap
 /// layouts (which give new tabs and multi-pane arrangements the same shape).
-/// `__SIDEBAR_25__` / `__SIDEBAR_40__` are replaced with sidebar plugin
-/// blocks carrying this plugin's own dir args, so the spawned sidebar filters
-/// workspaces like the user's other sessions do.
+/// `__DOCK__` is replaced with the sidebar plugin block carrying this plugin's
+/// own dir args, so the spawned sidebar filters workspaces like the user's other
+/// sessions do.
 ///
 /// Must stay structurally in sync with
 /// `zellij-utils/assets/layouts/flock.kdl` + `flock.swap.kdl` (the swap
 /// file's contents are inlined here because a stringified layout has no
 /// sibling `.swap.kdl` to pick up).
 const FLOCK_LAYOUT_TEMPLATE: &str = r#"layout {
+    dock size=40 closed_size=5 {
+        __DOCK__
+    }
     pane size=1 borderless=true {
         plugin location="tab-bar"
     }
-    pane split_direction="Vertical" {
-        pane size="25%" borderless=true {
-            __SIDEBAR_25__
-        }
-        pane
-    }
+    pane
     pane size=2 borderless=true {
         plugin location="status-bar"
     }
@@ -159,30 +157,25 @@ const FLOCK_LAYOUT_TEMPLATE: &str = r#"layout {
         pane size=1 borderless=true {
             plugin location="tab-bar"
         }
-        pane split_direction="vertical" {
-            pane size=40 borderless=true {
-                __SIDEBAR_40__
-            }
-            children
-        }
+        children
         pane size=2 borderless=true {
             plugin location="status-bar"
         }
     }
     swap_tiled_layout name="vertical" {
-        flock_ui max_panes=6 {
+        flock_ui max_panes=5 {
             pane split_direction="vertical" {
                 pane
                 pane { children; }
             }
         }
-        flock_ui max_panes=9 {
+        flock_ui max_panes=8 {
             pane split_direction="vertical" {
                 pane { children; }
                 pane { pane; pane; pane; pane; }
             }
         }
-        flock_ui max_panes=13 {
+        flock_ui max_panes=12 {
             pane split_direction="vertical" {
                 pane { children; }
                 pane { pane; pane; pane; pane; }
@@ -191,17 +184,17 @@ const FLOCK_LAYOUT_TEMPLATE: &str = r#"layout {
         }
     }
     swap_tiled_layout name="horizontal" {
-        flock_ui max_panes=5 {
+        flock_ui max_panes=4 {
             pane
             pane
         }
-        flock_ui max_panes=9 {
+        flock_ui max_panes=8 {
             pane {
                 pane split_direction="vertical" { children; }
                 pane split_direction="vertical" { pane; pane; pane; pane; }
             }
         }
-        flock_ui max_panes=13 {
+        flock_ui max_panes=12 {
             pane {
                 pane split_direction="vertical" { children; }
                 pane split_direction="vertical" { pane; pane; pane; pane; }
@@ -210,7 +203,7 @@ const FLOCK_LAYOUT_TEMPLATE: &str = r#"layout {
         }
     }
     swap_tiled_layout name="stacked" {
-        flock_ui min_panes=6 {
+        flock_ui min_panes=5 {
             pane split_direction="vertical" {
                 pane
                 pane stacked=true { children; }
@@ -312,9 +305,7 @@ pub fn layout_doc_with_options(
     let quoted: Vec<String> = binding_argv.iter().map(|arg| kdl_quote(arg)).collect();
     let layout = match base_layout {
         Some(base) => format!("{}\n", base.trim_end()),
-        None => FLOCK_LAYOUT_TEMPLATE
-            .replace("__SIDEBAR_25__", &sidebar_plugin_block(sidebar_args, 12))
-            .replace("__SIDEBAR_40__", &sidebar_plugin_block(sidebar_args, 16)),
+        None => FLOCK_LAYOUT_TEMPLATE.replace("__DOCK__", &sidebar_plugin_block(sidebar_args, 8)),
     };
     format!(
         "{}default_command {}\n{}",
@@ -324,8 +315,8 @@ pub fn layout_doc_with_options(
     )
 }
 
-/// A `plugin location="zellij:flock-sidebar"` block with the shared dir args
-/// as its children, indented to sit at `indent` spaces (the marker's depth).
+/// A `plugin location="zellij:flock-sidebar"` block with the shared dir args as
+/// its children, indented to sit at `indent` spaces (the marker's depth).
 fn sidebar_plugin_block(sidebar_args: &[(String, String)], indent: usize) -> String {
     if sidebar_args.is_empty() {
         return r#"plugin location="zellij:flock-sidebar""#.to_owned();
@@ -743,8 +734,12 @@ This API operation needs the "codespace" scope. To request it, run:  gh auth ref
         assert!(doc.contains(r#"cwd "/""#));
         assert!(doc.contains(r#"tab_template name="flock_ui""#));
         assert!(doc.contains(r#"swap_tiled_layout name="stacked""#));
-        assert!(!doc.contains("__SIDEBAR_25__"));
-        assert!(!doc.contains("__SIDEBAR_40__"));
+        assert!(!doc.contains("__DOCK__"));
+        // The sidebar must be declared exactly once, as a dock — not as a pane, and
+        // above all not inside a swap layout, where a relayout would re-assert its
+        // width and undo the user's toggle.
+        assert!(doc.contains("dock size=40 closed_size=5 {"));
+        assert_eq!(doc.matches("zellij:flock-sidebar").count(), 1);
     }
 
     /// A user base with multiple explicit tabs (like the flock-codespace

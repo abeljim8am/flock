@@ -17,10 +17,12 @@ use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap};
 use std::rc::Rc;
 use zellij_utils::{
-    data::{Palette, Style},
-    input::layout::{FloatingPaneLayout, Run, RunPluginOrAlias, TiledPaneLayout},
+    data::{DockMode, Palette, Style},
+    input::layout::{DockLayout, FloatingPaneLayout, Run, RunPluginOrAlias, TiledPaneLayout},
     pane_size::{PaneGeom, Size, SizeInPixels, Viewport},
 };
+
+use crate::panes::DockedPane;
 
 pub struct LayoutApplier<'a> {
     viewport: Rc<RefCell<Viewport>>, // includes all non-UI panes
@@ -156,6 +158,70 @@ impl<'a> LayoutApplier<'a> {
         )?;
         let should_show_floating_panes = layout_has_floating_panes && !hide_floating_panes;
         return Ok(should_show_floating_panes);
+    }
+    /// Materialize this tab's dock from the layout's `dock` declaration.
+    ///
+    /// Must run *before* `apply_tiled_panes_layout`, so that
+    /// `total_space_for_tiled_panes` already sees the reserved band and positions
+    /// the layout beside it rather than underneath it.
+    ///
+    /// Idempotent: a tab that already has a dock pane keeps it. Nothing here looks
+    /// the dock up by plugin URL, which is what makes a duplicate structurally
+    /// impossible.
+    pub fn apply_dock(
+        &mut self,
+        dock: &DockLayout,
+        mode: DockMode,
+        new_plugin_ids: &mut HashMap<RunPluginOrAlias, Vec<u32>>,
+    ) -> Result<()> {
+        let err_context = || format!("Failed to apply dock");
+        if self.tiled_panes.dock_pane_id().is_some() {
+            // Already materialized; only the mode can change, and `Screen` owns that.
+            self.tiled_panes.reserve_dock_band();
+            return Ok(());
+        }
+        let pid = new_plugin_ids
+            .get_mut(&dock.run)
+            .and_then(|ids| ids.pop())
+            .with_context(err_context)?;
+        let mut dock_pane = PluginPane::new(
+            pid,
+            PaneGeom::default(),
+            self.senders
+                .to_plugin
+                .as_ref()
+                .with_context(err_context)?
+                .clone(),
+            dock.run.location_string(),
+            String::new(),
+            self.sixel_image_store.clone(),
+            self.terminal_emulator_colors.clone(),
+            self.terminal_emulator_color_codes.clone(),
+            self.link_handler.clone(),
+            self.character_cell_size.clone(),
+            self.connected_clients.borrow().keys().copied().collect(),
+            self.style,
+            Some(Run::Plugin(dock.run.clone())),
+            self.debug,
+            self.arrow_fonts,
+            self.styled_underlines,
+        );
+        // A dock draws its own edge if it wants one, is never focusable, and is
+        // marked so every tiling path can skip it.
+        dock_pane.set_borderless(true);
+        dock_pane.set_selectable(false);
+        dock_pane.set_is_dock(true);
+        let pane_id = PaneId::Plugin(pid);
+        self.tiled_panes
+            .add_pane_with_existing_geom(pane_id, Box::new(dock_pane));
+        self.tiled_panes.set_dock(DockedPane {
+            pane_id,
+            mode,
+            open_cols: dock.open_cols,
+            closed_cols: dock.closed_cols,
+        });
+        self.tiled_panes.reserve_dock_band();
+        Ok(())
     }
     pub fn apply_tiled_panes_layout_to_existing_panes(
         &mut self,
@@ -1040,6 +1106,13 @@ impl<'a> LayoutApplier<'a> {
             let mut viewport = viewport.borrow_mut();
             *viewport = (*display_area.borrow()).into();
         }
+        // A dock's band is reserved explicitly, before any geometry is inspected,
+        // and is therefore order-independent. The scan below cannot do this job:
+        // it only insets horizontally for a pane spanning the viewport's full
+        // height, which a left-edge pane only does *after* the top and bottom
+        // chrome have inset it — so whether it fired at all would depend on
+        // iteration order over the pane map.
+        tiled_panes.reserve_dock_band();
         let boundary_geoms = tiled_panes.non_selectable_pane_geoms_inside_viewport();
         {
             // curly braces here is so that we free viewport immediately when we're done
@@ -1119,8 +1192,19 @@ impl<'a> LayoutApplier<'a> {
             (display_area.cols, display_area.rows)
         };
 
+        // A dock is not a node in the layout, so the layout must be positioned in
+        // the space *beside* it. `split_space` honours `x` and resolves percentages
+        // against the geom it is given, so every layout percentage ends up relative
+        // to the content band. `SwapLayouts::swap_tiled_panes` subtracts the band
+        // identically — if its feasibility probe and this disagree, `flatten_layout`
+        // silently falls back to ignoring percent sizes.
+        let dock_band = self.tiled_panes.dock_band_cols();
+
         let mut free_space = PaneGeom::default();
-        free_space.cols.set_inner(display_area_cols);
+        free_space.x = dock_band;
+        free_space
+            .cols
+            .set_inner(display_area_cols.saturating_sub(dock_band));
         free_space.rows.set_inner(display_area_rows);
         free_space
     }

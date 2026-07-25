@@ -16,14 +16,16 @@ use zellij_utils::data::Direction;
 use zellij_utils::data::Resize;
 use zellij_utils::data::ResizeStrategy;
 use zellij_utils::data::WebSharing;
+use zellij_utils::data::{DockMode, PermissionType, PluginPermission};
 use zellij_utils::envs::set_session_name;
 use zellij_utils::errors::{prelude::*, ErrorContext};
 use zellij_utils::input::layout::{
-    FloatingPaneLayout, Layout, PercentOrFixed, RunPluginOrAlias, SwapFloatingLayout,
-    SwapTiledLayout, TiledPaneLayout,
+    DockLayout, FloatingPaneLayout, Layout, LayoutConstraint, PercentOrFixed, RunPluginOrAlias,
+    SplitDirection, SwapFloatingLayout, SwapTiledLayout, TiledPaneLayout,
 };
 use zellij_utils::input::mouse::MouseEvent;
 use zellij_utils::ipc::IpcReceiverWithContext;
+use zellij_utils::pane_size::PaneGeom;
 use zellij_utils::pane_size::{Size, SizeInPixels};
 use zellij_utils::position::Position;
 
@@ -392,6 +394,32 @@ fn create_new_tab_with_swap_layouts(
     draw_pane_frames: bool,
     stacked_resize: bool,
 ) -> Tab {
+    create_new_tab_with_swap_layouts_and_dock(
+        size,
+        default_mode,
+        swap_layouts,
+        base_layout_and_ids,
+        draw_pane_frames,
+        stacked_resize,
+        None,
+    )
+}
+
+fn create_new_tab_with_swap_layouts_and_dock(
+    size: Size,
+    default_mode: ModeInfo,
+    swap_layouts: (Vec<SwapTiledLayout>, Vec<SwapFloatingLayout>),
+    base_layout_and_ids: Option<(
+        TiledPaneLayout,
+        Vec<FloatingPaneLayout>,
+        Vec<(u32, Option<RunCommand>)>,
+        Vec<(u32, Option<RunCommand>)>,
+        HashMap<RunPluginOrAlias, Vec<u32>>,
+    )>,
+    draw_pane_frames: bool,
+    stacked_resize: bool,
+    dock: Option<(DockLayout, DockMode)>,
+) -> Tab {
     set_session_name("test".into());
     let index = 0;
     let position = 0;
@@ -479,6 +507,9 @@ fn create_new_tab_with_swap_layouts(
     } else {
         new_terminal_ids
     };
+    if let Some((dock_layout, dock_mode)) = dock {
+        tab.set_dock_declaration(dock_layout, dock_mode);
+    }
     tab.apply_layout(
         base_layout,
         base_floating_layout,
@@ -8535,341 +8566,6 @@ fn new_pane_in_auto_layout() {
 }
 
 #[test]
-fn fixed_width_resize_of_unselectable_sidebar_preserves_auto_layout() {
-    let size = Size {
-        cols: 120,
-        rows: 30,
-    };
-    let client_id = 1;
-    let base_layout = r#"
-        layout {
-            pane size=1 borderless=true {
-                plugin location="zellij:tab-bar"
-            }
-            pane split_direction="vertical" {
-                pane size="25%" borderless=true {
-                    plugin location="zellij:flock-sidebar"
-                }
-                pane
-            }
-            pane size=2 borderless=true {
-                plugin location="zellij:status-bar"
-            }
-        }
-    "#;
-    let swap_layouts = r#"
-        layout {
-            swap_tiled_layout {
-                tab max_panes=5 {
-                    pane size=1 borderless=true {
-                        plugin location="zellij:tab-bar"
-                    }
-                    pane split_direction="vertical" {
-                        pane size=40 borderless=true {
-                            plugin location="zellij:flock-sidebar"
-                        }
-                        pane split_direction="vertical" {
-                            pane { children; }
-                            pane
-                        }
-                    }
-                    pane size=2 borderless=true {
-                        plugin location="zellij:status-bar"
-                    }
-                }
-            }
-        }
-    "#;
-    let (base_layout, base_floating_layout) =
-        Layout::from_kdl(base_layout, Some("file_name.kdl".into()), None, None)
-            .unwrap()
-            .template
-            .unwrap();
-
-    let new_terminal_ids = vec![(1, None)];
-    let new_floating_terminal_ids = vec![];
-    let mut new_plugin_ids = HashMap::new();
-    new_plugin_ids.insert(
-        RunPluginOrAlias::from_url("zellij:tab-bar", &None, None, None).unwrap(),
-        vec![1],
-    );
-    new_plugin_ids.insert(
-        RunPluginOrAlias::from_url("zellij:flock-sidebar", &None, None, None).unwrap(),
-        vec![2],
-    );
-    new_plugin_ids.insert(
-        RunPluginOrAlias::from_url("zellij:status-bar", &None, None, None).unwrap(),
-        vec![3],
-    );
-
-    let swap_layout =
-        Layout::from_kdl(swap_layouts, Some("file_name.kdl".into()), None, None).unwrap();
-    let swap_tiled_layouts = swap_layout.swap_tiled_layouts.clone();
-    let swap_floating_layouts = swap_layout.swap_floating_layouts.clone();
-    let stacked_resize = true;
-    let mut tab = create_new_tab_with_swap_layouts(
-        size,
-        ModeInfo::default(),
-        (swap_tiled_layouts, swap_floating_layouts),
-        Some((
-            base_layout,
-            base_floating_layout,
-            new_terminal_ids,
-            new_floating_terminal_ids,
-            new_plugin_ids,
-        )),
-        true,
-        stacked_resize,
-    );
-
-    tab.set_pane_selectable(PaneId::Plugin(1), false);
-    tab.set_pane_selectable(PaneId::Plugin(2), false);
-    tab.set_pane_selectable(PaneId::Plugin(3), false);
-    tab.resize_pane_id_to_fixed_width(PaneId::Plugin(2), 40)
-        .unwrap();
-    assert!(
-        !tab.swap_layouts.is_tiled_damaged(),
-        "resizing non-selectable UI panes should not disable auto layout"
-    );
-
-    tab.new_pane(
-        PaneId::Terminal(2),
-        None,
-        None,
-        false,
-        true,
-        NewPanePlacement::default(),
-        Some(client_id),
-        None,
-    )
-    .unwrap();
-
-    let sidebar_geom = tab
-        .tiled_panes
-        .panes
-        .get(&PaneId::Plugin(2))
-        .unwrap()
-        .position_and_size();
-    let first_terminal_geom = tab
-        .tiled_panes
-        .panes
-        .get(&PaneId::Terminal(1))
-        .unwrap()
-        .position_and_size();
-    let second_terminal_geom = tab
-        .tiled_panes
-        .panes
-        .get(&PaneId::Terminal(2))
-        .unwrap()
-        .position_and_size();
-
-    assert_eq!(sidebar_geom.x, 0, "sidebar x position");
-    assert_eq!(sidebar_geom.cols.as_usize(), 40, "sidebar column count");
-    assert_eq!(first_terminal_geom.x, 40, "first terminal x position");
-    assert_eq!(
-        first_terminal_geom.cols.as_usize(),
-        40,
-        "first terminal column count"
-    );
-    assert_eq!(second_terminal_geom.x, 80, "second terminal x position");
-    assert_eq!(
-        second_terminal_geom.cols.as_usize(),
-        40,
-        "second terminal column count"
-    );
-}
-
-#[test]
-fn fixed_width_resize_rejects_unsatisfiable_widths() {
-    let size = Size {
-        cols: 120,
-        rows: 30,
-    };
-    let base_layout = r#"
-        layout {
-            pane split_direction="vertical" {
-                pane size="25%" borderless=true {
-                    plugin location="zellij:flock-sidebar"
-                }
-                pane
-            }
-        }
-    "#;
-    let (base_layout, base_floating_layout) =
-        Layout::from_kdl(base_layout, Some("file_name.kdl".into()), None, None)
-            .unwrap()
-            .template
-            .unwrap();
-    let new_terminal_ids = vec![(1, None)];
-    let mut new_plugin_ids = HashMap::new();
-    new_plugin_ids.insert(
-        RunPluginOrAlias::from_url("zellij:flock-sidebar", &None, None, None).unwrap(),
-        vec![2],
-    );
-    let mut tab = create_new_tab_with_swap_layouts(
-        size,
-        ModeInfo::default(),
-        (vec![], vec![]),
-        Some((
-            base_layout,
-            base_floating_layout,
-            new_terminal_ids,
-            vec![],
-            new_plugin_ids,
-        )),
-        true,
-        true,
-    );
-
-    let geom_before = tab
-        .tiled_panes
-        .panes
-        .get(&PaneId::Plugin(2))
-        .unwrap()
-        .position_and_size();
-
-    // Width 0 and widths beyond the display must be rejected before any
-    // geometry is touched — otherwise the pane is left with an unsatisfiable
-    // Fixed constraint that no resize can ever undo.
-    tab.resize_pane_id_to_fixed_width(PaneId::Plugin(2), 0)
-        .unwrap();
-    tab.resize_pane_id_to_fixed_width(PaneId::Plugin(2), size.cols + 80)
-        .unwrap();
-
-    let geom_after = tab
-        .tiled_panes
-        .panes
-        .get(&PaneId::Plugin(2))
-        .unwrap()
-        .position_and_size();
-    assert_eq!(
-        geom_before, geom_after,
-        "rejected fixed-width resizes must not change the pane geometry"
-    );
-    assert!(
-        !geom_after.cols.is_fixed(),
-        "rejected fixed-width resizes must not leave a Fixed cols constraint"
-    );
-}
-
-#[test]
-fn directional_split_after_fixed_width_sidebar_splits_content_evenly() {
-    let size = Size {
-        cols: 120,
-        rows: 30,
-    };
-    let client_id = 1;
-    let base_layout = r#"
-        layout {
-            pane size=1 borderless=true {
-                plugin location="zellij:tab-bar"
-            }
-            pane split_direction="vertical" {
-                pane size="25%" borderless=true {
-                    plugin location="zellij:flock-sidebar"
-                }
-                pane
-            }
-            pane size=2 borderless=true {
-                plugin location="zellij:status-bar"
-            }
-        }
-    "#;
-    let (base_layout, base_floating_layout) =
-        Layout::from_kdl(base_layout, Some("file_name.kdl".into()), None, None)
-            .unwrap()
-            .template
-            .unwrap();
-
-    let new_terminal_ids = vec![(1, None)];
-    let new_floating_terminal_ids = vec![];
-    let mut new_plugin_ids = HashMap::new();
-    new_plugin_ids.insert(
-        RunPluginOrAlias::from_url("zellij:tab-bar", &None, None, None).unwrap(),
-        vec![1],
-    );
-    new_plugin_ids.insert(
-        RunPluginOrAlias::from_url("zellij:flock-sidebar", &None, None, None).unwrap(),
-        vec![2],
-    );
-    new_plugin_ids.insert(
-        RunPluginOrAlias::from_url("zellij:status-bar", &None, None, None).unwrap(),
-        vec![3],
-    );
-
-    let stacked_resize = true;
-    let mut tab = create_new_tab_with_swap_layouts(
-        size,
-        ModeInfo::default(),
-        (vec![], vec![]),
-        Some((
-            base_layout,
-            base_floating_layout,
-            new_terminal_ids,
-            new_floating_terminal_ids,
-            new_plugin_ids,
-        )),
-        true,
-        stacked_resize,
-    );
-
-    tab.set_pane_selectable(PaneId::Plugin(1), false);
-    tab.set_pane_selectable(PaneId::Plugin(2), false);
-    tab.set_pane_selectable(PaneId::Plugin(3), false);
-    tab.resize_pane_id_to_fixed_width(PaneId::Plugin(2), 40)
-        .unwrap();
-
-    tab.new_pane(
-        PaneId::Terminal(2),
-        None,
-        None,
-        false,
-        true,
-        NewPanePlacement::Tiled {
-            direction: Some(Direction::Right),
-            borderless: Some(false),
-        },
-        Some(client_id),
-        None,
-    )
-    .unwrap();
-
-    let sidebar_geom = tab
-        .tiled_panes
-        .panes
-        .get(&PaneId::Plugin(2))
-        .unwrap()
-        .position_and_size();
-    let first_terminal_geom = tab
-        .tiled_panes
-        .panes
-        .get(&PaneId::Terminal(1))
-        .unwrap()
-        .position_and_size();
-    let second_terminal_geom = tab
-        .tiled_panes
-        .panes
-        .get(&PaneId::Terminal(2))
-        .unwrap()
-        .position_and_size();
-
-    assert_eq!(sidebar_geom.x, 0, "sidebar x position");
-    assert_eq!(sidebar_geom.cols.as_usize(), 40, "sidebar column count");
-    assert_eq!(first_terminal_geom.x, 40, "first terminal x position");
-    assert_eq!(
-        first_terminal_geom.cols.as_usize(),
-        40,
-        "first terminal column count"
-    );
-    assert_eq!(second_terminal_geom.x, 80, "second terminal x position");
-    assert_eq!(
-        second_terminal_geom.cols.as_usize(),
-        40,
-        "second terminal column count"
-    );
-}
-
-#[test]
 fn new_pane_in_stacked_resizes() {
     let size = Size {
         cols: 200,
@@ -15179,4 +14875,400 @@ fn hidden_cursor_still_emits_cup_for_host_terminal_positioning() {
         !client_output.contains("\u{1b}[?25h"),
         "Show-cursor sequence must not be present when app has hidden the cursor"
     );
+}
+
+// ── dock ─────────────────────────────────────────────────────────────────────
+//
+// A dock is chrome pinned to the left edge that reserves a band of columns. It
+// is not a node in any layout, so it must be invisible to pane counts, swap
+// layouts, relayout matching and focus navigation, and the server — not the
+// plugin in it — owns its width.
+
+const DOCK_URL: &str = "zellij:status-bar";
+
+fn dock_layout(open_cols: usize, closed_cols: usize) -> DockLayout {
+    DockLayout {
+        run: RunPluginOrAlias::from_url(DOCK_URL, &None, None, None).unwrap(),
+        open_cols,
+        closed_cols,
+    }
+}
+
+/// A tab with a dock plus `content_panes` terminal panes, and nothing else.
+fn create_tab_with_dock(
+    size: Size,
+    open_cols: usize,
+    closed_cols: usize,
+    mode: DockMode,
+    content_panes: usize,
+    swap_layouts: (Vec<SwapTiledLayout>, Vec<SwapFloatingLayout>),
+) -> Tab {
+    let dock = dock_layout(open_cols, closed_cols);
+    let mut new_plugin_ids = HashMap::new();
+    // The plugin thread reserves an id for the dock's plugin the same way it does
+    // for panes declared in the layout; `apply_dock` pops it from here.
+    new_plugin_ids.insert(dock.run.clone(), vec![1]);
+    let base_layout = TiledPaneLayout {
+        children: (0..content_panes)
+            .map(|_| TiledPaneLayout::default())
+            .collect(),
+        ..Default::default()
+    };
+    let new_terminal_ids: Vec<(u32, Option<RunCommand>)> =
+        (0..content_panes as u32).map(|i| (i + 1, None)).collect();
+    create_new_tab_with_swap_layouts_and_dock(
+        size,
+        ModeInfo::default(),
+        swap_layouts,
+        Some((
+            base_layout,
+            vec![],
+            new_terminal_ids,
+            vec![],
+            new_plugin_ids,
+        )),
+        true,
+        false,
+        Some((dock, mode)),
+    )
+}
+
+fn dock_geom(tab: &Tab) -> PaneGeom {
+    let dock_pane_id = tab
+        .tiled_panes
+        .dock_pane_id()
+        .expect("tab should have a dock");
+    tab.tiled_panes
+        .get_pane(dock_pane_id)
+        .expect("dock pane should exist")
+        .position_and_size()
+}
+
+fn content_geoms(tab: &Tab) -> Vec<PaneGeom> {
+    let dock_pane_id = tab.tiled_panes.dock_pane_id();
+    let mut geoms: Vec<_> = tab
+        .tiled_panes
+        .panes
+        .iter()
+        .filter(|(id, _)| Some(**id) != dock_pane_id)
+        .map(|(_, pane)| pane.position_and_size())
+        .collect();
+    geoms.sort_by_key(|geom| (geom.x, geom.y));
+    geoms
+}
+
+#[test]
+fn dock_reserves_a_column_band() {
+    let size = Size {
+        cols: 120,
+        rows: 30,
+    };
+    let tab = create_tab_with_dock(size, 40, 5, DockMode::Open, 1, Default::default());
+
+    let dock = dock_geom(&tab);
+    assert_eq!(dock.x, 0, "dock is pinned to the left edge");
+    assert_eq!(
+        dock.y, 0,
+        "dock spans the full height, above the tab-bar row"
+    );
+    assert_eq!(dock.cols.as_usize(), 40);
+    assert_eq!(dock.rows.as_usize(), 30);
+
+    // Every content pane lives beside the dock, not underneath it.
+    for geom in content_geoms(&tab) {
+        assert_eq!(geom.x, 40, "content starts after the dock band");
+        assert_eq!(
+            geom.cols.as_usize(),
+            80,
+            "content gets the remaining columns"
+        );
+    }
+}
+
+#[test]
+fn collapsed_dock_reserves_only_the_rail() {
+    let size = Size {
+        cols: 120,
+        rows: 30,
+    };
+    let tab = create_tab_with_dock(size, 40, 5, DockMode::Closed, 1, Default::default());
+
+    assert_eq!(dock_geom(&tab).cols.as_usize(), 5);
+    for geom in content_geoms(&tab) {
+        assert_eq!(geom.x, 5);
+        assert_eq!(geom.cols.as_usize(), 115);
+    }
+}
+
+#[test]
+fn dock_is_excluded_from_pane_counts() {
+    let size = Size {
+        cols: 120,
+        rows: 30,
+    };
+    let tab = create_tab_with_dock(size, 40, 5, DockMode::Open, 2, Default::default());
+    // Two content panes; the dock is chrome and must not be counted, or the count
+    // would disagree with the number of leaf pane nodes the layout declares.
+    assert_eq!(tab.tiled_panes.visible_panes_count(), 2);
+    assert_eq!(tab.get_selectable_tiled_panes_count(), 2);
+}
+
+#[test]
+fn dock_geometry_is_idempotent() {
+    let size = Size {
+        cols: 120,
+        rows: 30,
+    };
+    let mut tab = create_tab_with_dock(size, 40, 5, DockMode::Open, 2, Default::default());
+    let before_dock = dock_geom(&tab);
+    let before_content = content_geoms(&tab);
+
+    // Reserving twice must be indistinguishable from reserving once; if the band
+    // accumulated, a resize that triggers a relayout would oscillate.
+    tab.tiled_panes.reserve_dock_band();
+    tab.tiled_panes.reserve_dock_band();
+
+    assert_eq!(dock_geom(&tab), before_dock);
+    assert_eq!(content_geoms(&tab), before_content);
+}
+
+#[test]
+fn focus_navigation_skips_the_dock() {
+    let size = Size {
+        cols: 120,
+        rows: 30,
+    };
+    let mut tab = create_tab_with_dock(size, 40, 5, DockMode::Open, 1, Default::default());
+    let client_id = 1;
+    let focused_before = tab.get_active_pane_id(client_id);
+
+    // The only thing to the left of the content pane is the dock, so this must be
+    // a no-op rather than moving focus into chrome.
+    tab.move_focus_left(client_id).unwrap();
+
+    assert_eq!(tab.get_active_pane_id(client_id), focused_before);
+    assert_ne!(
+        tab.get_active_pane_id(client_id),
+        tab.tiled_panes.dock_pane_id()
+    );
+}
+
+#[test]
+fn opening_a_pane_does_not_resize_the_dock() {
+    // The regression test for the original bug: with auto-layout on and swap
+    // layouts loaded, opening a pane used to re-apply the swap layout, which
+    // re-asserted the sidebar's declared width and silently undid the collapse.
+    let size = Size {
+        cols: 120,
+        rows: 30,
+    };
+    let swap_layouts = (
+        vec![(
+            {
+                let mut layouts = BTreeMap::new();
+                layouts.insert(
+                    LayoutConstraint::NoConstraint,
+                    TiledPaneLayout {
+                        children_split_direction: SplitDirection::Vertical,
+                        children: vec![TiledPaneLayout::default(), TiledPaneLayout::default()],
+                        ..Default::default()
+                    },
+                );
+                layouts
+            },
+            Some("vertical".to_owned()),
+        )],
+        vec![],
+    );
+    let mut tab = create_tab_with_dock(size, 40, 5, DockMode::Closed, 1, swap_layouts);
+    assert_eq!(dock_geom(&tab).cols.as_usize(), 5, "starts collapsed");
+
+    tab.new_pane(
+        PaneId::Terminal(2),
+        None,
+        None,
+        false,
+        true,
+        NewPanePlacement::default(),
+        Some(1),
+        None,
+    )
+    .unwrap();
+
+    assert_eq!(
+        dock_geom(&tab).cols.as_usize(),
+        5,
+        "the dock must still be collapsed after a relayout"
+    );
+    assert_eq!(
+        tab.tiled_panes.dock_mode(),
+        Some(DockMode::Closed),
+        "and the mode must be unchanged"
+    );
+}
+
+#[test]
+fn terminal_resize_keeps_the_dock_fixed_and_clamped() {
+    let mut tab = create_tab_with_dock(
+        Size {
+            cols: 120,
+            rows: 30,
+        },
+        40,
+        5,
+        DockMode::Open,
+        1,
+        Default::default(),
+    );
+
+    tab.resize_whole_tab(Size { cols: 80, rows: 30 }).unwrap();
+    assert_eq!(
+        dock_geom(&tab).cols.as_usize(),
+        40,
+        "a fixed dock keeps its width; content absorbs the delta"
+    );
+
+    // Narrow enough that an unclamped 40-column dock would starve the content
+    // area. The clamp is the server's job — the plugin has no idea how wide the
+    // tab is.
+    tab.resize_whole_tab(Size { cols: 30, rows: 30 }).unwrap();
+    let dock_cols = dock_geom(&tab).cols.as_usize();
+    assert!(
+        dock_cols <= 25,
+        "dock must be clamped to leave room for content, got {dock_cols}"
+    );
+    for geom in content_geoms(&tab) {
+        assert!(
+            geom.cols.as_usize() >= 5,
+            "content band must stay usable, got {}",
+            geom.cols.as_usize()
+        );
+    }
+}
+
+#[test]
+fn fullscreen_does_not_cover_the_dock() {
+    // A dock owns a band of the display, so a fullscreen pane fills what is left
+    // beside it rather than drawing over it. (This is a fix, not a preservation:
+    // the old sidebar was swept into `panes_to_hide` and covered.)
+    let size = Size {
+        cols: 120,
+        rows: 30,
+    };
+    let mut tab = create_tab_with_dock(size, 40, 5, DockMode::Open, 2, Default::default());
+    let client_id = 1;
+    let dock_pane_id = tab.tiled_panes.dock_pane_id().unwrap();
+
+    tab.toggle_active_pane_fullscreen(client_id);
+
+    assert!(tab.tiled_panes.fullscreen_is_active());
+    let fullscreen_pane_id = tab.get_active_pane_id(client_id).unwrap();
+    let fullscreen_geom = tab
+        .tiled_panes
+        .get_pane(fullscreen_pane_id)
+        .unwrap()
+        .current_geom();
+    assert_eq!(
+        fullscreen_geom.x, 40,
+        "the fullscreen pane starts after the dock band"
+    );
+    let dock = tab.tiled_panes.get_pane(dock_pane_id).unwrap();
+    assert_eq!(
+        dock.position_and_size().cols.as_usize(),
+        40,
+        "the dock keeps its band under fullscreen"
+    );
+
+    // And unsetting fullscreen restores the content beside the dock.
+    tab.toggle_active_pane_fullscreen(client_id);
+    assert!(!tab.tiled_panes.fullscreen_is_active());
+    for geom in content_geoms(&tab) {
+        assert_eq!(geom.x >= 40, true, "content stays beside the dock");
+    }
+}
+
+#[test]
+fn toggling_the_dock_preserves_content_pane_proportions() {
+    // Content panes keep their `Percent` constraints, so re-solving against the
+    // narrower/wider band preserves their ratio for free. This is the assertion
+    // the deleted `normalize_flexible_widths_overlapping_pane` was approximating.
+    let size = Size {
+        cols: 120,
+        rows: 30,
+    };
+    let mut tab = create_tab_with_dock(size, 40, 5, DockMode::Open, 2, Default::default());
+
+    let before = content_geoms(&tab);
+    assert_eq!(before.len(), 2);
+    let open_band: usize = before.iter().map(|g| g.cols.as_usize()).sum();
+
+    tab.set_dock_mode(DockMode::Closed);
+
+    let after = content_geoms(&tab);
+    let closed_band: usize = after.iter().map(|g| g.cols.as_usize()).sum();
+    assert!(
+        closed_band > open_band,
+        "collapsing the dock hands its columns to the content ({open_band} -> {closed_band})"
+    );
+    // Same split ratio, just over a wider band.
+    let ratio_before = before[0].cols.as_usize() as f64 / open_band as f64;
+    let ratio_after = after[0].cols.as_usize() as f64 / closed_band as f64;
+    assert!(
+        (ratio_before - ratio_after).abs() < 0.05,
+        "split ratio should be preserved: {ratio_before} vs {ratio_after}"
+    );
+}
+
+#[test]
+fn setting_the_dock_mode_is_idempotent() {
+    let size = Size {
+        cols: 120,
+        rows: 30,
+    };
+    let mut tab = create_tab_with_dock(size, 40, 5, DockMode::Open, 2, Default::default());
+
+    tab.set_dock_mode(DockMode::Closed);
+    let once = (dock_geom(&tab), content_geoms(&tab));
+    tab.set_dock_mode(DockMode::Closed);
+    let twice = (dock_geom(&tab), content_geoms(&tab));
+
+    assert_eq!(once, twice, "re-applying the same mode must change nothing");
+}
+
+#[test]
+fn a_permission_prompt_keeps_the_dock_expanded() {
+    // The permission prompt renders into the dock plugin's own grid. A 5-column
+    // rail cannot show it, so a dock awaiting permissions must stay expanded no
+    // matter what mode says — otherwise the user is left with an unreadable prompt
+    // and a sidebar that never gets the permissions it needs.
+    let size = Size {
+        cols: 120,
+        rows: 30,
+    };
+    let mut tab = create_tab_with_dock(size, 40, 5, DockMode::Open, 1, Default::default());
+    let dock_pane_id = tab.tiled_panes.dock_pane_id().unwrap();
+
+    tab.tiled_panes
+        .get_pane_mut(dock_pane_id)
+        .unwrap()
+        .request_permissions_from_user(Some(PluginPermission {
+            name: "flock-sidebar".to_owned(),
+            permissions: vec![PermissionType::ReadApplicationState],
+        }));
+
+    tab.set_dock_mode(DockMode::Closed);
+
+    assert_eq!(
+        dock_geom(&tab).cols.as_usize(),
+        40,
+        "the dock must stay expanded while the permission prompt is up"
+    );
+
+    // Once the prompt is answered, the requested mode takes effect.
+    tab.tiled_panes
+        .get_pane_mut(dock_pane_id)
+        .unwrap()
+        .request_permissions_from_user(None);
+    tab.tiled_panes.reserve_dock_band();
+    assert_eq!(dock_geom(&tab).cols.as_usize(), 5);
 }

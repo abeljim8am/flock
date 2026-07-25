@@ -262,7 +262,17 @@ impl SwapLayouts {
                             let display_area = self.display_area.borrow();
                             // TODO: reuse the assets from position_panes_in_space here?
                             let pane_count = tiled_panes.visible_panes_count();
-                            let display_area = PaneGeom::from(&*display_area);
+                            let mut display_area = PaneGeom::from(&*display_area);
+                            // Must match `LayoutApplier::total_space_for_tiled_panes`
+                            // exactly: this probe decides whether a candidate is
+                            // usable, and the applier is what then positions it. If
+                            // they disagree about the space available, the applier
+                            // silently falls back to ignoring percent sizes.
+                            let dock_band = tiled_panes.dock_band_cols();
+                            display_area.x = dock_band;
+                            display_area
+                                .cols
+                                .set_inner(display_area.cols.as_usize().saturating_sub(dock_band));
                             if layout
                                 .position_panes_in_space(
                                     &display_area,

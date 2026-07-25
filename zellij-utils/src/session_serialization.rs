@@ -5,8 +5,9 @@ use std::path::PathBuf;
 use crate::{
     input::layout::PluginUserConfiguration,
     input::layout::{
-        FloatingPaneLayout, Layout, LayoutConstraint, PercentOrFixed, Run, RunPluginOrAlias,
-        SplitDirection, SplitSize, SwapFloatingLayout, SwapTiledLayout, TiledPaneLayout,
+        DockLayout, FloatingPaneLayout, Layout, LayoutConstraint, PercentOrFixed, Run,
+        RunPluginOrAlias, SplitDirection, SplitSize, SwapFloatingLayout, SwapTiledLayout,
+        TiledPaneLayout,
     },
     pane_size::{Constraint, PaneGeom},
 };
@@ -50,6 +51,9 @@ pub fn serialize_session_layout(
     let mut layout_node_children = KdlDocument::new();
     if let Some(global_cwd) = serialize_global_cwd(&global_layout_manifest.global_cwd) {
         layout_node_children.nodes_mut().push(global_cwd);
+    }
+    if let Some(dock) = serialize_dock(&global_layout_manifest.default_layout.dock) {
+        layout_node_children.nodes_mut().push(dock);
     }
     match serialize_multiple_tabs(global_layout_manifest.tabs, &mut pane_contents) {
         Ok(mut serialized_tabs) => {
@@ -332,30 +336,37 @@ fn serialize_args(args: Vec<String>, pane_node_children: &mut KdlDocument) {
     }
 }
 
+/// A `plugin location="…" { …config… }` node.
+fn plugin_node(plugin: String, plugin_config: Option<PluginUserConfiguration>) -> KdlNode {
+    let mut plugin_node = KdlNode::new("plugin");
+    plugin_node
+        .entries_mut()
+        .push(KdlEntry::new_prop("location", plugin));
+    if let Some(plugin_config) =
+        plugin_config.and_then(|p| if p.inner().is_empty() { None } else { Some(p) })
+    {
+        let mut plugin_node_children = KdlDocument::new();
+        for (config_key, config_value) in plugin_config.inner() {
+            let mut config_node = KdlNode::new(config_key.to_owned());
+            config_node
+                .entries_mut()
+                .push(KdlEntry::new(config_value.to_owned()));
+            plugin_node_children.nodes_mut().push(config_node);
+        }
+        plugin_node.set_children(plugin_node_children);
+    }
+    plugin_node
+}
+
 fn serialize_plugin(
     plugin: Option<String>,
     plugin_config: Option<PluginUserConfiguration>,
     pane_node_children: &mut KdlDocument,
 ) {
     if let Some(plugin) = plugin {
-        let mut plugin_node = KdlNode::new("plugin");
-        plugin_node
-            .entries_mut()
-            .push(KdlEntry::new_prop("location", plugin.to_owned()));
-        if let Some(plugin_config) =
-            plugin_config.and_then(|p| if p.inner().is_empty() { None } else { Some(p) })
-        {
-            let mut plugin_node_children = KdlDocument::new();
-            for (config_key, config_value) in plugin_config.inner() {
-                let mut config_node = KdlNode::new(config_key.to_owned());
-                config_node
-                    .entries_mut()
-                    .push(KdlEntry::new(config_value.to_owned()));
-                plugin_node_children.nodes_mut().push(config_node);
-            }
-            plugin_node.set_children(plugin_node_children);
-        }
-        pane_node_children.nodes_mut().push(plugin_node);
+        pane_node_children
+            .nodes_mut()
+            .push(plugin_node(plugin, plugin_config));
     }
 }
 
@@ -483,6 +494,29 @@ fn serialize_start_suspended(command: &Option<String>, pane_node_children: &mut 
             .push(KdlEntry::new(KdlValue::Bool(true)));
         pane_node_children.nodes_mut().push(start_suspended_node);
     }
+}
+
+/// Emit the session-wide `dock` node.
+///
+/// The dock pane itself is filtered out of the serialized panes, so this is the
+/// only place it survives a dump — otherwise a resurrected session would come back
+/// with the dock declared once and *also* present as an ordinary pane.
+fn serialize_dock(dock: &Option<DockLayout>) -> Option<KdlNode> {
+    dock.as_ref().map(|dock| {
+        let mut node = KdlNode::new("dock");
+        node.push(KdlEntry::new_prop("size", dock.open_cols as i64));
+        node.push(KdlEntry::new_prop("closed_size", dock.closed_cols as i64));
+        let (plugin, plugin_config) =
+            extract_plugin_and_config(&Some(Run::Plugin(dock.run.clone())));
+        let mut children = KdlDocument::new();
+        if let Some(plugin) = plugin {
+            children
+                .nodes_mut()
+                .push(plugin_node(plugin, plugin_config));
+        }
+        node.set_children(children);
+        node
+    })
 }
 
 fn serialize_global_cwd(global_cwd: &Option<PathBuf>) -> Option<KdlNode> {
@@ -2233,5 +2267,38 @@ mod tests {
             panic!("Constraint is nor a percent nor fixed");
         };
         dim
+    }
+    #[test]
+    fn dock_survives_a_serialize_parse_round_trip_and_is_not_a_pane() {
+        use crate::input::layout::DockLayout;
+        let dock = DockLayout {
+            run: RunPluginOrAlias::from_url("zellij:status-bar", &None, None, None).unwrap(),
+            open_cols: 40,
+            closed_cols: 5,
+        };
+        let global_layout_manifest = GlobalLayoutManifest {
+            default_layout: Box::new(Layout {
+                dock: Some(dock.clone()),
+                ..Default::default()
+            }),
+            tabs: vec![("one".to_owned(), TabLayoutManifest::default())],
+            ..Default::default()
+        };
+        let (kdl, _contents) = serialize_session_layout(global_layout_manifest).unwrap();
+
+        let reparsed = Layout::from_kdl(&kdl, Some("dumped.kdl".into()), None, None).unwrap();
+        let reparsed_dock = reparsed
+            .dock
+            .as_ref()
+            .expect("the dumped layout should declare a dock");
+        assert_eq!(reparsed_dock.open_cols, dock.open_cols);
+        assert_eq!(reparsed_dock.closed_cols, dock.closed_cols);
+        // And crucially: the dock is emitted once, as a dock — never also as a pane,
+        // which would resurrect a duplicate sidebar.
+        assert_eq!(
+            kdl.matches("zellij:status-bar").count(),
+            1,
+            "kdl was:\n{kdl}"
+        );
     }
 }

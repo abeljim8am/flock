@@ -46,7 +46,7 @@ mod state;
 mod ui;
 
 use std::collections::{BTreeMap, HashSet};
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::Instant;
 
 use detect::{detect_agent, identify_agent_from_command, identify_agent_from_screen, AgentState};
 use hook::{
@@ -81,20 +81,11 @@ const SESSION_REFRESH_SECS: f64 = 1.0;
 /// switches can leave the plugin rendering before a fresh command event arrives.
 const AGENT_COMMAND_SYNC_SECS: f64 = 1.0;
 
-/// Pipe message name (sent by a `MessagePlugin` keybind, e.g. Super b) that
-/// toggles the sidebar between its slim rail and an expanded width. We resize
-/// our *own* pane rather than swap the layout, so the user's content panes keep
-/// their arrangement — only the sidebar/content split ratio changes.
-const WIDTH_TOGGLE_PIPE: &str = "flock-toggle-width";
-/// Floor (cols) for the expanded width on small terminals: the half-the-tab
-/// cap in `set_width_for_mode` never shrinks the expanded sidebar below this.
-/// Sits between the slim rail (~5) and the full-view threshold (16).
-const WIDTH_EXPAND_THRESHOLD: usize = 14;
-/// Target widths (cols) for the toggle. Fixed column counts — not a screen
-/// relative percent — so the expanded sidebar is the same size on a laptop and
-/// on an ultrawide rather than stretching to fill.
-const SIDEBAR_SLIM_COLS: usize = 5;
-const SIDEBAR_EXPANDED_COLS: usize = 40;
+/// Pipe message name (sent by a name-only `MessagePlugin` keybind, e.g. Alt b)
+/// that flips the dock between its rail and its expanded width. We only relay it
+/// to the server: the dock's widths come from the layout's `size`/`closed_size`,
+/// and the server clamps and applies them.
+const DOCK_TOGGLE_PIPE: &str = "flock-toggle-dock";
 
 /// Session name used by the flock-selector cold-shell entry point (set via its
 /// `session_name` layout arg). It's the picker's throwaway host session, not a
@@ -156,9 +147,6 @@ struct State {
     /// Timestamp attached to the last local/adopted sidebar mode. Cross-session
     /// sync uses this so every live sidebar converges on the newest toggle.
     sidebar_state_updated_at_millis: u64,
-    /// The last sidebar mode state we published to the cross-session metadata
-    /// bus. Diffed to avoid rewriting session metadata on every event.
-    last_published_sidebar_state: Option<FlockSidebarState>,
     /// Unified keyboard selection cursor over the sessions then the agents.
     selected: usize,
     /// Scroll offset into the workspaces (sessions) section.
@@ -189,12 +177,6 @@ struct State {
     /// pane's grid across the wasm boundary, so they're clamped to the slow
     /// state cadence even when the timer runs at the spinner cadence.
     last_screen_pull: Option<Instant>,
-    /// Whether we've applied the one-time default width after the layout first
-    /// reports our geometry. The flock layout opens the sidebar at a resizable
-    /// percent (so Super b can toggle it in place); once we know the real
-    /// geometry we resize to the fixed expanded width so the sidebar starts in
-    /// the full labeled view rather than at whatever the percent happens to be.
-    default_width_applied: bool,
 }
 
 register_plugin!(State);
@@ -270,8 +252,6 @@ impl ZellijPlugin for State {
                 self.sync_agents_from_manifest(now);
                 // A focus change here may clear a Done-unseen notification.
                 self.sync_focus();
-                // First time we see the real geometry, size to the default view.
-                self.maybe_set_default_width();
                 should_render = true;
             },
             Event::TabUpdate(tabs) => {
@@ -282,7 +262,7 @@ impl ZellijPlugin for State {
             },
             Event::SessionUpdate(sessions, _resurrectable) => {
                 self.sessions = sessions;
-                self.sync_sidebar_mode_from_sessions();
+                self.sync_dock_mode_from_sessions();
                 should_render = true;
             },
             Event::CommandChanged(pane_id, command, is_foreground, _focused_clients) => {
@@ -334,9 +314,6 @@ impl ZellijPlugin for State {
                 if self.should_refresh_session_list(now) {
                     should_render |= self.refresh_session_list(now);
                 }
-                // Catch the resize if permissions/geometry weren't ready when
-                // the first PaneUpdate arrived (runs once, gated by the flag).
-                self.maybe_set_default_width();
                 set_timeout(if working && !reports_are_stale {
                     SPINNER_TICK_SECS
                 } else {
@@ -406,16 +383,16 @@ impl ZellijPlugin for State {
         // Any handled event may have changed an agent's state; mirror the latest
         // picture onto the cross-session bus (no-op when unchanged).
         self.publish_state_if_changed();
-        self.publish_sidebar_state_if_changed();
         should_render
     }
 
     fn pipe(&mut self, pipe_message: PipeMessage) -> bool {
-        // The width-toggle channel (Super b → MessagePlugin) resizes our pane.
-        if pipe_message.name == WIDTH_TOGGLE_PIPE {
-            self.toggle_width();
-            self.publish_sidebar_state_if_changed();
-            return false; // the resize itself triggers a re-render
+        // The dock-toggle channel: a name-only `MessagePlugin` keybind, broadcast to
+        // every plugin, so it can never load a plugin and therefore can never
+        // conjure a second sidebar pane the way a plugin-URL pipe could.
+        if pipe_message.name == DOCK_TOGGLE_PIPE {
+            self.toggle_dock();
+            return false; // the server's resize triggers our re-render
         }
         // Local remote-pty bridges report remote daemon build mismatches here;
         // the render turns them into the upgrade banner.
@@ -461,7 +438,6 @@ impl ZellijPlugin for State {
             agents: &self.agents,
             sessions: &sessions,
             palette: &self.palette,
-            sidebar_mode: self.sidebar_mode,
             focused: self.focused,
             selected: self.selected,
             scroll_sessions: self.scroll_sessions,
@@ -607,7 +583,7 @@ impl State {
                     false
                 } else {
                     self.sessions = snapshot.live_sessions;
-                    self.sync_sidebar_mode_from_sessions();
+                    self.sync_dock_mode_from_sessions();
                     true
                 }
             },
@@ -709,114 +685,55 @@ impl State {
         }
     }
 
-    /// Toggle the sidebar between its slim rail and an expanded width by
-    /// resizing our *own* pane. Resizing only shifts the split between the
-    /// sidebar and the content area beside it — content panes keep their
-    /// arrangement (unlike a swap layout, which re-fits everything). Direction
-    /// follows the stored sidebar mode so every render section shares the same
-    /// open/closed state.
-    fn toggle_width(&mut self) {
-        self.sidebar_mode = self.sidebar_mode.toggled();
-        self.sidebar_state_updated_at_millis = now_millis();
-        self.default_width_applied = true;
-        self.set_width_for_mode(self.sidebar_mode);
+    /// Ask the server to flip the dock. The server owns the width: it resolves the
+    /// mode to a column count from the layout's `size`/`closed_size`, clamps it
+    /// against the tab, and applies it to every tab. We never touch geometry, so we
+    /// can no longer fight the layout engine.
+    fn toggle_dock(&mut self) {
+        let next = self.sidebar_mode.toggled();
+        set_dock_mode(next.into());
     }
 
-    /// Adopt the newest sidebar mode published by any live session. Sessions
-    /// republish adopted states, so a single toggle eventually propagates to
-    /// every flock sidebar through the existing session-list refresh loop.
-    fn sync_sidebar_mode_from_sessions(&mut self) -> bool {
-        let Some(sidebar_state) = self
+    /// Track the server's dock mode, and adopt a newer one from another session.
+    ///
+    /// Our own session's `dock_state` is authoritative for us — the server writes it
+    /// — so we mirror it rather than keeping our own idea of the mode. If some other
+    /// session has a strictly newer one, we ask the server to adopt it; the server
+    /// then stamps its own timestamp, which is what makes the fleet converge.
+    fn sync_dock_mode_from_sessions(&mut self) -> bool {
+        let mut should_render = false;
+        if let Some(own) = self
             .sessions
             .iter()
-            .filter_map(|session| session.flock_sidebar_state)
-            .max_by_key(|state| state.updated_at_millis)
-        else {
-            return false;
-        };
-        if sidebar_state.updated_at_millis <= self.sidebar_state_updated_at_millis {
-            return false;
-        }
-        self.sidebar_state_updated_at_millis = sidebar_state.updated_at_millis;
-        let mode = SidebarMode::from(sidebar_state.mode);
-        if mode == self.sidebar_mode {
-            return false;
-        }
-        self.sidebar_mode = mode;
-        self.default_width_applied = true;
-        self.set_width_for_mode(mode);
-        true
-    }
-
-    /// Resize the sidebar to the target width for `mode` — a fixed column
-    /// count, not a screen-relative percent, so it's the same on a laptop and
-    /// an ultrawide. The expanded width is capped to half the tab on small
-    /// terminals so the sidebar never crowds out the content.
-    fn set_width_for_mode(&self, mode: SidebarMode) {
-        let (_, total) = self.sidebar_and_tab_cols();
-        let target = match mode {
-            SidebarMode::Open => SIDEBAR_EXPANDED_COLS
-                .min(total / 2)
-                .max(WIDTH_EXPAND_THRESHOLD),
-            SidebarMode::Closed => SIDEBAR_SLIM_COLS,
-        };
-        self.set_width(target);
-    }
-
-    /// Once we know the real layout geometry, resize the sidebar to its default
-    /// expanded width so it starts in the full labeled view. The flock layout
-    /// opens the rail at a resizable percent (kept a percent so Super b can
-    /// later toggle it in place); the first time we see a content pane beside us
-    /// we resize to the fixed expanded target — the same width Super b expands
-    /// to. Runs once — it must not fight a later Super b toggle.
-    fn maybe_set_default_width(&mut self) {
-        if self.default_width_applied || !self.permissions_granted {
-            return;
-        }
-        let (current, total) = self.sidebar_and_tab_cols();
-        // Wait until the manifest reports a content pane beside us (total wider
-        // than our own width) before trusting the geometry.
-        if total <= current {
-            return;
-        }
-        self.default_width_applied = true;
-        self.sidebar_mode = SidebarMode::Open;
-        self.set_width_for_mode(SidebarMode::Open);
-    }
-
-    /// Set our own pane to an exact `target` column width. Uses the fixed-width
-    /// resize so the sidebar lands on precisely `target` columns on any screen —
-    /// the increment resize can't do this, as it steps by ~5% of the screen and
-    /// won't shrink a percent-sized pane below 5% of the screen width (which is
-    /// many columns on an ultrawide, leaving the slim rail far too wide).
-    fn set_width(&self, target: usize) {
-        let own = PaneId::Plugin(self.own_plugin_id);
-        resize_pane_id_to_fixed_width(own, target as u32);
-    }
-
-    /// The sidebar's current width and the active tab's total width (cols), read
-    /// from the pane manifest. Falls back to the last render width if the
-    /// manifest geometry isn't available yet.
-    fn sidebar_and_tab_cols(&self) -> (usize, usize) {
-        let active = self
-            .tabs
-            .iter()
-            .find(|tab| tab.active)
-            .map(|tab| tab.position);
-        let mut current = self.cols.max(1);
-        let mut total = self.cols.max(1);
-        if let Some(panes) = active.and_then(|idx| self.panes.panes.get(&idx)) {
-            for pane in panes {
-                let right = pane.pane_x + pane.pane_columns;
-                if right > total {
-                    total = right;
-                }
-                if pane.is_plugin && pane.id == self.own_plugin_id {
-                    current = pane.pane_columns;
-                }
+            .find(|session| session.is_current_session)
+            .and_then(|session| session.dock_state)
+        {
+            self.sidebar_state_updated_at_millis = own.updated_at_millis;
+            let own_mode = SidebarMode::from(own.mode);
+            if own_mode != self.sidebar_mode {
+                self.sidebar_mode = own_mode;
+                should_render = true;
             }
         }
-        (current, total)
+        let Some(newest) = self
+            .sessions
+            .iter()
+            .filter(|session| !session.is_current_session)
+            .filter_map(|session| session.dock_state)
+            .max_by_key(|state| state.updated_at_millis)
+        else {
+            return should_render;
+        };
+        if newest.updated_at_millis <= self.sidebar_state_updated_at_millis {
+            return should_render;
+        }
+        let mode = SidebarMode::from(newest.mode);
+        if mode == self.sidebar_mode {
+            return should_render;
+        }
+        // `SetDockMode` is idempotent, so converging cannot race or ping-pong.
+        set_dock_mode(mode.into());
+        should_render
     }
 
     /// Move the selection cursor up by `n`, clamped at the top.
@@ -937,22 +854,6 @@ impl State {
             states.insert(*pane_id, self.status_to_publish(pane_id, st));
         }
         states
-    }
-
-    /// Publish this session's sidebar presentation state when it changes, so
-    /// other sessions' sidebars can adopt the newest toggle.
-    fn publish_sidebar_state_if_changed(&mut self) {
-        if !self.permissions_granted {
-            return;
-        }
-        let state = FlockSidebarState {
-            mode: self.sidebar_mode.into(),
-            updated_at_millis: self.sidebar_state_updated_at_millis,
-        };
-        if Some(state) != self.last_published_sidebar_state {
-            self.last_published_sidebar_state = Some(state);
-            publish_flock_sidebar_state(state);
-        }
     }
 
     fn status_to_publish(&self, pane_id: &PaneId, st: &PaneAgentState) -> PaneAgentStatus {
@@ -1274,13 +1175,6 @@ fn to_run_state(state: AgentState) -> AgentRunState {
         AgentState::Blocked => AgentRunState::Blocked,
         AgentState::Unknown => AgentRunState::Unknown,
     }
-}
-
-fn now_millis() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_millis() as u64)
-        .unwrap_or_default()
 }
 
 /// Flatten a pane's viewport into a single screen-text snapshot for detection.

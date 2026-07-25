@@ -35,8 +35,8 @@ use std::collections::BTreeMap;
 
 use unicode_width::UnicodeWidthStr;
 use zellij_tile::prelude::{
-    AgentRunState, FlockSidebarMode, PaletteColor, PaneAgentStatus, PaneId, PaneManifest,
-    RemoteBackend, RemoteConnectionState, SessionInfo, TabInfo,
+    AgentRunState, DockMode, PaletteColor, PaneAgentStatus, PaneId, PaneManifest, RemoteBackend,
+    RemoteConnectionState, SessionInfo, TabInfo,
 };
 
 use crate::detect::{identify_agent_from_command, AgentState};
@@ -49,7 +49,15 @@ use crate::state::PaneAgentState;
 const SPINNERS: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
 /// Pane width (columns) below which the sidebar renders as a clean icon-only
-/// rail instead of the full text layout. A slim docked strip lands here.
+/// rail instead of the full text layout.
+///
+/// This is the **only** thing that decides which view is drawn. The dock's mode
+/// lives in the server, which resolves it to a width and hands us the columns; we
+/// render whatever we were given. Consulting a mode here as well would be a second
+/// source of truth that can disagree with the geometry.
+///
+/// A layout's `closed_size` therefore has to be below this for the rail to appear
+/// when collapsed.
 const THIN_WIDTH: usize = 16;
 
 /// Blank rows kept above and below the sidebar content (both the thin/mini rail
@@ -88,16 +96,16 @@ impl SidebarMode {
     }
 }
 
-impl From<FlockSidebarMode> for SidebarMode {
-    fn from(mode: FlockSidebarMode) -> Self {
+impl From<DockMode> for SidebarMode {
+    fn from(mode: DockMode) -> Self {
         match mode {
-            FlockSidebarMode::Open => Self::Open,
-            FlockSidebarMode::Closed => Self::Closed,
+            DockMode::Open => Self::Open,
+            DockMode::Closed => Self::Closed,
         }
     }
 }
 
-impl From<SidebarMode> for FlockSidebarMode {
+impl From<SidebarMode> for DockMode {
     fn from(mode: SidebarMode) -> Self {
         match mode {
             SidebarMode::Open => Self::Open,
@@ -646,8 +654,6 @@ pub struct RenderInput<'a> {
     pub agents: &'a BTreeMap<PaneId, PaneAgentState>,
     pub sessions: &'a [SessionInfo],
     pub palette: &'a Theme,
-    /// Shared open/closed state for both sidebar sections.
-    pub sidebar_mode: SidebarMode,
     /// Whether the sidebar pane is focused. The selection cursor is only drawn
     /// when focused, so an unfocused ambient rail shows status without a cursor.
     pub focused: bool,
@@ -722,10 +728,10 @@ pub fn render(input: RenderInput) -> RenderOutput {
     let rows_data = build_rows(input.panes, input.tabs, input.agents, input.sessions);
     let selected = clamp_selection(input.selected, rows_data.len());
 
-    // Closed mode uses the icon rail even if the pane has enough room for labels.
-    // A physically narrow pane also falls back to the rail so open mode never
-    // tries to draw labels into too few columns.
-    if !input.sidebar_mode.is_open() || cols < THIN_WIDTH {
+    // The columns the server gave us are the single source of truth: a collapsed
+    // dock is narrow, so it lands here, and a genuinely narrow pane falls back to
+    // the rail rather than trying to draw labels into too few columns.
+    if cols < THIN_WIDTH {
         return render_thin(out, &input, &rows_data, selected);
     }
 
@@ -1366,7 +1372,10 @@ mod tests {
     }
 
     #[test]
-    fn closed_sidebar_mode_uses_rail_even_when_wide() {
+    fn a_collapsed_dock_width_renders_the_rail() {
+        // The columns we are given are the only signal: the server resolved the
+        // collapsed mode to a narrow band, so we draw the icon rail. There is no
+        // separate mode flag that could disagree with the geometry.
         let panes = PaneManifest::default();
         let tabs = Vec::new();
         let agents = BTreeMap::new();
@@ -1380,7 +1389,36 @@ mod tests {
             agents: &agents,
             sessions: &sessions,
             palette: &palette,
-            sidebar_mode: SidebarMode::Closed,
+            focused: false,
+            selected: 0,
+            scroll_sessions: 0,
+            scroll_agents: 0,
+            spinner_tick: 0,
+            rows: 8,
+            cols: THIN_WIDTH - 1,
+            upgrade_banner: None,
+        });
+
+        assert!(!output.ansi.contains("workspaces"));
+        assert!(!output.ansi.contains("workspace-a"));
+        assert!(output.click_map.iter().any(|hit| hit.index == 0));
+    }
+
+    #[test]
+    fn an_expanded_dock_width_renders_labels() {
+        let panes = PaneManifest::default();
+        let tabs = Vec::new();
+        let agents = BTreeMap::new();
+        let sessions = vec![sess("workspace-a", "/home/u/proj")];
+        let palette = Theme::default();
+
+        let output = render(RenderInput {
+            permissions_granted: true,
+            panes: &panes,
+            tabs: &tabs,
+            agents: &agents,
+            sessions: &sessions,
+            palette: &palette,
             focused: false,
             selected: 0,
             scroll_sessions: 0,
@@ -1391,9 +1429,7 @@ mod tests {
             upgrade_banner: None,
         });
 
-        assert!(!output.ansi.contains("workspaces"));
-        assert!(!output.ansi.contains("workspace-a"));
-        assert!(output.click_map.iter().any(|hit| hit.index == 0));
+        assert!(output.ansi.contains("workspace-a"));
     }
 
     #[test]
@@ -1411,7 +1447,6 @@ mod tests {
             agents: &agents,
             sessions: &sessions,
             palette: &palette,
-            sidebar_mode: SidebarMode::Open,
             focused: false,
             selected: 0,
             scroll_sessions: 0,
@@ -1440,7 +1475,6 @@ mod tests {
             agents: &agents,
             sessions: &sessions,
             palette: &palette,
-            sidebar_mode: SidebarMode::Open,
             focused: false,
             selected: 0,
             scroll_sessions: 0,
@@ -1459,7 +1493,8 @@ mod tests {
         assert_eq!(output.banner_row, Some(0));
         assert!(output.ansi.contains("click to upgrade"));
 
-        // The thin rail has no room for the banner.
+        // The thin rail has no room for the banner. Narrow, not "closed mode":
+        // width is the only thing that selects the rail now.
         let thin = render(RenderInput {
             permissions_granted: true,
             panes: &panes,
@@ -1467,14 +1502,13 @@ mod tests {
             agents: &agents,
             sessions: &sessions,
             palette: &palette,
-            sidebar_mode: SidebarMode::Closed,
             focused: false,
             selected: 0,
             scroll_sessions: 0,
             scroll_agents: 0,
             spinner_tick: 0,
             rows: 8,
-            cols: 60,
+            cols: THIN_WIDTH - 1,
             upgrade_banner: Some(UpgradeBanner {
                 daemon_version: "26.5.0".into(),
                 local_version: "26.6.0".into(),
@@ -1486,7 +1520,7 @@ mod tests {
     }
 
     #[test]
-    fn closed_sidebar_mode_renders_only_session_indicators() {
+    fn a_collapsed_dock_width_renders_only_session_indicators() {
         use crate::detect::Agent;
 
         let panes = PaneManifest {
@@ -1521,14 +1555,13 @@ mod tests {
             agents: &agents,
             sessions: &sessions,
             palette: &palette,
-            sidebar_mode: SidebarMode::Closed,
             focused: false,
             selected: 1,
             scroll_sessions: 0,
             scroll_agents: 0,
             spinner_tick: 0,
             rows: 8,
-            cols: 40,
+            cols: THIN_WIDTH - 1,
             upgrade_banner: None,
         });
 

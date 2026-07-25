@@ -1,19 +1,21 @@
 layout {
+    // The flock sidebar as a dock: chrome pinned to the left edge that reserves a
+    // band of columns and is invisible to the layout engine. It is not a `pane`,
+    // so it never occupies a layout slot, never counts toward `max_panes`, and
+    // cannot be resized by a relayout — which is what used to silently re-expand
+    // it whenever a pane was opened.
+    //
+    // `size` is the expanded width, `closed_size` the collapsed rail. The server
+    // owns which one is in effect (Alt b toggles it) and clamps both so the
+    // content area always stays usable. `closed_size` must stay under the
+    // sidebar's 16-column label threshold for the rail to render.
+    dock size=40 closed_size=5 {
+        plugin location="zellij:flock-sidebar"
+    }
     pane size=1 borderless=true {
         plugin location="tab-bar"
     }
-    pane split_direction="Vertical" {
-        // Docked sidebar. A percent (not a fixed cell count) keeps it resizable
-        // — zellij won't resize fixed-size panes — so Super b (a MessagePlugin
-        // "flock-toggle-width") can toggle it in place, leaving the content
-        // panes' arrangement intact. The plugin drives it to fixed column
-        // targets (slim ~3, expanded ~40) and on load resizes this percent to
-        // the expanded width, so the sidebar starts in the full labeled view.
-        pane size="25%" borderless=true {
-            plugin location="zellij:flock-sidebar"
-        }
-        pane
-    }
+    pane
     pane size=2 borderless=true {
         plugin location="status-bar"
     }

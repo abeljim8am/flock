@@ -583,6 +583,13 @@ pub(crate) fn plugin_thread_main(
                     .collect();
                 let mut all_run_instructions = extracted_run_instructions;
                 all_run_instructions.append(&mut extracted_floating_plugins);
+                // The dock is declared on the layout rather than in the tab's pane
+                // tree, so `extract_run_instructions` cannot see it — but it still
+                // needs a PluginId reserved here, since `LayoutApplier::apply_dock`
+                // consumes ids from the same map.
+                if let Some(dock_run_instruction) = layout.dock_run_instruction() {
+                    all_run_instructions.push(Some(dock_run_instruction));
+                }
 
                 for run_instruction in all_run_instructions {
                     if let Some(Run::Plugin(run_plugin_or_alias)) = run_instruction {

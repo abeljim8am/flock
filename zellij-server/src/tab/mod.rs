@@ -57,12 +57,15 @@ use std::{
     str,
 };
 use zellij_utils::{
-    data::{Event, FloatingPaneCoordinates, InputMode, ModeInfo, Palette, PaletteColor, Styling},
+    data::{
+        DockMode, Event, FloatingPaneCoordinates, InputMode, ModeInfo, Palette, PaletteColor,
+        Styling,
+    },
     input::{
         command::TerminalAction,
         layout::{
-            FloatingPaneLayout, Run, RunPluginOrAlias, SwapFloatingLayout, SwapTiledLayout,
-            TiledPaneLayout,
+            DockLayout, FloatingPaneLayout, Run, RunPluginOrAlias, SwapFloatingLayout,
+            SwapTiledLayout, TiledPaneLayout,
         },
         parse_keys,
     },
@@ -200,6 +203,10 @@ pub(crate) struct Tab {
     pending_instructions: Vec<BufferedTabInstruction>, // instructions that came while the tab was
     // pending and need to be re-applied
     swap_layouts: SwapLayouts,
+    /// The session-wide dock declaration this tab should materialize, and the mode
+    /// to materialize it in. Set by `Screen` (the single owner of the mode) before
+    /// the layout is applied; `None` when the layout declares no dock.
+    dock_declaration: Option<(DockLayout, DockMode)>,
     default_shell: PathBuf,
     default_editor: Option<PathBuf>,
     debug: bool,
@@ -270,6 +277,30 @@ pub trait Pane {
     fn set_should_render_boundaries(&mut self, _should_render: bool) {}
     fn selectable(&self) -> bool;
     fn set_selectable(&mut self, selectable: bool);
+    /// Whether this pane is a dock: chrome pinned to an edge that reserves a band
+    /// of the display and never takes part in tiling.
+    ///
+    /// Deliberately distinct from `!selectable()`. Unselectable only means "skip
+    /// me in focus navigation", which is also true of the tab-bar and status-bar —
+    /// and those *do* tile, get counted as panes, and occupy layout slots. A dock
+    /// does none of those things: `TiledPaneGrid` never sees it, pane counts
+    /// exclude it, and the server writes its geometry directly.
+    ///
+    /// `TiledPanes` holds the authoritative dock id; this exists for the iterators
+    /// that only have a `&dyn Pane` in hand (rendering, serialization, manifests).
+    fn is_dock(&self) -> bool {
+        false
+    }
+    fn set_is_dock(&mut self, _is_dock: bool) {}
+    /// Whether this pane is currently showing the plugin-permission prompt.
+    ///
+    /// A dock consults this before collapsing: the prompt renders into the plugin's
+    /// own grid, and a few columns of rail cannot show it. Collapsing over it would
+    /// leave the user unable to grant the permissions the plugin needs, with no way
+    /// to tell why.
+    fn is_requesting_permissions(&self) -> bool {
+        false
+    }
     fn request_permissions_from_user(&mut self, _permissions: Option<PluginPermission>) {}
     fn render(
         &mut self,
@@ -854,6 +885,7 @@ impl Tab {
             is_pending: true, // will be switched to false once the layout is applied
             pending_instructions: vec![],
             swap_layouts,
+            dock_declaration: None,
             default_shell,
             debug,
             arrow_fonts,
@@ -882,18 +914,70 @@ impl Tab {
         }
     }
 
+    /// The dock declaration this tab materializes, and the mode to do it in.
+    /// `Screen` owns the mode, so it sets this before applying the layout.
+    pub fn set_dock_declaration(&mut self, dock_layout: DockLayout, mode: DockMode) {
+        self.dock_declaration = Some((dock_layout, mode));
+    }
+    /// Apply a dock mode decided by `Screen`. Idempotent; a no-op without a dock.
+    pub fn set_dock_mode(&mut self, mode: DockMode) {
+        if self.tiled_panes.dock_mode() == Some(mode) {
+            return;
+        }
+        // Keep the declaration in step, so a dock materialized later in this tab's
+        // life (eg. after an override layout) comes up in the current mode.
+        if let Some((_, declared_mode)) = self.dock_declaration.as_mut() {
+            *declared_mode = mode;
+        }
+        self.tiled_panes.set_dock_mode(mode);
+        self.set_force_render();
+        // The band moved, so cells the dock vacated have to be cleared.
+        self.set_should_clear_display_before_rendering();
+    }
+    pub fn dock_mode(&self) -> Option<DockMode> {
+        self.tiled_panes.dock_mode()
+    }
     pub fn apply_layout(
         &mut self,
         layout: TiledPaneLayout,
         floating_panes_layout: Vec<FloatingPaneLayout>,
         new_terminal_ids: Vec<(u32, HoldForCommand)>,
         new_floating_terminal_ids: Vec<(u32, HoldForCommand)>,
-        new_plugin_ids: HashMap<RunPluginOrAlias, Vec<u32>>,
+        mut new_plugin_ids: HashMap<RunPluginOrAlias, Vec<u32>>,
         client_id: ClientId,
         blocking_terminal: Option<(u32, NotificationEnd)>,
     ) -> Result<()> {
         self.swap_layouts
             .set_base_layout((layout.clone(), floating_panes_layout.clone()));
+        // Before the tiled layout, so the band is already reserved and the layout is
+        // positioned beside the dock rather than underneath it.
+        if let Some((dock_layout, dock_mode)) = self.dock_declaration.clone() {
+            LayoutApplier::new(
+                &self.viewport,
+                &self.senders,
+                &self.sixel_image_store,
+                &self.link_handler,
+                &self.terminal_emulator_colors,
+                &self.terminal_emulator_color_codes,
+                &self.character_cell_size,
+                &self.connected_clients_in_app,
+                &self.style,
+                &self.display_area,
+                &mut self.tiled_panes,
+                &mut self.floating_panes,
+                self.draw_pane_frames,
+                &mut self.focus_pane_id,
+                &self.os_api,
+                self.debug,
+                self.arrow_fonts,
+                self.styled_underlines,
+                self.osc8_hyperlinks,
+                self.explicitly_disable_kitty_keyboard_protocol,
+                None,
+            )
+            .apply_dock(&dock_layout, dock_mode, &mut new_plugin_ids)
+            .non_fatal();
+        }
         match LayoutApplier::new(
             &self.viewport,
             &self.senders,
@@ -3460,7 +3544,8 @@ impl Tab {
         self.suppressed_panes.iter()
     }
     fn get_selectable_tiled_panes(&self) -> impl Iterator<Item = (&PaneId, &Box<dyn Pane>)> {
-        self.get_tiled_panes().filter(|(_, p)| p.selectable())
+        self.get_tiled_panes()
+            .filter(|(_, p)| p.selectable() && !p.is_dock())
     }
     fn get_selectable_floating_panes(&self) -> impl Iterator<Item = (&PaneId, &Box<dyn Pane>)> {
         self.get_floating_panes().filter(|(_, p)| p.selectable())
@@ -3498,15 +3583,24 @@ impl Tab {
         tiled_panes_count + floating_panes_count + 1
     }
     pub fn has_selectable_panes(&self) -> bool {
-        let selectable_tiled_panes = self.tiled_panes.get_panes().filter(|(_, p)| p.selectable());
+        let selectable_tiled_panes = self
+            .tiled_panes
+            .get_panes()
+            .filter(|(_, p)| p.selectable() && !p.is_dock());
         let selectable_floating_panes = self
             .floating_panes
             .get_panes()
             .filter(|(_, p)| p.selectable());
         selectable_tiled_panes.count() > 0 || selectable_floating_panes.count() > 0
     }
+    /// Whether this tab still holds anything worth showing. `Screen` closes tabs
+    /// for which this is false, so a dock must not count — otherwise a tab whose
+    /// last content pane is closed would be kept alive by its chrome.
     pub fn has_selectable_tiled_panes(&self) -> bool {
-        let selectable_tiled_panes = self.tiled_panes.get_panes().filter(|(_, p)| p.selectable());
+        let selectable_tiled_panes = self
+            .tiled_panes
+            .get_panes()
+            .filter(|(_, p)| p.selectable() && !p.is_dock());
         selectable_tiled_panes.count() > 0
     }
     pub fn resize_whole_tab(&mut self, new_screen_size: Size) -> Result<()> {
@@ -5670,28 +5764,6 @@ impl Tab {
             .any(|s_p| s_p.1.pid() == pane_id)
         {
             log::error!("Cannot resize suppressed panes");
-        }
-        Ok(())
-    }
-    pub fn resize_pane_id_to_fixed_width(&mut self, pane_id: PaneId, width: usize) -> Result<()> {
-        // Only tiled panes have a meaningful split width to fix; floating /
-        // suppressed panes are positioned independently, so this is a no-op for
-        // them (the docked rail this serves is always tiled).
-        if self.tiled_panes.panes_contain(&pane_id) {
-            let pane_is_selectable = self
-                .tiled_panes
-                .get_pane(pane_id)
-                .map(|pane| pane.selectable())
-                .unwrap_or(true);
-            if self.tiled_panes.set_pane_fixed_width(pane_id, width) {
-                // Like a regular resize, the split boundary moved: force a clean
-                // redraw so cells vacated by the shrunk pane are cleared.
-                if pane_is_selectable {
-                    self.swap_layouts.set_is_tiled_damaged();
-                }
-                self.set_force_render();
-                self.set_should_clear_display_before_rendering();
-            }
         }
         Ok(())
     }

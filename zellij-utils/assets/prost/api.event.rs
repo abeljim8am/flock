@@ -404,7 +404,7 @@ pub struct SessionManifest {
     #[prost(message, repeated, tag="14")]
     pub agent_states: ::prost::alloc::vec::Vec<PaneAgentStatus>,
     #[prost(message, optional, tag="15")]
-    pub flock_sidebar_state: ::core::option::Option<FlockSidebarState>,
+    pub dock_state: ::core::option::Option<DockState>,
     /// The session's injected default command (command + args every new pane/tab
     /// runs instead of the default shell), e.g. a flock codespace binding.
     /// Empty means unset.
@@ -447,7 +447,7 @@ pub struct PaneAgentStatus {
 }
 #[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Clone, PartialEq, ::prost::Message)]
-pub struct FlockSidebarState {
+pub struct DockState {
     #[prost(uint32, tag="1")]
     pub mode: u32,
     #[prost(uint64, tag="2")]

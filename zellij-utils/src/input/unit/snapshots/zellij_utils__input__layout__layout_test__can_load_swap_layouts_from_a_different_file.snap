@@ -1,7 +1,6 @@
 ---
 source: zellij-utils/src/input/./unit/layout_test.rs
-assertion_line: 1938
-expression: "format!(\"{:#?}\", layout)"
+expression: "normalize_layout_debug(format!(\"{:#?}\", layout))"
 ---
 Layout {
     tabs: [],
@@ -833,4 +832,5 @@ Layout {
         ),
     ],
     swap_floating_layouts: [],
+    dock: None,
 }

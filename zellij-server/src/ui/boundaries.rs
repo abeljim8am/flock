@@ -510,7 +510,9 @@ impl Boundaries {
                 let coordinates = Coordinates::new(col, boundary_y_coords);
                 let symbol_to_add = if col == first_col_coordinates && col != self.viewport.x {
                     BoundarySymbol::new(boundary_type::TOP_LEFT).color(color)
-                } else if col == last_col_coordinates - 1 && col != self.viewport.cols - 1 {
+                } else if col == last_col_coordinates - 1
+                    && col != self.viewport.x + self.viewport.cols - 1
+                {
                     BoundarySymbol::new(boundary_type::TOP_RIGHT).color(color)
                 } else {
                     BoundarySymbol::new(boundary_type::HORIZONTAL).color(color)
@@ -564,7 +566,9 @@ impl Boundaries {
                 let coordinates = Coordinates::new(col, boundary_y_coords);
                 let symbol_to_add = if col == first_col_coordinates && col != self.viewport.x {
                     BoundarySymbol::new(boundary_type::BOTTOM_LEFT).color(color)
-                } else if col == last_col_coordinates - 1 && col != self.viewport.cols - 1 {
+                } else if col == last_col_coordinates - 1
+                    && col != self.viewport.x + self.viewport.cols - 1
+                {
                     BoundarySymbol::new(boundary_type::BOTTOM_RIGHT).color(color)
                 } else {
                     BoundarySymbol::new(boundary_type::HORIZONTAL).color(color)
@@ -602,7 +606,10 @@ impl Boundaries {
         Ok(character_chunks)
     }
     fn rect_right_boundary_is_before_screen_edge(&self, rect: &dyn Pane) -> bool {
-        rect.x() + rect.cols() < self.viewport.cols
+        // `viewport.x` is nonzero when a dock reserves a column band on the left, so the
+        // right edge of the usable area is `x + cols`, not `cols` — mirroring
+        // `rect_bottom_boundary_is_before_screen_edge` below.
+        rect.x() + rect.cols() < self.viewport.x + self.viewport.cols
     }
     fn rect_bottom_boundary_is_before_screen_edge(&self, rect: &dyn Pane) -> bool {
         rect.y() + rect.rows() < self.viewport.y + self.viewport.rows

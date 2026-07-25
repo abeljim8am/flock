@@ -96,6 +96,7 @@ pub(crate) struct PluginPane {
     prev_pane_name: String,
     frame: HashMap<ClientId, PaneFrame>,
     borderless: bool,
+    is_dock: bool,
     exclude_from_sync: bool,
     pane_frame_color_override: Option<(PaletteColor, Option<String>)>,
     invoked_with: Option<Run>,
@@ -142,6 +143,7 @@ impl PluginPane {
             content_offset: Offset::default(),
             pane_title: title,
             borderless: false,
+            is_dock: false,
             pane_name: pane_name.clone(),
             prev_pane_name: pane_name,
             terminal_emulator_colors,
@@ -380,6 +382,15 @@ impl Pane for PluginPane {
     }
     fn set_selectable(&mut self, selectable: bool) {
         self.selectable = selectable;
+    }
+    fn is_dock(&self) -> bool {
+        self.is_dock
+    }
+    fn set_is_dock(&mut self, is_dock: bool) {
+        self.is_dock = is_dock;
+    }
+    fn is_requesting_permissions(&self) -> bool {
+        self.requesting_permissions.is_some()
     }
     fn show_cursor(&mut self, client_id: ClientId, cursor_position: Option<(usize, usize)>) {
         self.cursor_visibility.insert(client_id, cursor_position);

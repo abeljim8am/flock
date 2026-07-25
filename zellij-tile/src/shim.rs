@@ -1573,16 +1573,6 @@ pub fn publish_agent_state(agent_states: BTreeMap<PaneId, PaneAgentStatus>) {
     unsafe { host_run_plugin_command() };
 }
 
-/// Publish this session's flock-sidebar open/closed state to the server. The
-/// server surfaces it on this session's `SessionInfo`, so other sessions'
-/// sidebars can follow the same presentation mode.
-pub fn publish_flock_sidebar_state(sidebar_state: FlockSidebarState) {
-    let plugin_command = PluginCommand::PublishFlockSidebarState(sidebar_state);
-    let protobuf_plugin_command: ProtobufPluginCommand = plugin_command.try_into().unwrap();
-    object_to_stdout(&protobuf_plugin_command.encode_to_vec());
-    unsafe { host_run_plugin_command() };
-}
-
 /// Unblock the input side of a pipe, requesting the next message be sent if there is one
 pub fn unblock_cli_pipe_input(pipe_name: &str) {
     let plugin_command = PluginCommand::UnblockCliPipeInput(pipe_name.to_owned());
@@ -1789,14 +1779,15 @@ pub fn resize_pane_with_id(resize_strategy: ResizeStrategy, pane_id: PaneId) {
     unsafe { host_run_plugin_command() };
 }
 
-/// Set the specified pane's width to an exact column count. Unlike
-/// [`resize_pane_with_id`], which steps by a screen-relative percentage and
-/// won't shrink a percent-sized pane below 5% of the screen, this makes the
-/// pane fixed-width at exactly `width` columns; sibling panes reflow to fill the
-/// remaining space. Useful for a docked rail that must stay a few columns wide
-/// regardless of how wide the terminal is.
-pub fn resize_pane_id_to_fixed_width(pane_id: PaneId, width: u32) {
-    let plugin_command = PluginCommand::ResizePaneIdToFixedWidth(pane_id, width);
+/// Ask the server to put this session's dock in `mode`.
+///
+/// The server owns the dock's width: it resolves `mode` to a column count from
+/// the layout's `size`/`closed_size`, clamps it against the tab width, applies it
+/// to every tab, and republishes it on `SessionInfo`. Idempotent, so it is safe
+/// to call while converging on a mode adopted from another session. A plugin
+/// cannot set a width directly, and so cannot fight the layout engine.
+pub fn set_dock_mode(mode: DockMode) {
+    let plugin_command = PluginCommand::SetDockMode(mode);
     let protobuf_plugin_command: ProtobufPluginCommand = plugin_command.try_into().unwrap();
     object_to_stdout(&protobuf_plugin_command.encode_to_vec());
     unsafe { host_run_plugin_command() };

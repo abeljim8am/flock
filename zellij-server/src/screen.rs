@@ -34,7 +34,7 @@ use std::net::{IpAddr, Ipv4Addr};
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::str;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::route::NotificationEnd;
 
@@ -304,8 +304,8 @@ use crate::{
 };
 use zellij_utils::{
     data::{
-        Event, InputMode, ModeInfo, Palette, PaletteColor, PaneAgentStatus, PluginCapabilities,
-        Style,
+        DockMode, Event, InputMode, ModeInfo, Palette, PaletteColor, PaneAgentStatus,
+        PluginCapabilities, Style,
     },
     errors::{ContextType, ScreenContext},
     input::get_mode_info,
@@ -914,7 +914,6 @@ pub enum ScreenInstruction {
         BTreeMap<String, Duration>,    // resurrectable sessions - <name, created>
     ),
     PublishAgentState(BTreeMap<zellij_utils::data::PaneId, PaneAgentStatus>),
-    PublishFlockSidebarState(zellij_utils::data::FlockSidebarState),
     ReplacePane(
         PaneId,
         HoldForCommand,
@@ -974,7 +973,8 @@ pub enum ScreenInstruction {
     },
     RerunCommandPane(u32, Option<NotificationEnd>), // u32 - terminal pane id
     ResizePaneWithId(ResizeStrategy, PaneId),
-    ResizePaneIdToFixedWidth(PaneId, usize), // usize - target width in columns
+    SetDockMode(DockMode),
+    ToggleDock,
     EditScrollbackForPaneWithId(PaneId, Option<NotificationEnd>),
     WriteToPaneId(Vec<u8>, PaneId, Option<NotificationEnd>),
     Paste(Vec<u8>, Option<PaneId>, ClientId, Option<NotificationEnd>),
@@ -1300,9 +1300,6 @@ impl From<&ScreenInstruction> for ScreenContext {
             ScreenInstruction::BreakPaneLeft(..) => ScreenContext::BreakPaneLeft,
             ScreenInstruction::UpdateSessionInfos(..) => ScreenContext::UpdateSessionInfos,
             ScreenInstruction::PublishAgentState(..) => ScreenContext::PublishAgentState,
-            ScreenInstruction::PublishFlockSidebarState(..) => {
-                ScreenContext::PublishFlockSidebarState
-            },
             ScreenInstruction::ReplacePane(..) => ScreenContext::ReplacePane,
             ScreenInstruction::NewInPlacePluginPane(..) => ScreenContext::NewInPlacePluginPane,
             ScreenInstruction::SerializeLayoutForResurrection => {
@@ -1316,9 +1313,8 @@ impl From<&ScreenInstruction> for ScreenContext {
             ScreenInstruction::Reconfigure { .. } => ScreenContext::Reconfigure,
             ScreenInstruction::RerunCommandPane { .. } => ScreenContext::RerunCommandPane,
             ScreenInstruction::ResizePaneWithId(..) => ScreenContext::ResizePaneWithId,
-            ScreenInstruction::ResizePaneIdToFixedWidth(..) => {
-                ScreenContext::ResizePaneIdToFixedWidth
-            },
+            ScreenInstruction::SetDockMode(..) => ScreenContext::SetDockMode,
+            ScreenInstruction::ToggleDock => ScreenContext::ToggleDock,
             ScreenInstruction::EditScrollbackForPaneWithId(..) => {
                 ScreenContext::EditScrollbackForPaneWithId
             },
@@ -1716,10 +1712,10 @@ pub(crate) struct Screen {
     /// cross-session metadata transport to other sessions' sidebars. Keyed by
     /// the plugin-facing `data::PaneId`.
     published_agent_states: BTreeMap<zellij_utils::data::PaneId, PaneAgentStatus>,
-    /// The latest flock-sidebar open/closed state published by this session's
-    /// flock-sidebar plugin. Stored here and copied onto every `SessionInfo` we
-    /// generate, so other sessions' sidebars can follow the same presentation.
-    published_flock_sidebar_state: Option<zellij_utils::data::FlockSidebarState>,
+    /// This session's dock mode. Copied onto every `SessionInfo` we generate, so
+    /// other sessions can follow the same presentation. `None` until something
+    /// establishes a mode.
+    published_dock_state: Option<zellij_utils::data::DockState>,
 }
 
 /// A pending forward waiting to be dispatched once the current in-flight
@@ -1878,7 +1874,7 @@ impl Screen {
             session_default_command: None,
             session_remote_backend: None,
             published_agent_states: BTreeMap::new(),
-            published_flock_sidebar_state: None,
+            published_dock_state: None,
         }
     }
 
@@ -3313,10 +3309,22 @@ impl Screen {
         };
 
         // apply the layout to the new tab
+        let dock_declaration = self.default_layout.dock.clone().map(|dock_layout| {
+            // `Screen` is the single owner of the mode, so every tab — including one
+            // created while the dock is collapsed — materializes in the same state.
+            let mode = self
+                .published_dock_state
+                .map(|dock_state| dock_state.mode)
+                .unwrap_or_default();
+            (dock_layout, mode)
+        });
         self.tabs
             .get_mut(&tab_id)
             .context("couldn't find tab with index {tab_id}")
             .and_then(|tab| {
+                if let Some((dock_layout, dock_mode)) = dock_declaration {
+                    tab.set_dock_declaration(dock_layout, dock_mode);
+                }
                 tab.apply_layout(
                     layout,
                     floating_panes_layout,
@@ -3740,7 +3748,7 @@ impl Screen {
             remote_connection_state,
             remote_panes,
             agent_states: self.published_agent_states.clone(),
-            flock_sidebar_state: self.published_flock_sidebar_state,
+            dock_state: self.published_dock_state,
         };
         self.bus
             .senders
@@ -4414,22 +4422,49 @@ impl Screen {
             log::error!("Failed to find pane with id: {:?} to resize", pane_id);
         }
     }
-    pub fn resize_pane_id_to_fixed_width(&mut self, pane_id: PaneId, width: usize) {
-        let mut found = false;
+    /// Put every tab's dock in `mode`.
+    ///
+    /// `Screen` is the single writer of dock state. That is what makes all tabs
+    /// agree, makes the operation idempotent, and means a plugin can converge on a
+    /// mode adopted from another session without racing anything.
+    pub fn set_dock_mode(&mut self, mode: DockMode) -> Result<()> {
+        let already_in_mode = self
+            .published_dock_state
+            .map(|state| state.mode == mode)
+            .unwrap_or(false);
+        if already_in_mode {
+            return Ok(());
+        }
         for tab in self.tabs.values_mut() {
-            if tab.has_pane_with_pid(&pane_id) {
-                tab.resize_pane_id_to_fixed_width(pane_id, width)
-                    .non_fatal();
-                found = true;
-                break;
-            }
+            tab.set_dock_mode(mode);
         }
-        if !found {
-            log::error!(
-                "Failed to find pane with id: {:?} to set fixed width",
-                pane_id
-            );
-        }
+        self.published_dock_state = Some(zellij_utils::data::DockState {
+            mode,
+            // Stamped server-side so cross-session convergence never depends on a
+            // plugin's clock.
+            updated_at_millis: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0),
+        });
+        self.log_and_report_session_state()?;
+        Ok(())
+    }
+    /// Flip every tab's dock between open and collapsed.
+    pub fn toggle_dock(&mut self) -> Result<()> {
+        let current = self
+            .published_dock_state
+            .map(|state| state.mode)
+            .or_else(|| {
+                // No mode established yet: take it from whatever a tab materialized.
+                self.tabs.values().find_map(|tab| tab.dock_mode())
+            })
+            .unwrap_or_default();
+        let next = match current {
+            DockMode::Open => DockMode::Closed,
+            DockMode::Closed => DockMode::Open,
+        };
+        self.set_dock_mode(next)
     }
     pub fn break_pane(
         &mut self,
@@ -5362,6 +5397,11 @@ impl Screen {
 
             let tiled_panes: Vec<PaneLayoutMetadata> = tab
                 .get_tiled_panes()
+                // The dock is emitted as the layout's `dock` node, not as a pane.
+                // Dumping it here too would resurrect *both*, i.e. a duplicate
+                // sidebar — and the geoms feeding the percentage reconstruction
+                // would be computed against the wrong space.
+                .filter(|(_, p)| !p.is_dock())
                 .map(|(pane_id, p)| {
                     // here we look to see if this pane triggers any suppressed pane,
                     // and if so we take that suppressed pane - we do this because this
@@ -5903,6 +5943,9 @@ fn find_already_running_panes(
     let mut layout_tiled_instructions = tiled_layout.extract_run_instructions();
     let running_tiled_instructions: Vec<Option<Run>> = active_tab
         .get_tiled_panes()
+        // The dock is not in the layout's pane tree, so it can never match one of
+        // its run instructions.
+        .filter(|(_, pane)| !pane.is_dock())
         .map(|(_, pane)| pane.invoked_with().clone())
         .collect();
 
@@ -8954,15 +8997,6 @@ pub(crate) fn screen_thread_main(
                     screen.log_and_report_session_state()?;
                 }
             },
-            ScreenInstruction::PublishFlockSidebarState(sidebar_state) => {
-                // Same diff guard as agent state: sidebars may republish adopted
-                // state while converging, but unchanged values shouldn't rewrite
-                // session metadata.
-                if screen.published_flock_sidebar_state != Some(sidebar_state) {
-                    screen.published_flock_sidebar_state = Some(sidebar_state);
-                    screen.log_and_report_session_state()?;
-                }
-            },
             ScreenInstruction::UpdateAvailableLayouts(layouts, errors) => {
                 screen.update_available_layouts(layouts, errors);
             },
@@ -9058,7 +9092,7 @@ pub(crate) fn screen_thread_main(
                     remote_connection_state,
                     remote_panes,
                     agent_states: screen.published_agent_states.clone(),
-                    flock_sidebar_state: screen.published_flock_sidebar_state,
+                    dock_state: screen.published_dock_state,
                 };
 
                 let session_layout_metadata = if screen.session_serialization {
@@ -9247,10 +9281,14 @@ pub(crate) fn screen_thread_main(
                 // cells are cleared rather than left as garbage.
                 screen.render(None)?;
             },
-            ScreenInstruction::ResizePaneIdToFixedWidth(pane_id, width) => {
-                screen.resize_pane_id_to_fixed_width(pane_id, width);
-                // Repaint so the resize is reflected and a shrunk pane's vacated
-                // cells are cleared rather than left as garbage.
+            ScreenInstruction::SetDockMode(mode) => {
+                screen.set_dock_mode(mode)?;
+                // Repaint so the band change is reflected and the cells the dock
+                // vacated are cleared rather than left as garbage.
+                screen.render(None)?;
+            },
+            ScreenInstruction::ToggleDock => {
+                screen.toggle_dock()?;
                 screen.render(None)?;
             },
             ScreenInstruction::EditScrollbackForPaneWithId(pane_id, completion_tx) => {

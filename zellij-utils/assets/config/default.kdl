@@ -198,6 +198,12 @@ keybinds {
         bind "Alt ]" { NextSwapLayout; }
         bind "Alt p" { TogglePaneInGroup; }
         bind "Alt Shift p" { ToggleGroupMarking; }
+        // Collapse/expand a docked plugin (eg. the flock sidebar). Deliberately a
+        // *name-only* MessagePlugin: with no plugin URL it is broadcast to every
+        // running plugin, so it can never load one — and therefore can never
+        // conjure a second dock pane, which is exactly what a plugin-URL pipe does
+        // when the keybind's configuration doesn't match the layout's.
+        bind "Alt b" { MessagePlugin { name "flock-toggle-dock"; }; }
     }
     shared_except "normal" "locked" {
         bind "Enter" "Esc" { SwitchToMode "Normal"; }
