@@ -26,7 +26,8 @@ pub use super::generated_api::api::{
         PaneRenderReportPayload as ProtobufPaneRenderReportPayload,
         PaneScrollbackResponse as ProtobufPaneScrollbackResponse, PaneType as ProtobufPaneType,
         PluginConfigurationChangedPayload as ProtobufPluginConfigurationChangedPayload,
-        PluginInfo as ProtobufPluginInfo, RemotePaneMetadata as ProtobufRemotePaneMetadata,
+        PluginInfo as ProtobufPluginInfo, RemotePaneHealth as ProtobufRemotePaneHealth,
+        RemotePaneMetadata as ProtobufRemotePaneMetadata,
         ResurrectableSession as ProtobufResurrectableSession, SelectedText as ProtobufSelectedText,
         SessionManifest as ProtobufSessionManifest, SyntaxError as ProtobufSyntaxError,
         TabInfo as ProtobufTabInfo, TabMetadata as ProtobufTabMetadata,
@@ -44,7 +45,8 @@ use crate::data::{
     FileMetadata, HostTerminalThemeMode, InputMode, KeyWithModifier, LayoutInfo, LayoutMetadata,
     ModeInfo, Mouse, PaneAgentStatus, PaneContents, PaneId, PaneInfo, PaneManifest, PaneMetadata,
     PaneScrollbackResponse, PermissionStatus, PluginCapabilities, PluginInfo, RemoteBackend,
-    RemoteConnectionState, RemotePaneMetadata, SelectedText, SessionInfo, Style, TabInfo,
+    RemoteConnectionState, RemotePaneHealth, RemotePaneMetadata, RemoteProtocolStatus, SelectedText,
+    SessionInfo, Style, TabInfo,
     TabMetadata, WebServerStatus, WebSharing,
 };
 
@@ -1237,6 +1239,18 @@ impl TryFrom<SessionInfo> for ProtobufSessionManifest {
                         replay_cursor: metadata.replay_cursor,
                         close_pending: metadata.close_pending,
                         foreground_argv: metadata.foreground_argv,
+                        health: Some(ProtobufRemotePaneHealth {
+                            status: match metadata.health.status {
+                                RemoteProtocolStatus::Ok => 0,
+                                RemoteProtocolStatus::VersionSkew => 1,
+                                RemoteProtocolStatus::ProtocolIncompatible => 2,
+                                RemoteProtocolStatus::InstallFailed => 3,
+                            },
+                            daemon_version: metadata.health.daemon_version,
+                            local_version: metadata.health.local_version,
+                            retry_count: metadata.health.retry_count,
+                            last_error: metadata.health.last_error,
+                        }),
                     })
                 })
                 .collect(),
@@ -1384,6 +1398,23 @@ impl TryFrom<ProtobufSessionManifest> for SessionInfo {
                         replay_cursor: metadata.replay_cursor,
                         close_pending: metadata.close_pending,
                         foreground_argv: metadata.foreground_argv,
+                        health: metadata
+                            .health
+                            .map(|health| RemotePaneHealth {
+                                status: match health.status {
+                                    1 => RemoteProtocolStatus::VersionSkew,
+                                    2 => RemoteProtocolStatus::ProtocolIncompatible,
+                                    3 => RemoteProtocolStatus::InstallFailed,
+                                    // An unknown status from a newer peer must
+                                    // not invent a problem we cannot describe.
+                                    _ => RemoteProtocolStatus::Ok,
+                                },
+                                daemon_version: health.daemon_version,
+                                local_version: health.local_version,
+                                retry_count: health.retry_count,
+                                last_error: health.last_error,
+                            })
+                            .unwrap_or_default(),
                     },
                 ))
             })

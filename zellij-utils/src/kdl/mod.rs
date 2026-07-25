@@ -5773,6 +5773,11 @@ impl SessionInfo {
                                         .collect()
                                 })
                                 .unwrap_or_default(),
+                            // Health is live state, re-read from the bridge's
+                            // sidecar files on every session-info tick. A
+                            // resurrected session must not carry a stale
+                            // problem forward from whenever it was written.
+                            health: Default::default(),
                         },
                     );
                 }

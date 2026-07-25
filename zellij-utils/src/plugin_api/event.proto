@@ -353,6 +353,16 @@ message RemotePaneMetadata {
   uint64 replay_cursor = 3;
   bool close_pending = 4;
   repeated string foreground_argv = 5;
+  RemotePaneHealth health = 6;
+}
+
+// 0 ok, 1 version skew, 2 protocol incompatible, 3 install failed.
+message RemotePaneHealth {
+  uint32 status = 1;
+  optional string daemon_version = 2;
+  optional string local_version = 3;
+  uint32 retry_count = 4;
+  optional string last_error = 5;
 }
 
 message PaneAgentStatus {
