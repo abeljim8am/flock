@@ -207,8 +207,22 @@ impl TiledPanes {
         if self.panes_to_hide.contains(&dock.pane_id) {
             return 0;
         }
+        // While the plugin is asking for permissions, stay expanded whatever the
+        // mode says: the prompt renders into the dock's own grid and a rail cannot
+        // show it, so collapsing here would strand the user with an unreadable
+        // prompt and a sidebar that never gets its permissions.
+        let requesting_permissions = self
+            .panes
+            .get(&dock.pane_id)
+            .map(|pane| pane.is_requesting_permissions())
+            .unwrap_or(false);
+        let desired = if requesting_permissions {
+            dock.open_cols
+        } else {
+            dock.desired_cols()
+        };
         let max_band = display_cols.saturating_sub(MIN_TERMINAL_WIDTH);
-        dock.desired_cols().min(max_band)
+        desired.min(max_band)
     }
     /// Write the dock's geometry and inset the viewport by its band.
     ///

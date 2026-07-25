@@ -389,6 +389,9 @@ impl Pane for PluginPane {
     fn set_is_dock(&mut self, is_dock: bool) {
         self.is_dock = is_dock;
     }
+    fn is_requesting_permissions(&self) -> bool {
+        self.requesting_permissions.is_some()
+    }
     fn show_cursor(&mut self, client_id: ClientId, cursor_position: Option<(usize, usize)>) {
         self.cursor_visibility.insert(client_id, cursor_position);
         self.should_render.insert(client_id, true);

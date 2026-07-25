@@ -13,10 +13,10 @@ use std::sync::Mutex;
 
 use zellij_utils::channels::Receiver;
 use zellij_utils::data::Direction;
-use zellij_utils::data::DockMode;
 use zellij_utils::data::Resize;
 use zellij_utils::data::ResizeStrategy;
 use zellij_utils::data::WebSharing;
+use zellij_utils::data::{DockMode, PermissionType, PluginPermission};
 use zellij_utils::envs::set_session_name;
 use zellij_utils::errors::{prelude::*, ErrorContext};
 use zellij_utils::input::layout::{
@@ -15144,4 +15144,131 @@ fn terminal_resize_keeps_the_dock_fixed_and_clamped() {
             geom.cols.as_usize()
         );
     }
+}
+
+#[test]
+fn fullscreen_does_not_cover_the_dock() {
+    // A dock owns a band of the display, so a fullscreen pane fills what is left
+    // beside it rather than drawing over it. (This is a fix, not a preservation:
+    // the old sidebar was swept into `panes_to_hide` and covered.)
+    let size = Size {
+        cols: 120,
+        rows: 30,
+    };
+    let mut tab = create_tab_with_dock(size, 40, 5, DockMode::Open, 2, Default::default());
+    let client_id = 1;
+    let dock_pane_id = tab.tiled_panes.dock_pane_id().unwrap();
+
+    tab.toggle_active_pane_fullscreen(client_id);
+
+    assert!(tab.tiled_panes.fullscreen_is_active());
+    let fullscreen_pane_id = tab.get_active_pane_id(client_id).unwrap();
+    let fullscreen_geom = tab
+        .tiled_panes
+        .get_pane(fullscreen_pane_id)
+        .unwrap()
+        .current_geom();
+    assert_eq!(
+        fullscreen_geom.x, 40,
+        "the fullscreen pane starts after the dock band"
+    );
+    let dock = tab.tiled_panes.get_pane(dock_pane_id).unwrap();
+    assert_eq!(
+        dock.position_and_size().cols.as_usize(),
+        40,
+        "the dock keeps its band under fullscreen"
+    );
+
+    // And unsetting fullscreen restores the content beside the dock.
+    tab.toggle_active_pane_fullscreen(client_id);
+    assert!(!tab.tiled_panes.fullscreen_is_active());
+    for geom in content_geoms(&tab) {
+        assert_eq!(geom.x >= 40, true, "content stays beside the dock");
+    }
+}
+
+#[test]
+fn toggling_the_dock_preserves_content_pane_proportions() {
+    // Content panes keep their `Percent` constraints, so re-solving against the
+    // narrower/wider band preserves their ratio for free. This is the assertion
+    // the deleted `normalize_flexible_widths_overlapping_pane` was approximating.
+    let size = Size {
+        cols: 120,
+        rows: 30,
+    };
+    let mut tab = create_tab_with_dock(size, 40, 5, DockMode::Open, 2, Default::default());
+
+    let before = content_geoms(&tab);
+    assert_eq!(before.len(), 2);
+    let open_band: usize = before.iter().map(|g| g.cols.as_usize()).sum();
+
+    tab.set_dock_mode(DockMode::Closed);
+
+    let after = content_geoms(&tab);
+    let closed_band: usize = after.iter().map(|g| g.cols.as_usize()).sum();
+    assert!(
+        closed_band > open_band,
+        "collapsing the dock hands its columns to the content ({open_band} -> {closed_band})"
+    );
+    // Same split ratio, just over a wider band.
+    let ratio_before = before[0].cols.as_usize() as f64 / open_band as f64;
+    let ratio_after = after[0].cols.as_usize() as f64 / closed_band as f64;
+    assert!(
+        (ratio_before - ratio_after).abs() < 0.05,
+        "split ratio should be preserved: {ratio_before} vs {ratio_after}"
+    );
+}
+
+#[test]
+fn setting_the_dock_mode_is_idempotent() {
+    let size = Size {
+        cols: 120,
+        rows: 30,
+    };
+    let mut tab = create_tab_with_dock(size, 40, 5, DockMode::Open, 2, Default::default());
+
+    tab.set_dock_mode(DockMode::Closed);
+    let once = (dock_geom(&tab), content_geoms(&tab));
+    tab.set_dock_mode(DockMode::Closed);
+    let twice = (dock_geom(&tab), content_geoms(&tab));
+
+    assert_eq!(once, twice, "re-applying the same mode must change nothing");
+}
+
+#[test]
+fn a_permission_prompt_keeps_the_dock_expanded() {
+    // The permission prompt renders into the dock plugin's own grid. A 5-column
+    // rail cannot show it, so a dock awaiting permissions must stay expanded no
+    // matter what mode says — otherwise the user is left with an unreadable prompt
+    // and a sidebar that never gets the permissions it needs.
+    let size = Size {
+        cols: 120,
+        rows: 30,
+    };
+    let mut tab = create_tab_with_dock(size, 40, 5, DockMode::Open, 1, Default::default());
+    let dock_pane_id = tab.tiled_panes.dock_pane_id().unwrap();
+
+    tab.tiled_panes
+        .get_pane_mut(dock_pane_id)
+        .unwrap()
+        .request_permissions_from_user(Some(PluginPermission {
+            name: "flock-sidebar".to_owned(),
+            permissions: vec![PermissionType::ReadApplicationState],
+        }));
+
+    tab.set_dock_mode(DockMode::Closed);
+
+    assert_eq!(
+        dock_geom(&tab).cols.as_usize(),
+        40,
+        "the dock must stay expanded while the permission prompt is up"
+    );
+
+    // Once the prompt is answered, the requested mode takes effect.
+    tab.tiled_panes
+        .get_pane_mut(dock_pane_id)
+        .unwrap()
+        .request_permissions_from_user(None);
+    tab.tiled_panes.reserve_dock_band();
+    assert_eq!(dock_geom(&tab).cols.as_usize(), 5);
 }

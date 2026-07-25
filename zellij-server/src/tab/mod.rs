@@ -292,6 +292,15 @@ pub trait Pane {
         false
     }
     fn set_is_dock(&mut self, _is_dock: bool) {}
+    /// Whether this pane is currently showing the plugin-permission prompt.
+    ///
+    /// A dock consults this before collapsing: the prompt renders into the plugin's
+    /// own grid, and a few columns of rail cannot show it. Collapsing over it would
+    /// leave the user unable to grant the permissions the plugin needs, with no way
+    /// to tell why.
+    fn is_requesting_permissions(&self) -> bool {
+        false
+    }
     fn request_permissions_from_user(&mut self, _permissions: Option<PluginPermission>) {}
     fn render(
         &mut self,

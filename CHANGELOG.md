@@ -5,6 +5,29 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
 
 ## [Unreleased]
+* feat(dock)!: redesign the flock sidebar as a first-class `dock` — a layout-level
+  declaration (`dock size=40 closed_size=5 { plugin location="…" }`) for a plugin
+  pinned to the left edge, excluded from pane counts, swap layouts, relayout
+  matching and focus navigation, with the server owning its geometry and its
+  open/closed mode. Fixes a second sidebar pane appearing at random, a collapsed
+  rail silently re-expanding whenever a pane was opened, and fullscreen/floating
+  panes drawing over the sidebar. Bound to `Alt b`; a dock inside a tab, template
+  or swap layout is now a parse error.
+  * **Breaking (plugin API):** `ResizePaneIdToFixedWidth` is replaced by
+    `SetDockMode(DockMode)` (command 216 reused), and `PublishDockState` is removed
+    (217 reserved) — the server is the single writer of dock state. `FlockSidebarMode`
+    /`FlockSidebarState` are now `DockMode`/`DockState`, and `SessionInfo`'s
+    `flock_sidebar_state` is `dock_state`.
+  * **Breaking (layouts):** the flock layouts declare the sidebar as a `dock` rather
+    than a `pane`; swap-layout `max_panes`/`min_panes` each drop by one. User layouts
+    that declare the sidebar as a pane in both a base and a `flock_ui` template should
+    collapse to a single top-level `dock` node carrying the same plugin config. A
+    layout that has both a dock and a pane running the dock's plugin drops the pane.
+  * **Breaking (session metadata):** the persisted node is `dock_state`, not
+    `flock_sidebar_state`.
+* fix(ui): compare a pane's right edge against `viewport.x + viewport.cols` rather
+  than `viewport.cols` when drawing right boundaries and computing content offsets
+  (dormant until something insets the viewport horizontally).
 
 ## [26.6.1] - 2026-07-22
 * fix(remote-agent): keep agents detected through foreground tools
