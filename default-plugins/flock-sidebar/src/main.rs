@@ -84,6 +84,11 @@ const AGENT_COMMAND_SYNC_SECS: f64 = 1.0;
 /// and the server clamps and applies them.
 const DOCK_TOGGLE_PIPE: &str = "flock-toggle-dock";
 
+/// Pipe message name used by a keybinding to close the current session and
+/// move its client to the next session in sidebar display order. The handoff
+/// must happen before the kill so the user's terminal remains attached.
+const CLOSE_CURRENT_SESSION_PIPE: &str = "flock-close-current-session";
+
 /// Session name used by the flock-selector cold-shell entry point (set via its
 /// `session_name` layout arg). It's the picker's throwaway host session, not a
 /// workspace, so the sidebar always hides it from the workspace list. Must match
@@ -411,6 +416,10 @@ impl ZellijPlugin for State {
         if pipe_message.name == DOCK_TOGGLE_PIPE {
             self.toggle_dock();
             return false; // the server's resize triggers our re-render
+        }
+        if pipe_message.name == CLOSE_CURRENT_SESSION_PIPE {
+            self.close_current_session_and_switch();
+            return false;
         }
         // Only the agent self-report channel concerns us otherwise; ignore the
         // rest so we don't claim pipes meant for other plugins.
@@ -806,6 +815,19 @@ impl State {
             Some(Target::Pane(PaneId::Plugin(id))) => focus_plugin_pane(id, false, false),
             None => {},
         }
+    }
+
+    /// Hand this client to the next visible session before killing the session
+    /// it came from. `switch_session` waits for the server-side handoff, which
+    /// keeps the following kill from severing the client mid-transition.
+    fn close_current_session_and_switch(&self) {
+        let sessions = self.visible_sessions();
+        let Some((current, next)) = current_and_next_session(&sessions) else {
+            return;
+        };
+
+        switch_session(Some(&next));
+        let _ = kill_sessions(&[current.as_str()]);
     }
 
     /// Whether this session's issue offers an action. A reconnecting transport
@@ -1268,6 +1290,29 @@ pub(crate) fn session_remote_binding(session: &SessionInfo) -> Option<RemoteBind
             .as_deref()
             .and_then(parse_remote_binding),
     }
+}
+
+/// Resolve the current session and its successor using the same stable ordering
+/// as the sidebar. The last session wraps to the first; with no distinct target
+/// the operation is intentionally a no-op.
+fn current_and_next_session(sessions: &[SessionInfo]) -> Option<(String, String)> {
+    let ordered = ui::ordered_sessions(sessions);
+    if ordered.len() < 2 {
+        return None;
+    }
+    let current_index = ordered
+        .iter()
+        .position(|session| session.is_current_session)?;
+    let current = ordered[current_index].name.clone();
+    let next = ordered
+        .iter()
+        .cycle()
+        .skip(current_index + 1)
+        .take(ordered.len() - 1)
+        .find(|session| !session.is_current_session)?
+        .name
+        .clone();
+    Some((current, next))
 }
 
 fn argv_from_terminal_command(command: &str) -> Vec<String> {
@@ -1971,6 +2016,51 @@ mod tests {
                 .get(&pane_id)
                 .map(|status| status.state),
             Some(AgentRunState::Idle)
+        );
+    }
+
+    #[test]
+    fn close_session_target_follows_sidebar_order() {
+        let mut current = SessionInfo::new("current".to_string());
+        current.workspace_root = "/work/b".into();
+        current.is_current_session = true;
+        let mut next = SessionInfo::new("next".to_string());
+        next.workspace_root = "/work/c".into();
+        let mut previous = SessionInfo::new("previous".to_string());
+        previous.workspace_root = "/work/a".into();
+
+        assert_eq!(
+            current_and_next_session(&[next, current, previous]),
+            Some(("current".to_string(), "next".to_string()))
+        );
+    }
+
+    #[test]
+    fn close_session_target_wraps_to_first_sidebar_session() {
+        let mut first = SessionInfo::new("first".to_string());
+        first.workspace_root = "/work/a".into();
+        let mut current = SessionInfo::new("current".to_string());
+        current.workspace_root = "/work/z".into();
+        current.is_current_session = true;
+
+        assert_eq!(
+            current_and_next_session(&[current, first]),
+            Some(("current".to_string(), "first".to_string()))
+        );
+    }
+
+    #[test]
+    fn close_session_target_requires_another_session() {
+        let mut current = SessionInfo::new("only".to_string());
+        current.is_current_session = true;
+
+        assert_eq!(current_and_next_session(&[current]), None);
+        assert_eq!(
+            current_and_next_session(&[
+                SessionInfo::new("one".to_string()),
+                SessionInfo::new("two".to_string()),
+            ]),
+            None
         );
     }
 }
