@@ -21,6 +21,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
   it. Previously the stale instances could flip it back and the toggle settled on the
   wrong state.
 
+## [26.9.0] - 2026-07-26
+* fix(remote): keep failed remote bridge panes visible with actionable errors,
+  resize retained PTYs before replay, skip incomplete truncated VT history, and
+  close completed remote PTYs before rerunning them.
+* feat(sidebar): add a message that switches to the next visible session before
+  killing the current session, with sidebar-order wraparound and a safe no-op
+  when no alternative session exists.
+
 ## [26.8.0] - 2026-07-25
 * feat(remote): show real remote health and version drift, classify bootstrap failures,
   offer reinstall/upgrade actions, and confirm remote workspace starts and installs.
