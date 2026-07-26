@@ -477,3 +477,40 @@ fn osc7_then_poll_skips_terminal() {
         "poll after osc7 should skip terminal since flag was cleared"
     );
 }
+
+fn remote_pty_command() -> RunCommand {
+    RunCommand {
+        command: "/tmp/flock".into(),
+        args: vec![
+            "remote-agent".into(),
+            "remote-pty".into(),
+            "--provider".into(),
+            "coder".into(),
+            "--workspace".into(),
+            "alice/api".into(),
+        ],
+        hold_on_close: true,
+        ..Default::default()
+    }
+}
+
+#[test]
+fn clean_remote_shell_exit_closes_instead_of_reconnecting() {
+    assert!(!should_hold_after_exit(&remote_pty_command(), Some(0)));
+}
+
+#[test]
+fn failed_remote_shell_exit_remains_visible() {
+    assert!(should_hold_after_exit(&remote_pty_command(), Some(1)));
+    assert!(should_hold_after_exit(&remote_pty_command(), None));
+}
+
+#[test]
+fn ordinary_held_commands_still_hold_after_success() {
+    let command = RunCommand {
+        command: "printf".into(),
+        hold_on_close: true,
+        ..Default::default()
+    };
+    assert!(should_hold_after_exit(&command, Some(0)));
+}

@@ -258,10 +258,11 @@ const FLOCK_LAYOUT_TEMPLATE: &str = r#"layout {
 /// config server-side). Every content pane — initial, split, or new tab —
 /// falls back to the session's `default_command` and SSHes into the
 /// codespace; plugin panes (sidebar, status bars) are unaffected. A pane
-/// whose SSH ends (remote `exit`, dropped connection) closes like a normal
-/// shell exit. Base layouts should open a single initial tab: several tabs
-/// racing `gh codespace ssh` against a stopped codespace all but guarantees
-/// the losing connections' tabs close on arrival.
+/// whose direct SSH command ends closes like a normal shell exit. Unified
+/// remote-agent bindings (Coder, SSH, and devcontainers) are held on exit so
+/// their error and reconnect action remain visible. Base layouts should open a
+/// single initial tab: several tabs racing `gh codespace ssh` against a stopped
+/// codespace all but guarantees the losing connections' tabs close on arrival.
 pub fn layout_doc_for(
     codespace_name: &str,
     sidebar_args: &[(String, String)],

@@ -511,15 +511,20 @@ impl PaneState {
                 })?;
             }
         }
-        for chunk in history
-            .iter()
-            .filter(|chunk| chunk.sequence > after_sequence)
-        {
-            tx.send(ServerMessage::Output {
-                pane_id: self.id,
-                sequence: chunk.sequence,
-                data: chunk.data.clone(),
-            })?;
+        let replay_is_complete = history
+            .front()
+            .is_none_or(|chunk| after_sequence.saturating_add(1) >= chunk.sequence);
+        if replay_is_complete {
+            for chunk in history
+                .iter()
+                .filter(|chunk| chunk.sequence > after_sequence)
+            {
+                tx.send(ServerMessage::Output {
+                    pane_id: self.id,
+                    sequence: chunk.sequence,
+                    data: chunk.data.clone(),
+                })?;
+            }
         }
         tx.send(ServerMessage::Attached {
             pane_id: self.id,
@@ -1124,7 +1129,17 @@ pub fn remote_pty(
         ) {
             Ok(TransportEnd::Exited(status)) => {
                 persist_connection(&cursor_path, "disconnected")?;
-                std::process::exit(status.unwrap_or_default())
+                if status != Some(0) {
+                    let detail = status
+                        .map(|status| format!(" with status {status}"))
+                        .unwrap_or_else(|| " without an exit status".to_owned());
+                    writeln!(
+                        io::stderr(),
+                        "\r\nflock: {} remote shell exited{detail}; press Enter to start a new remote shell or Ctrl-c to close the pane",
+                        transport.label(),
+                    )?;
+                }
+                std::process::exit(status.unwrap_or(1))
             },
             Ok(TransportEnd::Attached(last_cursor)) => {
                 created = true;
@@ -1494,6 +1509,25 @@ enum TransportEnd {
     Exited(Option<i32>),
 }
 
+fn remote_attach_requests(
+    pane_id: Uuid,
+    after_sequence: u64,
+    cols: u16,
+    rows: u16,
+) -> [ClientMessage; 2] {
+    [
+        ClientMessage::Resize {
+            pane_id,
+            cols,
+            rows,
+        },
+        ClientMessage::AttachPane {
+            pane_id,
+            after_sequence,
+        },
+    ]
+}
+
 fn run_remote_transport(
     transport: &RemoteTransport,
     pane_id: Uuid,
@@ -1566,13 +1600,14 @@ fn run_remote_transport(
 
     let (cols, rows) = local_terminal_size();
     if attach_first {
-        write_frame(
-            &mut *child_stdin.lock().unwrap(),
-            &ClientMessage::AttachPane {
-                pane_id,
-                after_sequence: cursor,
-            },
-        )?;
+        // A resurrected local pane can have different dimensions from the PTY
+        // the daemon kept alive. Resize before subscribing to replay: terminal
+        // UIs emit cursor-addressed redraws for their old geometry while
+        // detached, and replaying those into the new geometry leaves stacked
+        // artifacts (eg. devenv's repeated "watching … files" status).
+        for request in remote_attach_requests(pane_id, cursor, cols, rows) {
+            write_frame(&mut *child_stdin.lock().unwrap(), &request)?;
+        }
     } else {
         write_frame(
             &mut *child_stdin.lock().unwrap(),
@@ -1591,11 +1626,36 @@ fn run_remote_transport(
     // permanently discarding the first keystrokes.
     let mut create_sent = !attach_first;
     let mut last_cursor = cursor;
+    let mut truncated_replay = None;
     loop {
         match read_frame::<_, ServerMessage>(&mut child_stdout)? {
             ServerMessage::Attached {
-                pane_id: attached, ..
-            } if attached == pane_id => break,
+                pane_id: attached,
+                next_sequence,
+            } if attached == pane_id => {
+                // A truncated byte stream starts in the middle of arbitrary VT
+                // state and cannot safely reconstruct a screen. Older daemons
+                // still send their retained chunks after ReplayTruncated, so
+                // the bridge skips them and advances to the coherent live
+                // watermark. New daemons omit them at the source.
+                last_cursor = next_sequence.saturating_sub(1);
+                persist_cursor(cursor_path, last_cursor)?;
+                write_frame(
+                    &mut *child_stdin.lock().unwrap(),
+                    &ClientMessage::Acknowledge {
+                        pane_id,
+                        sequence: last_cursor,
+                    },
+                )?;
+                if let Some(first_available) = truncated_replay {
+                    write!(
+                        io::stdout().lock(),
+                        "\x1b[!p\x1b[2J\x1b[H\r\n[flock: detached output exceeded the replay buffer; skipped incomplete terminal history before sequence {first_available}]\r\n",
+                    )?;
+                    io::stdout().lock().flush()?;
+                }
+                break;
+            },
             ServerMessage::PaneCreated {
                 pane_id: created, ..
             } if created == pane_id => break,
@@ -1604,8 +1664,10 @@ fn run_remote_transport(
                 sequence,
                 data,
             } if output_pane == pane_id => {
-                io::stdout().lock().write_all(&data)?;
-                io::stdout().lock().flush()?;
+                if truncated_replay.is_none() {
+                    io::stdout().lock().write_all(&data)?;
+                    io::stdout().lock().flush()?;
+                }
                 last_cursor = sequence;
                 write_frame(
                     &mut *child_stdin.lock().unwrap(),
@@ -1616,7 +1678,7 @@ fn run_remote_transport(
             ServerMessage::ReplayTruncated {
                 first_available, ..
             } => {
-                write!(io::stdout().lock(), "\x1b[!p\x1b[2J\x1b[H\r\n[flock: remote output before sequence {first_available} was truncated]\r\n")?;
+                truncated_replay = Some(first_available);
             },
             ServerMessage::Error { message }
                 if attach_first && !create_sent && message.contains("unknown pane") =>
@@ -1713,6 +1775,15 @@ fn run_remote_transport(
             },
             Ok(ServerMessage::Exited { status, .. }) => {
                 resize_active.store(false, Ordering::Relaxed);
+                // The local pane is held on bridge exit and Enter re-runs this
+                // same UUID. Remove the completed remote PTY before returning
+                // so that re-run's attach-first request receives "unknown
+                // pane" and creates a fresh shell instead of attaching to the
+                // same terminal Exited response forever.
+                let _ = write_frame(
+                    &mut *child_stdin.lock().unwrap(),
+                    &ClientMessage::ClosePane { pane_id },
+                );
                 return Ok(TransportEnd::Exited(status));
             },
             Ok(ServerMessage::ForegroundProcess { argv, cwd, .. }) => {
@@ -2491,6 +2562,25 @@ mod tests {
     }
 
     #[test]
+    fn an_existing_remote_pty_is_resized_before_output_replay() {
+        let pane_id = Uuid::new_v4();
+        assert_eq!(
+            remote_attach_requests(pane_id, 42, 120, 40),
+            [
+                ClientMessage::Resize {
+                    pane_id,
+                    cols: 120,
+                    rows: 40,
+                },
+                ClientMessage::AttachPane {
+                    pane_id,
+                    after_sequence: 42,
+                },
+            ]
+        );
+    }
+
+    #[test]
     fn bounded_history_drops_oldest_complete_chunks() {
         let pane = test_pane(Uuid::new_v4(), 1);
         pane.record_output(vec![1; HISTORY_LIMIT_BYTES]);
@@ -2525,6 +2615,37 @@ mod tests {
             ServerMessage::Output { sequence: 2, data, .. } if data == b"live"
         ));
         assert_eq!(messages.len(), 3);
+    }
+
+    #[test]
+    fn truncated_replay_skips_the_incomplete_terminal_stream() {
+        let pane = test_pane(Uuid::new_v4(), 1);
+        *pane.history.lock().unwrap() = VecDeque::from([OutputChunk {
+            sequence: 7,
+            data: b"middle of a vt redraw".to_vec(),
+        }]);
+        *pane.history_bytes.lock().unwrap() = 21;
+        *pane.next_sequence.lock().unwrap() = 8;
+        let (tx, rx) = mpsc::channel();
+
+        pane.subscribe_with_replay(0, &tx).unwrap();
+
+        let messages: Vec<_> = rx.try_iter().collect();
+        assert!(matches!(
+            messages[0],
+            ServerMessage::ReplayTruncated {
+                first_available: 7,
+                ..
+            }
+        ));
+        assert!(matches!(
+            messages[1],
+            ServerMessage::Attached {
+                next_sequence: 8,
+                ..
+            }
+        ));
+        assert_eq!(messages.len(), 2);
     }
 
     #[test]

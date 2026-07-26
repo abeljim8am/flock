@@ -330,15 +330,25 @@ fn session_default_terminal_action(
     cwd: Option<PathBuf>,
 ) -> Option<TerminalAction> {
     if let Some(command) = default_command.filter(|c| !c.is_empty()) {
+        let is_remote_pty = matches!(
+            command,
+            [_, remote_agent, remote_pty, ..]
+                if remote_agent == "remote-agent" && remote_pty == "remote-pty"
+        );
         return Some(TerminalAction::RunCommand(RunCommand {
             command: PathBuf::from(&command[0]),
             args: command[1..].to_vec(),
             cwd,
-            // A finished command closes its pane, exactly like a shell exit
-            // would — `exit` inside a codespace SSH pane should dismiss the
-            // pane, not park it on the re-run prompt (which turns the next
-            // keypress into a surprise reconnect).
-            hold_on_close: false,
+            // A failed remote bridge must remain visible. Besides giving the
+            // user the transport's error and an explicit re-run affordance,
+            // this keeps the command in the resurrection snapshot; closing
+            // the last remote pane produces an empty layout which resurrects
+            // as an unrelated local shell (usually in `/`).
+            //
+            // Legacy direct SSH commands retain shell-like close-on-exit
+            // behavior. The unified remote-pty bridge is the only command
+            // with reconnect state and a useful error to preserve.
+            hold_on_close: is_remote_pty,
             use_terminal_title: true,
             ..Default::default()
         }));
@@ -2477,5 +2487,41 @@ mod coder_remote_cwd_tests {
     fn local_backend_keeps_host_startup_cwd() {
         let cwd = Some(PathBuf::from("/projects/api"));
         assert_eq!(host_cwd_for_remote_backend(None, cwd.clone()), cwd);
+    }
+
+    #[test]
+    fn remote_pty_failure_is_held_in_its_pane() {
+        let command = vec![
+            "/opt/flock/bin/flock".to_owned(),
+            "remote-agent".to_owned(),
+            "remote-pty".to_owned(),
+            "--provider".to_owned(),
+            "coder".to_owned(),
+            "--workspace".to_owned(),
+            "alice/api".to_owned(),
+        ];
+        let TerminalAction::RunCommand(action) =
+            session_default_terminal_action(Some(&command), None, None).unwrap()
+        else {
+            panic!("default command should produce a command action");
+        };
+        assert!(action.hold_on_close);
+    }
+
+    #[test]
+    fn direct_remote_command_still_closes_like_a_shell() {
+        let command = vec![
+            "gh".to_owned(),
+            "codespace".to_owned(),
+            "ssh".to_owned(),
+            "-c".to_owned(),
+            "api".to_owned(),
+        ];
+        let TerminalAction::RunCommand(action) =
+            session_default_terminal_action(Some(&command), None, None).unwrap()
+        else {
+            panic!("default command should produce a command action");
+        };
+        assert!(!action.hold_on_close);
     }
 }
