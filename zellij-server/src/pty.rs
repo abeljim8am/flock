@@ -210,6 +210,18 @@ pub(crate) struct Pty {
     is_shutting_down: bool,
 }
 
+/// Remote bridges are held only when they fail. A clean status is the remote
+/// user intentionally leaving the shell, and holding that Enter key can race
+/// the exit notification and immediately re-run the bridge in a loop.
+fn should_hold_after_exit(command: &RunCommand, exit_status: Option<i32>) -> bool {
+    let is_remote_pty = matches!(
+        command.args.as_slice(),
+        [remote_agent, remote_pty, ..]
+            if remote_agent == "remote-agent" && remote_pty == "remote-pty"
+    );
+    command.hold_on_close && (!is_remote_pty || exit_status != Some(0))
+}
+
 pub(crate) fn pty_thread_main(mut pty: Pty, layout: Box<Layout>) -> Result<()> {
     loop {
         let (event, mut err_ctx) = pty.bus.recv().expect("failed to receive event on channel");
@@ -1019,20 +1031,16 @@ impl Pty {
                 terminal_action
             },
         };
-        let (hold_on_start, hold_on_close, originating_command_plugin, originating_edit_plugin) =
+        let (hold_on_start, originating_command_plugin, originating_edit_plugin) =
             match &terminal_action {
                 TerminalAction::RunCommand(run_command) => (
                     run_command.hold_on_start,
-                    run_command.hold_on_close,
                     run_command.originating_plugin.clone(),
                     None,
                 ),
-                TerminalAction::OpenFile(open_file_payload) => (
-                    false,
-                    false,
-                    None,
-                    open_file_payload.originating_plugin.clone(),
-                ),
+                TerminalAction::OpenFile(open_file_payload) => {
+                    (false, None, open_file_payload.originating_plugin.clone())
+                },
             };
 
         if hold_on_start {
@@ -1082,7 +1090,7 @@ impl Pty {
                     }
                 }
 
-                if hold_on_close {
+                if should_hold_after_exit(&command, exit_status) {
                     let _ = senders.send_to_screen(ScreenInstruction::HoldPane(
                         pane_id,
                         exit_status,
@@ -1567,13 +1575,21 @@ impl Pty {
         let err_context = || format!("failed to apply run instruction");
         let quit_cb = Box::new({
             let senders = self.bus.senders.clone();
-            move |pane_id, exit_status, _command| {
-                let _ = senders.send_to_screen(ScreenInstruction::ClosePane(
-                    pane_id,
-                    None,
-                    None,
-                    exit_status,
-                ));
+            move |pane_id, exit_status, command| {
+                if should_hold_after_exit(&command, exit_status) {
+                    let _ = senders.send_to_screen(ScreenInstruction::HoldPane(
+                        pane_id,
+                        exit_status,
+                        command,
+                    ));
+                } else {
+                    let _ = senders.send_to_screen(ScreenInstruction::ClosePane(
+                        pane_id,
+                        None,
+                        None,
+                        exit_status,
+                    ));
+                }
             }
         });
 
@@ -1588,7 +1604,6 @@ impl Pty {
         match run_instruction {
             Some(Run::Command(mut command)) => {
                 let starts_held = command.hold_on_start;
-                let hold_on_close = command.hold_on_close;
                 let quit_cb = Box::new({
                     let senders = self.bus.senders.clone();
                     move |pane_id, exit_status, command| {
@@ -1607,7 +1622,7 @@ impl Pty {
                             }
                         }
 
-                        if hold_on_close {
+                        if should_hold_after_exit(&command, exit_status) {
                             let _ = senders.send_to_screen(ScreenInstruction::HoldPane(
                                 pane_id,
                                 exit_status,
@@ -1961,7 +1976,6 @@ impl Pty {
                 let _ = self.task_handles.remove(&id); // if all is well, this shouldn't be here
                 let _ = self.id_to_child_pid.remove(&id); // if all is wlel, this shouldn't be here
 
-                let hold_on_close = run_command.hold_on_close;
                 let originating_plugin = Arc::new(run_command.originating_plugin.clone());
                 let quit_cb = Box::new({
                     let senders = self.bus.senders.clone();
@@ -1980,7 +1994,7 @@ impl Pty {
                                 )]));
                             }
                         }
-                        if hold_on_close {
+                        if should_hold_after_exit(&command, exit_status) {
                             let _ = senders.send_to_screen(ScreenInstruction::HoldPane(
                                 pane_id,
                                 exit_status,
