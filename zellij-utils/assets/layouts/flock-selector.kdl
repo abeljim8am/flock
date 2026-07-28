@@ -1,32 +1,33 @@
-// The `flock-selector` layout floats the project picker over a fresh session —
-// the cold-shell entry point, reached with `flock --layout flock-selector`.
+// The `flock-selector` layout: the project picker as the whole session. This is
+// what bare `flock` and `flock pick` open, and it is reachable directly with
+// `flock --layout flock-selector`.
 //
-// This layout deliberately carries no folder args. The picker resolves them
-// from the `flock-selector` alias in config.kdl, which is the one place they
-// are stated: adding `root_dirs` there reaches this layout, the `Super s`
-// keybinding, and the sidebar in every project session alike. Restating them
-// here would not just be redundant — a set that disagreed with the keybinding's
-// would make `Super s` miss the running picker and launch a second one.
+// The picker is the session's only pane, deliberately. It used to float over a
+// shell, which needed `tail -f /dev/null` underneath it as a keepalive — an
+// interactive shell can exit during its own startup and tear the session down
+// before the WASM plugin has finished loading. A plugin pane cannot exit, so
+// making the picker the base pane removes both the race and the sacrificial
+// process. There is also nothing useful to put underneath: this session exists
+// only to choose what to work on.
+//
+// This layout deliberately carries no folder args. The picker resolves them from
+// the `flock` section of config.kdl, which is the one place they are stated:
+// setting `root_dirs` there reaches this layout, the `Super s` keybinding, and
+// the sidebar in every project session alike. Restating them here would not just
+// be redundant — a set that disagreed with the keybinding's would make `Super s`
+// miss the running picker and launch a second one.
 layout {
-    // Keep the cold-selector session alive until the floating picker is ready.
-    // An interactive default shell can exit during startup (eg. from shell
-    // initialization), which otherwise tears down the whole session before the
-    // WASM plugin finishes loading.
-    pane command="tail" {
-        args "-f" "/dev/null"
-    }
-    floating_panes {
-        pane {
-            plugin location="flock-selector" {
-                // Rename this cold-shell entry session to a fixed name so it is
-                // always the same session (and the sidebar hides it) instead of
-                // a random throwaway name accumulating in the workspace list.
-                session_name "flock-selector"
-            }
-            width "70%"
-            height "70%"
-            x "15%"
-            y "15%"
+    pane borderless=true {
+        plugin location="flock-selector" {
+            // Name this entry session so it is always the same one (and the
+            // sidebar hides it) instead of a random throwaway name accumulating
+            // in the workspace list. Bare `flock` already creates the session
+            // under this name, which makes the rename a no-op; it still matters
+            // when this layout is opened by hand with `--layout`.
+            //
+            // Must match `FLOCK_SELECTOR_SESSION_NAME` in
+            // zellij-utils/src/input/flock_config.rs — a test keeps them in step.
+            session_name "flock-selector"
         }
     }
 }

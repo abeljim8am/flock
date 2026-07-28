@@ -6961,5 +6961,6 @@ Config {
         coder_dotfiles_branch: None,
         coder_dotfiles_parameter: None,
         coder_dotfiles_branch_parameter: None,
+        selector_on_startup: None,
     },
 }

@@ -5171,6 +5171,7 @@ impl FlockConfig {
                 "devcontainers" => flock_config.devcontainers = Some(flock_flag(node)?),
                 "coder" => flock_config.coder = Some(flock_flag(node)?),
                 "ssh" => flock_config.ssh = Some(flock_flag(node)?),
+                "selector_on_startup" => flock_config.selector_on_startup = Some(flock_flag(node)?),
                 "coder_dotfiles_uri" => flock_config.coder_dotfiles_uri = flock_string(node)?,
                 "coder_dotfiles_branch" => flock_config.coder_dotfiles_branch = flock_string(node)?,
                 "coder_dotfiles_parameter" => {
@@ -5187,7 +5188,8 @@ impl FlockConfig {
                         format!(
                             "Unknown \"flock\" configuration key: \"{}\". Expected one of: \
                              root_dirs, individual_dirs, session_layout, remote_session_layout, \
-                             codespaces, devcontainers, coder, ssh, coder_dotfiles_uri, \
+                             codespaces, devcontainers, coder, ssh, selector_on_startup, \
+                             coder_dotfiles_uri, \
                              coder_dotfiles_branch, coder_dotfiles_parameter, \
                              coder_dotfiles_branch_parameter",
                             unknown
@@ -5247,6 +5249,7 @@ impl FlockConfig {
         push_flag("devcontainers", self.devcontainers);
         push_flag("coder", self.coder);
         push_flag("ssh", self.ssh);
+        push_flag("selector_on_startup", self.selector_on_startup);
 
         flock_node.set_children(children);
         Some(flock_node)

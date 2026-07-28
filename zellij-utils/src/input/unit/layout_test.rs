@@ -2631,14 +2631,19 @@ fn flock_selector_bundled_layout_resolves_through_the_shipped_alias() {
     let default_config = crate::input::config::Config::from_default_assets().unwrap();
     layout.populate_plugin_aliases_in_layout(&default_config.plugins);
 
-    let (_, floating_panes) = layout.template.clone().expect("layout has a template");
-    let selector = floating_panes
+    let (tiled, floating_panes) = layout.template.clone().expect("layout has a template");
+    // Looked for in both tiled and floating panes on purpose: the picker is a
+    // tiled pane now that it is the session's only content, and this test is
+    // about alias resolution rather than about where the pane sits.
+    let mut runs = collect_runs(&tiled);
+    runs.extend(floating_panes.iter().filter_map(|pane| pane.run.clone()));
+    let selector = runs
         .iter()
-        .find_map(|pane| match pane.run.as_ref() {
-            Some(Run::Plugin(run)) => run.get_run_plugin(),
+        .find_map(|run| match run {
+            Run::Plugin(run) => run.get_run_plugin(),
             _ => None,
         })
-        .expect("the selector layout floats a resolved plugin pane");
+        .expect("the selector layout runs a resolved plugin pane");
     assert_eq!(
         selector.location,
         RunPluginLocation::parse("zellij:flock-selector", None).unwrap(),
@@ -2652,6 +2657,76 @@ fn flock_selector_bundled_layout_resolves_through_the_shipped_alias() {
         Some("flock-selector"),
         "the call-site session_name must survive alias merging"
     );
+}
+
+#[test]
+fn the_selector_layout_names_the_session_the_cli_creates() {
+    // Bare `flock` creates the picker session under
+    // `FLOCK_SELECTOR_SESSION_NAME`, and the layout asks the plugin to rename its
+    // session to a fixed name. If the two drifted apart the rename would fire on
+    // every startup and produce a second, differently-named picker session —
+    // silently, since neither side can see the other.
+    let (layout_path, kdl_layout, _) =
+        Layout::stringified_from_default_assets(std::path::Path::new("flock-selector")).unwrap();
+    let mut layout = Layout::from_kdl(&kdl_layout, Some(layout_path), None, None).unwrap();
+    let default_config = crate::input::config::Config::from_default_assets().unwrap();
+    layout.populate_plugin_aliases_in_layout(&default_config.plugins);
+
+    let (tiled, floating) = layout.template.clone().expect("layout has a template");
+    let mut runs = collect_runs(&tiled);
+    runs.extend(floating.iter().filter_map(|pane| pane.run.clone()));
+    let selector = runs
+        .iter()
+        .find_map(|run| match run {
+            Run::Plugin(run) => run.get_run_plugin(),
+            _ => None,
+        })
+        .expect("the selector layout runs a resolved plugin");
+    assert_eq!(
+        selector
+            .configuration
+            .inner()
+            .get("session_name")
+            .map(|s| s.as_str()),
+        Some(crate::input::flock_config::FLOCK_SELECTOR_SESSION_NAME),
+    );
+}
+
+#[test]
+fn the_selector_layout_needs_no_keepalive_process() {
+    // The picker is the session's only pane. It used to float over a shell with
+    // `tail -f /dev/null` underneath as a keepalive, because an interactive shell
+    // can exit during its own startup and tear the session down before the plugin
+    // finishes loading. A plugin pane cannot exit, so the sacrificial process is
+    // gone — assert it stays gone.
+    // Asserted structurally rather than by grepping the KDL text: the layout's
+    // own comments explain the removed keepalive, so a text search matches its
+    // documentation.
+    let (_, kdl_layout, _) =
+        Layout::stringified_from_default_assets(std::path::Path::new("flock-selector")).unwrap();
+    let layout = Layout::from_kdl(&kdl_layout, Some("flock-selector".into()), None, None).unwrap();
+    let (tiled, _) = layout.template.clone().expect("layout has a template");
+    let runs = collect_runs(&tiled);
+    assert!(
+        !runs.is_empty(),
+        "the selector layout must actually run something"
+    );
+    assert!(
+        runs.iter().all(|run| matches!(run, Run::Plugin(_))),
+        "every pane in the selector layout should be a plugin — a shell pane could \
+         exit during startup and tear the session down, which is what the keepalive \
+         used to guard against; got {:?}",
+        runs
+    );
+}
+
+/// Every `run` in a tiled layout tree, panes without one omitted.
+fn collect_runs(pane: &TiledPaneLayout) -> Vec<Run> {
+    let mut runs: Vec<Run> = pane.run.clone().into_iter().collect();
+    for child in &pane.children {
+        runs.extend(collect_runs(child));
+    }
+    runs
 }
 
 fn dock_of(layout: &Layout) -> &DockLayout {

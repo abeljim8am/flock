@@ -306,6 +306,14 @@ load_plugins {
 // set `root_dirs` or `individual_dirs`, the selector's project list is empty.
 //
 // flock {
+//     // Bare `flock` opens the project selector rather than dropping straight
+//     // into a shell. Set this to false to get a plain session instead, keeping
+//     // Flock a drop-in Zellij replacement; `flock pick` still opens the selector
+//     // on demand. Naming a session (`flock --session x`), a layout
+//     // (`flock --layout compact`), or `session_name` in this file already
+//     // bypasses the selector without needing this.
+//     selector_on_startup true
+//
 //     // Scanned one level deep: every immediate subdirectory is a project.
 //     root_dirs "~/src" "~/work"
 //

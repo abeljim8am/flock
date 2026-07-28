@@ -132,16 +132,29 @@ creates it. Note `--session NAME` does **not** attach when the session is alread
 live (`AGENTS.md:26`), so this needs real attach-or-create logic rather than a
 flag.
 
-- Replace the `tail -f /dev/null` keepalive with something intentional now that
-  this is the primary startup path.
-- Keep an explicit `flock pick` subcommand as well: bare `flock` is now
-  overloaded, and scripts and docs benefit from a name. Gets shell completion
-  free via the existing `setup --generate-completion`.
-- `attach_to_session` is effectively subsumed — the selector lists live sessions
-  with agent badges, so picking one *is* attaching. Confirm the interaction
-  rather than assuming it.
-- Explicit forms (`flock attach`, `flock --session X`, `flock -l LAYOUT`) keep
-  working unchanged.
+Implemented by rewriting the request into the `attach --create` form and letting
+that branch run, rather than adding a parallel create path. That branch already
+resolves live / dead-but-resurrectable / absent correctly — and a hand-rolled
+create would call `assert_session_ne`, which **exits the process** when the name
+exists as a dead session, so bare `flock` would have started failing outright
+once a stale picker snapshot existed.
+
+- The `tail -f /dev/null` keepalive is gone: the picker is the session's only
+  pane. A plugin pane cannot exit, so the shell-exits-during-startup race it
+  guarded against cannot happen. This also matches the tiled (not floating)
+  selector pane the author's own daily layout already used.
+- `flock pick` (alias `p`) added. Falls through to `start_client` with no
+  `main.rs` change, and gets shell completion free via
+  `setup --generate-completion`.
+- `attach_to_session` needed no handling: it is only consulted inside the
+  `session_name` branch, which selector mode already declines to touch. Confirmed
+  by reading the branch, not assumed.
+- Explicit forms (`flock attach`, `flock --session X`, `flock -l LAYOUT`, other
+  subcommands, reconnects) keep working unchanged.
+- The first-run setup wizard is deliberately **not** special-cased. On a brand-new
+  install it floats over the picker, which reads as a reasonable funnel once
+  Phase 3 makes the empty project list actionable: configure UI in the wizard,
+  dismiss, then be told how to add a project folder.
 
 ## Phase 3 — make the empty state carry first-run
 

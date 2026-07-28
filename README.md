@@ -52,9 +52,19 @@ cargo xtask test
 
 ## Configure Flock
 
-Flock works with no configuration: it starts with the sidebar docked to the left
-edge, and `Super s` opens the project selector. The one thing it cannot guess is
-where your projects live.
+Flock works with no configuration. Running `flock` opens the project selector —
+pick a project and it starts or switches to that project's session, with the
+sidebar docked to the left edge. `Super s` reaches the selector again from inside
+a session, and `flock pick` from outside one.
+
+The selector runs in a single fixed session named `flock-selector`, so reaching
+for it repeatedly lands in the same place instead of accumulating throwaway
+sessions. Anything that names what it wants skips it: `flock --session work`,
+`flock --layout compact`, `flock attach x`, or a `session_name` in your config.
+To go back to a plain shell on startup, set `selector_on_startup false` in the
+`flock` section below — `flock pick` still works.
+
+The one thing Flock cannot guess is where your projects live.
 
 Point it at them with the `flock` section of `~/.config/flock/config.kdl`:
 

@@ -38,11 +38,13 @@ use miette::{Report, Result};
 use zellij_server::{os_input_output::get_server_os_input, start_server as start_server_impl};
 use zellij_utils::{
     cli::{CliArgs, Command, SessionCommand, Sessions},
-    data::ConnectToSession,
+    data::{ConnectToSession, LayoutInfo},
     envs,
+    home::{find_default_config_dir, get_layout_dir},
     input::{
         actions::Action,
         config::{Config, ConfigError},
+        flock_config::{FLOCK_SELECTOR_LAYOUT_NAME, FLOCK_SELECTOR_SESSION_NAME},
         options::Options,
     },
     setup::Setup,
@@ -671,6 +673,59 @@ fn attach_with_session_name(
     }
 }
 
+/// Whether this invocation should open the project selector.
+///
+/// True for an explicit `flock pick`, and for a bare `flock` that has asked for
+/// nothing else. Anything that names what it wants — a session, a layout, a
+/// subcommand, or a `session_name` in the config — is left alone, as is a
+/// reconnect, which is resuming a session rather than starting one.
+fn should_open_selector(
+    opts: &CliArgs,
+    config: &Config,
+    config_options: &Options,
+    is_a_reconnect: bool,
+) -> bool {
+    if is_a_reconnect {
+        return false;
+    }
+    // An explicit request wins, including over `selector_on_startup false`.
+    if matches!(opts.command, Some(Command::Sessions(Sessions::Pick))) {
+        return true;
+    }
+    if !config.flock.selector_on_startup() {
+        return false;
+    }
+    // `flock options ...` is a way of starting an ordinary session with overrides,
+    // so it counts as bare for this purpose. Any other subcommand does not.
+    let is_bare = match &opts.command {
+        None => true,
+        Some(Command::Options(_)) => true,
+        Some(_) => false,
+    };
+    is_bare
+        && opts.session.is_none()
+        && opts.layout.is_none()
+        && opts.layout_string.is_none()
+        && opts.new_session_with_layout.is_none()
+        && config_options.session_name.is_none()
+}
+
+/// The layout the selector session is created with, resolved by name so a user's
+/// own `layouts/flock-selector.kdl` wins over the bundled one — the same
+/// precedence the startup layout follows.
+fn selector_layout_info(opts: &CliArgs, config_options: &Options) -> LayoutInfo {
+    let layout_dir = config_options
+        .layout_dir
+        .clone()
+        .or_else(|| get_layout_dir(opts.config_dir.clone()))
+        .or_else(|| get_layout_dir(find_default_config_dir()));
+    LayoutInfo::from_config(
+        &layout_dir,
+        &Some(PathBuf::from(FLOCK_SELECTOR_LAYOUT_NAME)),
+    )
+    .unwrap_or_else(|| LayoutInfo::BuiltIn(FLOCK_SELECTOR_LAYOUT_NAME.to_owned()))
+}
+
 pub(crate) fn start_client(opts: CliArgs) {
     // look for old YAML config/layout/theme files and convert them to KDL
     convert_old_yaml_files(&opts);
@@ -744,6 +799,32 @@ pub(crate) fn start_client(opts: CliArgs) {
             config = config_without_layout.clone();
             config_options = config_options_without_layout.clone();
             is_a_reconnect = true;
+        }
+
+        // Bare `flock` (and `flock pick`) opens the project selector rather than
+        // dropping into a shell. Rewriting the request into the `attach --create`
+        // form deliberately reuses that branch's session lifecycle instead of
+        // reimplementing it: it already resolves live / dead-but-resurrectable /
+        // absent correctly, where a hand-rolled create would hit
+        // `assert_session_ne` and abort outright once a stale resurrection
+        // snapshot existed for the picker session.
+        if should_open_selector(&opts, &config, &config_options, is_a_reconnect) {
+            opts.command = Some(Command::Sessions(Sessions::Attach {
+                session_name: Some(FLOCK_SELECTOR_SESSION_NAME.to_owned()),
+                create: true,
+                create_background: false,
+                force_run_commands: false,
+                index: None,
+                options: None,
+                token: None,
+                remember: false,
+                forget: false,
+                ca_cert: None,
+                insecure: false,
+            }));
+            // Only consulted when the session has to be created; attaching to a
+            // live picker, or resurrecting a saved one, keeps what it already has.
+            layout_info = Some(selector_layout_info(&opts, &config_options));
         }
 
         let start_client_plan = |session_name: std::string::String| {
@@ -1096,4 +1177,134 @@ pub fn get_config_options_from_cli_args(opts: &CliArgs) -> Result<Options, Strin
     Setup::from_cli_args(&opts)
         .map(|(_, _, config_options, _, _)| config_options)
         .map_err(|e| e.to_string())
+}
+
+#[cfg(test)]
+mod selector_startup_test {
+    use super::*;
+    use zellij_utils::input::flock_config::FlockConfig;
+
+    fn config_with(selector_on_startup: Option<bool>) -> Config {
+        Config {
+            flock: FlockConfig {
+                selector_on_startup,
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+    }
+
+    fn bare() -> CliArgs {
+        CliArgs::default()
+    }
+
+    #[test]
+    fn bare_flock_opens_the_selector() {
+        assert!(should_open_selector(
+            &bare(),
+            &config_with(None),
+            &Options::default(),
+            false
+        ));
+    }
+
+    #[test]
+    fn flock_options_counts_as_bare() {
+        // `flock options --simplified-ui true` is a way of starting an ordinary
+        // session with overrides, so it should still land in the selector.
+        let mut opts = bare();
+        opts.command = Some(Command::Options(Default::default()));
+        assert!(should_open_selector(
+            &opts,
+            &config_with(None),
+            &Options::default(),
+            false
+        ));
+    }
+
+    #[test]
+    fn an_explicit_request_wins_over_the_opt_out() {
+        let mut opts = bare();
+        opts.command = Some(Command::Sessions(Sessions::Pick));
+        assert!(
+            should_open_selector(&opts, &config_with(Some(false)), &Options::default(), false),
+            "`flock pick` must work even with selector_on_startup false"
+        );
+    }
+
+    #[test]
+    fn the_opt_out_restores_plain_startup() {
+        assert!(!should_open_selector(
+            &bare(),
+            &config_with(Some(false)),
+            &Options::default(),
+            false
+        ));
+    }
+
+    #[test]
+    fn a_named_session_is_left_alone() {
+        let mut opts = bare();
+        opts.session = Some("my-session".to_owned());
+        assert!(!should_open_selector(
+            &opts,
+            &config_with(None),
+            &Options::default(),
+            false
+        ));
+    }
+
+    #[test]
+    fn an_explicit_layout_is_left_alone() {
+        let mut opts = bare();
+        opts.layout = Some(PathBuf::from("compact"));
+        assert!(!should_open_selector(
+            &opts,
+            &config_with(None),
+            &Options::default(),
+            false
+        ));
+    }
+
+    #[test]
+    fn a_session_name_in_the_config_is_left_alone() {
+        // Naming a startup session in config.kdl is an explicit choice about what
+        // bare `flock` should do, so it outranks the selector default.
+        let config_options = Options {
+            session_name: Some("work".to_owned()),
+            ..Default::default()
+        };
+        assert!(!should_open_selector(
+            &bare(),
+            &config_with(None),
+            &config_options,
+            false
+        ));
+    }
+
+    #[test]
+    fn another_subcommand_is_left_alone() {
+        let mut opts = bare();
+        opts.command = Some(Command::Sessions(Sessions::ListAliases));
+        assert!(!should_open_selector(
+            &opts,
+            &config_with(None),
+            &Options::default(),
+            false
+        ));
+    }
+
+    #[test]
+    fn a_reconnect_is_never_hijacked() {
+        // Resuming a session must not be turned into "open the picker", even for
+        // an explicit pick that started the process.
+        let mut opts = bare();
+        opts.command = Some(Command::Sessions(Sessions::Pick));
+        assert!(!should_open_selector(
+            &opts,
+            &config_with(None),
+            &Options::default(),
+            true
+        ));
+    }
 }
