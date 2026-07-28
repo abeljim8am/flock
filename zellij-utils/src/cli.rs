@@ -190,8 +190,8 @@ pub enum RemoteAgentCommand {
         #[clap(long, value_parser)]
         pane_id: String,
     },
-    /// Reinstall the remote agent and retire the running daemon, so the next
-    /// reconnect serves panes from the new build. Panes are never closed.
+    /// Reinstall the remote agent and retire an idle running daemon. Live panes
+    /// stay on their existing daemon until they close.
     #[clap(name = "remote-upgrade", hide = true)]
     RemoteUpgrade {
         #[clap(long, value_parser)]
@@ -204,6 +204,16 @@ pub enum RemoteAgentCommand {
         ssh_arg: Vec<String>,
         #[clap(long, value_parser)]
         workspace_folder: Option<String>,
+        /// Terminate the current daemon and its PTYs after installing.
+        #[clap(long, hide = true)]
+        #[serde(default)]
+        force: bool,
+    },
+    /// Terminate the verified daemon behind the private remote-agent socket.
+    #[clap(name = "force-restart", hide = true)]
+    ForceRestart {
+        #[clap(long, value_parser)]
+        socket: Option<PathBuf>,
     },
     /// Report an agent state transition to the remote PTY daemon.
     #[clap(name = "report-state", hide = true)]

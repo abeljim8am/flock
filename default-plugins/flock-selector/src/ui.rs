@@ -116,7 +116,7 @@ pub struct RenderInput<'a> {
     /// An open that would start or install something on the far end, waiting
     /// on its `y`. Owns the keyboard and draws over the bottom result row.
     pub pending_start: Option<&'a str>,
-    /// Host a Ctrl-r reinstall is currently running against.
+    /// Host a confirmed Ctrl-r force restart is currently running against.
     pub pending_reinstall: Option<&'a str>,
     /// Agent build running on each bound remote, keyed by row identifier.
     pub remote_agent_versions: &'a std::collections::BTreeMap<String, String>,
@@ -513,7 +513,7 @@ pub fn render(input: RenderInput) -> RenderOutput {
         }
     }
 
-    // A reinstall is a background repair, so it only reports progress.
+    // A confirmed restart is a background repair, so it only reports progress.
     if let Some(target) = pending_reinstall {
         let glyph = spinner_frame.unwrap_or('◌');
         render_row(
@@ -524,7 +524,7 @@ pub fn render(input: RenderInput) -> RenderOutput {
             None,
             &[
                 Span::new(format!(" {} ", glyph), p.yellow),
-                Span::new(format!("reinstalling the flock agent on {target}…"), p.text).bold(),
+                Span::new(format!("restarting the flock agent on {target}…"), p.text).bold(),
             ],
         );
     }
@@ -613,14 +613,14 @@ fn render_header_row(
             PickerMode::Projects => &["Tab switch ", "Tab "],
             PickerMode::Codespaces => &["Tab switch · Ctrl-x stop ", "Ctrl-x stop ", "? "],
             PickerMode::Coder => &[
-                "Tab switch · Ctrl-o create · Ctrl-r reinstall · Ctrl-x stop ",
-                "Ctrl-o create · Ctrl-r reinstall · Ctrl-x stop ",
+                "Tab switch · Ctrl-o create · Ctrl-r force restart · Ctrl-x stop ",
+                "Ctrl-o create · Ctrl-r restart · Ctrl-x stop ",
                 "Ctrl-o · Ctrl-r · Ctrl-x ",
                 "? ",
             ],
             PickerMode::Ssh => &[
-                "Tab switch · Ctrl-o add · Ctrl-e edit · Ctrl-r reinstall · Ctrl-x delete ",
-                "Ctrl-o add · Ctrl-e edit · Ctrl-r reinstall · Ctrl-x delete ",
+                "Tab switch · Ctrl-o add · Ctrl-e edit · Ctrl-r force restart · Ctrl-x delete ",
+                "Ctrl-o add · Ctrl-e edit · Ctrl-r restart · Ctrl-x delete ",
                 "Ctrl-o · Ctrl-e · Ctrl-r · Ctrl-x ",
                 "? ",
             ],

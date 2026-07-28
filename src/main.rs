@@ -60,13 +60,16 @@ fn main() {
                     destination,
                     ssh_arg,
                     workspace_folder,
+                    force,
                 } => remote_transport(&provider, workspace, destination, ssh_arg, workspace_folder)
                     .and_then(|transport| {
                         remote_agent::remote_upgrade(
                             transport,
                             &zellij_utils::remote_bootstrap::reinstall_script(),
+                            force,
                         )
                     }),
+                RemoteAgentCommand::ForceRestart { socket } => remote_agent::force_restart(socket),
                 RemoteAgentCommand::ReportState {
                     pane_id,
                     state,

@@ -372,8 +372,18 @@ pub struct RemoteIssue {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum UpgradeProgress {
     Working,
-    Done { version: String, panes: usize },
-    Failed { reason: String },
+    Activated {
+        version: String,
+    },
+    /// The binary is installed, but the old daemon still owns live PTYs. This
+    /// is not an error, and it is not an activated upgrade either.
+    InstalledPending {
+        version: String,
+        panes: Option<usize>,
+    },
+    Failed {
+        reason: String,
+    },
 }
 
 /// Roll a session's per-pane health into at most one issue. Returns `None` for
@@ -434,8 +444,8 @@ pub struct ClickTarget {
 /// has got. Kept narrow on purpose: the sidebar is routinely 28 content columns
 /// wide, and a row that truncates has failed at the one job it has.
 ///
-/// The armed state names the real cost — panes *reconnect*, they are not
-/// destroyed — and asks for `y`, matching the saved-host delete confirm.
+/// The dock is not keyboard-focusable, so the armed state asks for the only
+/// reachable confirmation: a second click.
 pub fn remote_issue_text(
     issue: &RemoteIssue,
     armed: bool,
@@ -448,17 +458,21 @@ pub fn remote_issue_text(
                 format!("{spinner} installing {}…", version_or(&issue.local_version)),
                 IssueTone::Busy,
             ),
-            UpgradeProgress::Done { version, panes } => {
-                (format!("✓ {version} · {panes} panes back"), IssueTone::Good)
+            UpgradeProgress::Activated { version } => {
+                (format!("✓ {version} activated"), IssueTone::Good)
             },
+            UpgradeProgress::InstalledPending { version, panes } => (
+                match panes {
+                    Some(panes) => format!("✓ {version} · {panes} panes old"),
+                    None => format!("✓ {version} · restart needed"),
+                },
+                IssueTone::Warn,
+            ),
             UpgradeProgress::Failed { reason } => (format!("✗ {reason}  ⏎ retry"), IssueTone::Bad),
         };
     }
     if armed {
-        return (
-            format!("⇪ {} panes reconnect  [y]", issue.pane_count),
-            IssueTone::Armed,
-        );
+        return ("⇪ click again to install".to_owned(), IssueTone::Armed);
     }
     match issue.kind {
         RemoteIssueKind::VersionSkew => (
@@ -824,7 +838,7 @@ pub struct RenderInput<'a> {
     pub spinner_tick: u32,
     pub rows: usize,
     pub cols: usize,
-    /// The session whose remote-issue row is armed for its `y` confirm, if any.
+    /// The session whose remote-issue row is waiting for a confirming second click.
     pub armed_issue: Option<&'a str>,
     /// In-flight or just-finished upgrades, keyed by session name.
     pub upgrade_progress: &'a BTreeMap<String, UpgradeProgress>,
@@ -1033,7 +1047,7 @@ struct SectionInput<'a> {
     spinner_tick: u32,
     cols: usize,
     p: &'a Theme,
-    /// Session whose issue row is armed for its `y` confirm.
+    /// Session whose issue row is armed for a confirming second click.
     armed_issue: Option<&'a str>,
     upgrade_progress: &'a BTreeMap<String, UpgradeProgress>,
 }
@@ -1453,11 +1467,10 @@ mod tests {
             remote_issue_text(&issue, false, None, "⠙").0,
             "⇪ v26.5.0 → 26.7.0"
         );
-        // The armed step names the real cost: panes reconnect, they are not
-        // closed, and `y` is the key that commits.
+        // Installing cannot replace the daemon while it owns these PTYs.
         assert_eq!(
             remote_issue_text(&issue, true, None, "⠙").0,
-            "⇪ 3 panes reconnect  [y]"
+            "⇪ click again to install"
         );
         assert_eq!(
             remote_issue_text(&issue, false, Some(&UpgradeProgress::Working), "⠙").0,
@@ -1467,14 +1480,14 @@ mod tests {
             remote_issue_text(
                 &issue,
                 false,
-                Some(&UpgradeProgress::Done {
+                Some(&UpgradeProgress::InstalledPending {
                     version: "26.7.0".into(),
-                    panes: 3
+                    panes: Some(3)
                 }),
                 "⠙"
             )
             .0,
-            "✓ 26.7.0 · 3 panes back"
+            "✓ 26.7.0 · 3 panes old"
         );
         assert_eq!(
             remote_issue_text(
@@ -1504,9 +1517,9 @@ mod tests {
             remote_issue_text(
                 &issue,
                 false,
-                Some(&UpgradeProgress::Done {
+                Some(&UpgradeProgress::InstalledPending {
                     version: "26.7.0".into(),
-                    panes: 3,
+                    panes: Some(3),
                 }),
                 "⠙",
             )
