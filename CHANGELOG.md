@@ -22,11 +22,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
     project opened through Flock has the sidebar. Previously they got Zellij's
     `default` layout with no way back to the selector.
 
-  **Breaking:** a custom `~/.config/flock/layouts/default.kdl` is no longer
-  loaded on startup, because layout resolution now looks for the name `flock`.
-  Set `default_layout "default"` in your `config.kdl` to get it back, or rename
-  the file to `flock.kdl`. Setting `default_layout` to any explicit value has
-  always taken precedence and still does.
+  Your own layouts still win. `default_layout` is deliberately left unset, and
+  the `flock` layout is a *fallback*: startup still loads your
+  `layouts/default.kdl` if you have written one, and only uses the built-in
+  `flock` layout when you have not. Naming a layout explicitly — including
+  `default_layout "default"` for the plain upstream Zellij chrome with no
+  sidebar — takes precedence as always.
 
 ## [26.10.1] - 2026-07-28
 * fix(remote): make the sidebar's upgrade confirmation mouse-reachable, report

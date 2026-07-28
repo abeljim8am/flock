@@ -1,0 +1,2 @@
+// Naming the upstream builtin explicitly, to opt out of Flock's sidebar chrome.
+default_layout "default"

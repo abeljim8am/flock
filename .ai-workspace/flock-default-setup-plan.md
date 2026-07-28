@@ -64,7 +64,14 @@ whole first-run experience. See Phase 3.
 Small, self-contained, no new config surface. Gets a fresh install from "plain
 Zellij" to "sidebar + working selector keybind."
 
-- `default.kdl`: set `default_layout "flock"`.
+- Make the built-in `flock` layout the startup **fallback**, not a shipped
+  `default_layout` value. `default_layout` stays unset, so a user's own
+  `layouts/default.kdl` is still what loads on startup; only when they have not
+  written one does Flock use its own layout. Setting the option instead would
+  skip that lookup and silently ignore a file the user expects to be their
+  startup layout — a breaking change for no benefit. The rule lives in two
+  places that must agree (`LayoutInfo::from_config` and the loader in
+  `layout.rs`), keyed off `FALLBACK_BUILTIN_LAYOUT`.
 - `config.rs`: `DEFAULT_SESSION_LAYOUT` → `"flock"`, so selector-created
   sessions get the dock.
 - `default.kdl`: register `flock-selector` and `flock-sidebar` in the
@@ -157,5 +164,13 @@ user's back.
   with the rebind.
 - **Selector-always is a visible divergence from Zellij.** The opt-out in Phase 1
   is the mitigation; it should be easy to find.
-- **`default_layout "flock"` changes behavior for existing users** who currently
-  get the plain default layout. Worth a CHANGELOG note.
+- **The flock fallback changes the startup chrome for existing users** who have
+  no `layouts/default.kdl` and were getting the plain default layout. They keep
+  every pane they had plus a sidebar dock, and `default_layout "default"` opts
+  out. Worth a CHANGELOG note, but not breaking: anyone with their own
+  `default.kdl` is unaffected by construction.
+- **Verifying startup layout resolution by hand is booby-trapped.** On a config
+  dir with no `config.kdl`, the first-run setup wizard both overrides the layout
+  and *writes a `config.kdl` into that directory* — which silently pollutes a
+  test fixture if you point the binary at one. Pre-seed a `config.kdl` in a temp
+  config dir when checking this by hand.

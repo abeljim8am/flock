@@ -1,3 +1,0 @@
-// Opting back out of Flock's shipped `default_layout "flock"`, so the sibling
-// `layouts/default.kdl` is what loads on startup again.
-default_layout "default"

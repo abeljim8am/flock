@@ -404,15 +404,19 @@ load_plugins {
 //
 // theme "default"
 
-// The name of the default layout to load on startup.
+// The name of the default layout to load on startup
 // (Requires restart)
 //
-// Flock ships "flock" rather than upstream Zellij's "default": it is the
-// "default" layout plus the flock-sidebar as a left-edge dock, which is what
-// makes agent status and session switching visible without any setup. Set this
-// to "default" for the plain upstream Zellij chrome, or to "compact" /
-// "classic" / "strider" for the other bundled layouts.
-default_layout "flock"
+// Left unset on purpose. While it is unset, Flock loads your own
+// `layouts/default.kdl` if you have written one, and only falls back to its
+// built-in "flock" layout — the default chrome plus the flock-sidebar as a
+// left-edge dock — when you have not. Setting this option would skip that
+// lookup and ignore your `default.kdl`.
+//
+// Set it to name a specific layout: "default" for the plain upstream Zellij
+// chrome with no sidebar, or "compact" / "classic" / "strider".
+//
+// default_layout "compact"
 
 // Choose the mode that zellij uses when starting up.
 // Default: normal

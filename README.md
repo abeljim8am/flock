@@ -106,7 +106,11 @@ coder_enabled "true"
 ssh_enabled "true"
 ```
 
-To get the plain upstream Zellij chrome instead, set `default_layout "default"`.
+Your own layouts take precedence over Flock's chrome. If you have a
+`~/.config/flock/layouts/default.kdl`, that is still what loads on startup — the
+built-in `flock` layout is only the fallback for when you have not written one.
+To get the plain upstream Zellij chrome with no sidebar, set
+`default_layout "default"`.
 
 Provider requirements:
 

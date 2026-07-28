@@ -6718,9 +6718,7 @@ Config {
         default_command: None,
         remote_backend: None,
         default_cwd: None,
-        default_layout: Some(
-            "flock",
-        ),
+        default_layout: None,
         layout_dir: None,
         theme_dir: None,
         mouse_mode: None,

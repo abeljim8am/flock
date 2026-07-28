@@ -847,40 +847,10 @@ mod setup_test {
     }
     #[test]
     fn cli_config_dir_finds_custom_default() {
-        // A user layout named after the *configured* `default_layout` shadows the
-        // built-in of the same name. Flock ships `default_layout "flock"`, so the
-        // file that wins here is `layouts/flock.kdl`.
-        let config_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("src")
-            .join("test-fixtures")
-            .join("config-dirs")
-            .join("custom-flock-layout");
-        let cli_args = CliArgs {
-            config_dir: Some(config_dir.clone()),
-            ..Default::default()
-        };
-        let (_, layout_info, _, _, _) = Setup::from_cli_args(&cli_args).unwrap();
-        let Some(LayoutInfo::File(layout_path, _)) = layout_info else {
-            panic!("layout info has unexpected format");
-        };
-        let expected = config_dir
-            .join("layouts")
-            .join("flock.kdl")
-            .canonicalize()
-            .unwrap();
-        assert_eq!(layout_path, expected.display().to_string());
-    }
-
-    #[test]
-    fn shipped_default_layout_shadows_a_users_default_kdl() {
-        // Pins the one user-visible regression from shipping
-        // `default_layout "flock"`: a config dir whose only layout is
-        // `layouts/default.kdl` no longer has that file loaded on startup,
-        // because resolution now looks for the name "flock" instead.
-        //
-        // This is intentional, not incidental — the built-in flock layout is what
-        // puts the sidebar on screen with no setup. Users who want their own
-        // `default.kdl` back set `default_layout "default"` in config.kdl.
+        // A user's own `layouts/default.kdl` is their startup layout. Flock's
+        // built-in `flock` fallback must not shadow it — that is the whole reason
+        // the fallback lives in layout resolution rather than in a shipped
+        // `default_layout` value.
         let config_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("src")
             .join("test-fixtures")
@@ -888,36 +858,6 @@ mod setup_test {
             .join("custom-default-layout");
         let cli_args = CliArgs {
             config_dir: Some(config_dir.clone()),
-            ..Default::default()
-        };
-        let (_, layout_info, _, _, _) = Setup::from_cli_args(&cli_args).unwrap();
-        assert_eq!(
-            layout_info,
-            Some(LayoutInfo::BuiltIn("flock".to_owned())),
-            "a user's default.kdl is shadowed by the shipped default_layout"
-        );
-    }
-
-    #[test]
-    fn a_user_set_default_layout_still_finds_their_default_kdl() {
-        // The escape hatch the test above names must actually work: with
-        // `default_layout "default"` in the user's own config.kdl, their
-        // `layouts/default.kdl` is loaded again.
-        let config_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("src")
-            .join("test-fixtures")
-            .join("config-dirs")
-            .join("custom-default-layout");
-        let cli_args = CliArgs {
-            config_dir: Some(config_dir.clone()),
-            config: Some(
-                PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                    .join("src")
-                    .join("test-fixtures")
-                    .join("config-dirs")
-                    .join("custom-default-layout")
-                    .join("opt-out-config.kdl"),
-            ),
             ..Default::default()
         };
         let (_, layout_info, _, _, _) = Setup::from_cli_args(&cli_args).unwrap();
@@ -930,6 +870,51 @@ mod setup_test {
             .canonicalize()
             .unwrap();
         assert_eq!(layout_path, expected.display().to_string());
+    }
+
+    #[test]
+    fn no_user_default_layout_falls_back_to_the_flock_builtin() {
+        // The other half: a config dir with a layouts/ directory but no
+        // `default.kdl` gets Flock's built-in `flock` layout (sidebar docked),
+        // not upstream Zellij's plain `default`.
+        let config_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("src")
+            .join("test-fixtures")
+            .join("config-dirs")
+            .join("no-default-layout");
+        let cli_args = CliArgs {
+            config_dir: Some(config_dir.clone()),
+            ..Default::default()
+        };
+        let (_, layout_info, _, _, _) = Setup::from_cli_args(&cli_args).unwrap();
+        assert_eq!(
+            layout_info,
+            Some(LayoutInfo::BuiltIn("flock".to_owned())),
+            "with no user default.kdl, the flock builtin is the startup layout"
+        );
+    }
+
+    #[test]
+    fn explicit_default_layout_still_selects_the_upstream_builtin() {
+        // The escape hatch to plain Zellij chrome: naming `default` explicitly
+        // must reach upstream's builtin, not be redirected to flock. Uses a
+        // fixture with no `default.kdl`, so the builtin is what resolves.
+        let config_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("src")
+            .join("test-fixtures")
+            .join("config-dirs")
+            .join("no-default-layout");
+        let cli_args = CliArgs {
+            config_dir: Some(config_dir.clone()),
+            config: Some(config_dir.join("opt-out-config.kdl")),
+            ..Default::default()
+        };
+        let (_, layout_info, _, _, _) = Setup::from_cli_args(&cli_args).unwrap();
+        assert_eq!(
+            layout_info,
+            Some(LayoutInfo::BuiltIn("default".to_owned())),
+            "an explicit default_layout must not be redirected to flock"
+        );
     }
 
     #[test]

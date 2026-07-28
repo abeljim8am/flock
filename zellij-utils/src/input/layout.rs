@@ -11,7 +11,10 @@
 #[cfg(not(target_family = "wasm"))]
 use crate::downloader::Downloader;
 use crate::{
-    data::{Direction, LayoutInfo, LayoutMetadata, LayoutParsingError, LayoutWithError},
+    data::{
+        Direction, LayoutInfo, LayoutMetadata, LayoutParsingError, LayoutWithError,
+        FALLBACK_BUILTIN_LAYOUT,
+    },
     home::{default_layout_dir, find_default_config_dir},
     input::{
         command::RunCommand,
@@ -1504,11 +1507,36 @@ impl Layout {
                     Layout::stringified_from_dir(layout_path, layout_dir.as_ref())
                 }
             },
-            None => Layout::stringified_from_dir(
-                &std::path::PathBuf::from("default"),
-                layout_dir.as_ref(),
-            ),
+            None => Layout::stringified_unspecified_default(layout_dir.as_ref()),
         }
+    }
+    /// The startup layout when the caller named none — no `--layout`, no
+    /// `default_layout`.
+    ///
+    /// A user's own `layouts/default.kdl` wins: that is the file people expect to
+    /// be their startup layout, and the upstream docs promise it. Only when they
+    /// have not written one does Flock fall back to its built-in
+    /// [`FALLBACK_BUILTIN_LAYOUT`] instead of upstream's plain `default`.
+    ///
+    /// Must stay in step with [`LayoutInfo::from_config`], which decides the
+    /// `LayoutInfo` for this same case — including checking both the
+    /// extensionless and `.kdl` candidates, so the two cannot disagree about
+    /// whether a user file exists.
+    fn stringified_unspecified_default(
+        layout_dir: Option<&PathBuf>,
+    ) -> Result<(String, String, Option<(String, String)>), ConfigError> {
+        let user_default_dir = layout_dir
+            .map(|dir| dir.to_path_buf())
+            .or_else(default_layout_dir);
+        if let Some(dir) = user_default_dir {
+            let candidate = dir.join("default");
+            for path in [candidate.clone(), candidate.with_extension("kdl")] {
+                if path.exists() {
+                    return Layout::stringified_from_path(&path);
+                }
+            }
+        }
+        Layout::stringified_from_default_assets(Path::new(FALLBACK_BUILTIN_LAYOUT))
     }
     #[cfg(not(target_family = "wasm"))]
     pub fn stringified_from_url(url: &str) -> Result<String, ConfigError> {
