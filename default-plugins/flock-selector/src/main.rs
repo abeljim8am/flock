@@ -181,7 +181,9 @@ struct State {
     ssh_notice: Option<String>,
     /// An open that would change something on the remote, waiting on its `y`.
     pending_start: Option<PendingStart>,
-    /// Host or workspace a Ctrl-r reinstall is running against.
+    /// A Ctrl-r force restart waiting on its explicit `y`.
+    pending_force_restart: Option<PendingForceRestart>,
+    /// Host or workspace a confirmed Ctrl-r restart is running against.
     pending_reinstall: Option<String>,
 }
 
@@ -202,6 +204,13 @@ struct PendingStart {
 enum PendingStartTarget {
     Coder { identifier: String },
     Ssh { host: ssh::SshHost },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PendingForceRestart {
+    prompt: String,
+    target: String,
+    argv: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -239,6 +248,37 @@ fn remote_upgrade_base_argv(executable: String) -> Vec<String> {
         "remote-upgrade".to_owned(),
         "--provider".to_owned(),
     ]
+}
+
+/// A successful reinstall can still leave the active daemon on its old build:
+/// it owns the live PTYs and cannot exit without closing them. Preserve that
+/// distinction in the picker instead of claiming that the displayed version
+/// should already have changed.
+fn reinstall_success_notice(target: &str, stderr: &[u8]) -> String {
+    let detail = String::from_utf8_lossy(stderr);
+    let last_line = detail
+        .lines()
+        .rev()
+        .map(str::trim)
+        .find(|line| !line.is_empty());
+    match last_line {
+        Some(line) if line.contains("live pane(s) remain on the previous daemon") => {
+            let panes = line
+                .split(" installed; ")
+                .nth(1)
+                .and_then(|suffix| suffix.split_whitespace().next())
+                .unwrap_or("live");
+            format!(
+                "Installed flock {VERSION} on {target}; {panes} pane(s) still use the previous daemon"
+            )
+        },
+        Some(line) if line.contains("running daemon did not accept the retire request") => {
+            format!(
+                "Installed flock {VERSION} on {target}; its live panes still use the previous daemon"
+            )
+        },
+        _ => format!("Installed and activated flock {VERSION} on {target}"),
+    }
 }
 
 #[cfg(test)]
@@ -566,6 +606,62 @@ mod tests {
     }
 
     #[test]
+    fn ctrl_r_requires_confirmation_and_requests_a_force_restart() {
+        let mut state = ssh_state_with_one_host();
+        state.flock_executable = Some("/opt/flock/bin/flock".into());
+
+        assert!(state.reinstall_selected_remote());
+        let pending = state
+            .pending_force_restart
+            .as_ref()
+            .expect("force restart confirmation");
+        assert!(pending.prompt.contains("closes its live remote panes"));
+        assert_eq!(
+            pending.argv,
+            [
+                "/opt/flock/bin/flock",
+                "remote-agent",
+                "remote-upgrade",
+                "--provider",
+                "ssh",
+                "--destination",
+                "abel@dev.example.com",
+                "--force",
+            ]
+        );
+
+        state.handle_pending_force_restart_key(KeyWithModifier::new(BareKey::Char('n')));
+        assert!(state.pending_force_restart.is_none());
+        assert!(state.pending_reinstall.is_none());
+    }
+
+    #[test]
+    fn reinstall_notice_does_not_claim_live_panes_were_upgraded() {
+        assert_eq!(
+            reinstall_success_notice(
+                "abeljim/api",
+                b"flock: Coder workspace abeljim/api installed; 3 live pane(s) remain on the previous daemon until they close\n",
+            ),
+            format!(
+                "Installed flock {VERSION} on abeljim/api; 3 pane(s) still use the previous daemon"
+            )
+        );
+        assert_eq!(
+            reinstall_success_notice(
+                "devbox",
+                b"flock: SSH host devbox installed, but the running daemon did not accept the retire request (EOF); its live panes remain on the previous build until that daemon restarts\n",
+            ),
+            format!(
+                "Installed flock {VERSION} on devbox; its live panes still use the previous daemon"
+            )
+        );
+        assert_eq!(
+            reinstall_success_notice("idle", b""),
+            format!("Installed and activated flock {VERSION} on idle")
+        );
+    }
+
+    #[test]
     fn coder_creation_keys_edit_filter_name_and_navigate_back() {
         let mut state = State {
             permissions_granted: true,
@@ -809,7 +905,7 @@ impl ZellijPlugin for State {
                 } else if let Some(target) = context.get(REINSTALL_CONTEXT_KEY) {
                     self.pending_reinstall = None;
                     let notice = if exit_code == Some(0) {
-                        format!("Reinstalled the flock agent on {target}")
+                        reinstall_success_notice(target, &stderr)
                     } else {
                         remote_bootstrap::classify_bootstrap_failure(
                             exit_code,
@@ -1049,7 +1145,15 @@ impl ZellijPlugin for State {
             pending_coder_stop: self.pending_coder_stop.as_deref(),
             coder_create: self.coder_create.as_ref(),
             coder_create_notice: self.coder_create_notice.as_deref(),
-            pending_start: self.pending_start.as_ref().map(|p| p.prompt.as_str()),
+            pending_start: self
+                .pending_force_restart
+                .as_ref()
+                .map(|pending| pending.prompt.as_str())
+                .or_else(|| {
+                    self.pending_start
+                        .as_ref()
+                        .map(|pending| pending.prompt.as_str())
+                }),
             pending_reinstall: self.pending_reinstall.as_deref(),
             remote_agent_versions: &remote_agent_versions,
             local_version: VERSION,
@@ -1220,6 +1324,9 @@ impl State {
         }
         if self.pending_ssh_delete.is_some() {
             return self.handle_ssh_delete_key(key);
+        }
+        if self.pending_force_restart.is_some() {
+            return self.handle_pending_force_restart_key(key);
         }
         if self.pending_start.is_some() {
             return self.handle_pending_start_key(key);
@@ -1954,12 +2061,11 @@ impl State {
         self.arm_spinner_timer();
     }
 
-    /// Reinstall the remote agent on the selected host (`Ctrl-r`). This is the
-    /// manual escape hatch for when health detection is wrong, or a remote is
-    /// wedged on a binary that the normal bootstrap would skip re-fetching
-    /// because its version directory already exists.
+    /// Arm a force reinstall/restart for the selected host (`Ctrl-r`). The
+    /// confirmation is mandatory because activating the new daemon terminates
+    /// every PTY and application owned by the old one.
     fn reinstall_selected_remote(&mut self) -> bool {
-        if self.pending_reinstall.is_some() {
+        if self.pending_reinstall.is_some() || self.pending_force_restart.is_some() {
             return false;
         }
         let Some(executable) = self.flock_executable.clone() else {
@@ -1995,13 +2101,32 @@ impl State {
             },
             _ => return false,
         };
-        let refs: Vec<&str> = argv.iter().map(String::as_str).collect();
-        run_command(
-            &refs,
-            BTreeMap::from_iter([(REINSTALL_CONTEXT_KEY.to_owned(), target.clone())]),
-        );
-        self.pending_reinstall = Some(target);
-        self.arm_spinner_timer();
+        argv.push("--force".to_owned());
+        self.pending_force_restart = Some(PendingForceRestart {
+            prompt: format!(
+                "force restart {target}?  closes its live remote panes and applications"
+            ),
+            target,
+            argv,
+        });
+        true
+    }
+
+    fn handle_pending_force_restart_key(&mut self, key: KeyWithModifier) -> bool {
+        let Some(pending) = self.pending_force_restart.take() else {
+            return false;
+        };
+        let confirm = key.has_no_modifiers()
+            && matches!(key.bare_key, BareKey::Char('y') | BareKey::Char('Y'));
+        if confirm {
+            let refs: Vec<&str> = pending.argv.iter().map(String::as_str).collect();
+            run_command(
+                &refs,
+                BTreeMap::from_iter([(REINSTALL_CONTEXT_KEY.to_owned(), pending.target.clone())]),
+            );
+            self.pending_reinstall = Some(pending.target);
+            self.arm_spinner_timer();
+        }
         true
     }
 

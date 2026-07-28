@@ -1244,13 +1244,17 @@ fn validate_agent_label(agent: &str) -> Result<()> {
 }
 
 /// Bring a remote host onto this build: reinstall the agent binary, then ask
-/// the running daemon to stand down so the next reconnect starts the new one.
+/// the running daemon to stand down once it no longer owns any live PTYs.
 ///
-/// This is what makes the sidebar's confirm honest. Nothing here closes a pane:
-/// the daemon keeps serving until its panes drain on their own, each bridge
-/// reconnects at its saved cursor, and a failed reinstall leaves the old daemon
+/// Nothing here closes a pane. Consequently an in-use daemon cannot activate
+/// the new binary immediately: it keeps serving its existing PTYs and exits
+/// only after the last pane closes. A failed reinstall leaves the old daemon
 /// exactly as it was.
-pub fn remote_upgrade(transport: RemoteTransport, reinstall_script: &str) -> Result<()> {
+pub fn remote_upgrade(
+    transport: RemoteTransport,
+    reinstall_script: &str,
+    force: bool,
+) -> Result<()> {
     let mut install = transport.script_command(reinstall_script);
     let output = install
         .stdin(Stdio::null())
@@ -1268,6 +1272,14 @@ pub fn remote_upgrade(transport: RemoteTransport, reinstall_script: &str) -> Res
             .unwrap_or("remote install failed");
         bail!("{detail}");
     }
+    if force {
+        request_force_restart(&transport)?;
+        eprintln!(
+            "flock: {} installed and activated; the previous daemon and its live panes were terminated",
+            transport.label()
+        );
+        return Ok(());
+    }
     // The reinstall is the part that must succeed. Retirement is best-effort:
     // if the daemon is already gone, or refuses the message because it predates
     // it, the new binary is still installed and the next connect picks it up.
@@ -1275,7 +1287,7 @@ pub fn remote_upgrade(transport: RemoteTransport, reinstall_script: &str) -> Res
         Ok(panes_held) => {
             if panes_held > 0 {
                 eprintln!(
-                    "flock: {} upgraded; the daemon retires when its last {panes_held} pane(s) close",
+                    "flock: {} installed; {panes_held} live pane(s) remain on the previous daemon until they close",
                     transport.label()
                 );
             }
@@ -1283,12 +1295,107 @@ pub fn remote_upgrade(transport: RemoteTransport, reinstall_script: &str) -> Res
         },
         Err(error) => {
             eprintln!(
-                "flock: {} upgraded, but the daemon did not accept the retire request ({error:#}); it will pick up the new build on its next restart",
+                "flock: {} installed, but the running daemon did not accept the retire request ({error:#}); its live panes remain on the previous build until that daemon restarts",
                 transport.label()
             );
             Ok(())
         },
     }
+}
+
+/// Run the newly installed binary on the remote host to terminate the daemon
+/// behind its private socket. This command is intentionally separate from the
+/// transport bridge: killing the daemon drops every bridge connection.
+fn request_force_restart(transport: &RemoteTransport) -> Result<()> {
+    let script = r#"exec "$HOME/.local/share/flock/current/flock" remote-agent force-restart"#;
+    let mut command = transport.script_command(script);
+    let output = command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .with_context(|| format!("force restart the {} daemon", transport.label()))?;
+    if output.status.success() {
+        return Ok(());
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let detail = stderr
+        .lines()
+        .rev()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .unwrap_or("remote daemon restart failed");
+    bail!("{detail}")
+}
+
+/// Terminate the daemon listening on `socket`. The peer PID comes from kernel
+/// credentials on the connected Unix socket; no process-name search or pidfile
+/// can accidentally target an unrelated process. Existing PTYs die with the
+/// daemon, and their local bridges reconnect through the newly installed
+/// binary, creating fresh remote shells.
+pub fn force_restart(socket: Option<PathBuf>) -> Result<()> {
+    require_supported_platform()?;
+    let socket = socket.unwrap_or(default_socket_path()?);
+    let mut stream = match UnixStream::connect(&socket) {
+        Ok(stream) => stream,
+        Err(error)
+            if matches!(
+                error.kind(),
+                io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused
+            ) =>
+        {
+            return Ok(());
+        },
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("connect to remote-agent at {}", socket.display()));
+        },
+    };
+    let pid = peer_pid(&stream).context("remote-agent socket did not expose its daemon pid")?;
+    validate_force_restart_target(&mut stream)?;
+    terminate_daemon(pid)
+}
+
+fn validate_force_restart_target(stream: &mut UnixStream) -> Result<()> {
+    write_frame(
+        &mut *stream,
+        &ClientMessage::Hello {
+            protocol: PROTOCOL_VERSION,
+            client_version: env!("CARGO_PKG_VERSION").into(),
+        },
+    )?;
+    match read_frame::<_, ServerMessage>(stream)? {
+        ServerMessage::Hello { .. } => Ok(()),
+        ServerMessage::Error { message } if message.contains("incompatible protocol") => Ok(()),
+        response => bail!("unexpected remote-agent handshake: {response:?}"),
+    }
+}
+
+fn terminate_daemon(pid: libc::pid_t) -> Result<()> {
+    if pid <= 1 || pid == std::process::id() as libc::pid_t {
+        bail!("refusing to terminate invalid daemon pid {pid}");
+    }
+    if unsafe { libc::kill(pid, libc::SIGTERM) } != 0 {
+        let error = io::Error::last_os_error();
+        if error.raw_os_error() != Some(libc::ESRCH) {
+            return Err(error).context("terminate the remote-agent daemon");
+        }
+        return Ok(());
+    }
+    let started = Instant::now();
+    while started.elapsed() < Duration::from_secs(3) {
+        if !process_is_alive(pid) {
+            return Ok(());
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
+    if unsafe { libc::kill(pid, libc::SIGKILL) } != 0 {
+        let error = io::Error::last_os_error();
+        if error.raw_os_error() != Some(libc::ESRCH) {
+            return Err(error).context("kill the unresponsive remote-agent daemon");
+        }
+    }
+    Ok(())
 }
 
 /// Ask the daemon to retire, returning how many panes it is still holding.
@@ -2559,6 +2666,46 @@ mod tests {
             read_frame::<_, ServerMessage>(&mut state_bytes.as_slice()).unwrap(),
             state_message
         );
+    }
+
+    #[test]
+    fn force_restart_only_accepts_a_remote_agent_handshake() {
+        let (mut client, mut server) = UnixStream::pair().unwrap();
+        let daemon = thread::spawn(move || {
+            let hello: ClientMessage = read_frame(&mut server).unwrap();
+            assert!(matches!(
+                hello,
+                ClientMessage::Hello {
+                    protocol: PROTOCOL_VERSION,
+                    ..
+                }
+            ));
+            write_frame(
+                &mut server,
+                &ServerMessage::Hello {
+                    protocol: PROTOCOL_VERSION,
+                    agent_version: "26.10.0".into(),
+                },
+            )
+            .unwrap();
+        });
+        validate_force_restart_target(&mut client).unwrap();
+        daemon.join().unwrap();
+
+        let (mut client, mut server) = UnixStream::pair().unwrap();
+        let impostor = thread::spawn(move || {
+            let _: ClientMessage = read_frame(&mut server).unwrap();
+            write_frame(
+                &mut server,
+                &ServerMessage::PaneClosed {
+                    pane_id: Uuid::new_v4(),
+                },
+            )
+            .unwrap();
+        });
+        assert!(validate_force_restart_target(&mut client).is_err());
+        impostor.join().unwrap();
+        assert!(terminate_daemon(1).is_err());
     }
 
     #[test]
