@@ -5,6 +5,29 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
 
 ## [Unreleased]
+* feat(selector): make an empty project list explain itself instead of just
+  reporting that it is empty. Flock deliberately does not go hunting for projects
+  on its own, so on a fresh install the empty list is the first screen a new user
+  sees — it is now the setup instructions:
+
+  ```
+   no project folders configured
+   add them to your config.kdl:
+       flock {
+           root_dirs "~/src" "~/work"
+       }
+   then reopen the selector
+  ```
+
+  A configured list that still finds nothing now names the likely cause rather
+  than reporting "no projects found" alone: `root_dirs` is scanned one level deep,
+  so pointing it at a project instead of the folder containing it finds nothing,
+  and `individual_dirs` is the option for a folder that is itself a project.
+
+  Both blocks fall back to a single line that still names the fix when the pane is
+  too short for the full form, rather than truncating mid-snippet. A search with
+  no matches stays a plain status line — mid-search is not the moment for setup
+  instructions.
 * feat(cli): bare `flock` opens the project selector instead of dropping into a
   shell, and `flock pick` (alias `flock p`) opens it on demand.
 

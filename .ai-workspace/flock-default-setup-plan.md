@@ -161,15 +161,27 @@ once a stale picker snapshot existed.
 This is load-bearing: with no auto-discovery and the selector as the startup
 screen, the unconfigured empty state is the first thing every new user sees.
 
-- Replace `" no project folders configured"` (`ui.rs:291`) with actionable text
-  that names the fix.
-- Add an in-app "add a project folder" action that writes to the user's
-  `flock { }` block. Precedent already exists in the SSH tab:
-  `" no saved SSH hosts — Ctrl-o adds one"` (`ui.rs:333`).
+- Replaced `" no project folders configured"` with a multi-row block that names
+  the file, shows the `flock { root_dirs ... }` snippet, and says to reopen the
+  selector. Degrades to a single line that still names the fix when the pane is
+  too short, rather than truncating mid-snippet.
+- Also rewrote the *configured-but-empty* state, which was `" no projects found"`.
+  It now names the likely cause: `root_dirs` is scanned one level deep, so
+  pointing it at a project rather than its parent finds nothing, and
+  `individual_dirs` is the option for a folder that is itself a project.
 
-Result: a fresh install shows a picker that explains itself and gets you
-configured in a few keystrokes — without scanning the filesystem behind the
-user's back.
+**The in-app "add a project folder" action was dropped, deliberately.** The only
+way a plugin can persist to `config.kdl` is `reconfigure`, which rewrites the
+whole file from the serialized config — it backs the old one up and prepends a
+pointer to the backup, but comments and formatting do not survive in the live
+file. It also needs a new `Reconfigure` permission (a one-time dialog for every
+existing user), and for a declaratively-managed config it would replace the
+symlink and break the manager. Paying all that to save one paste, on a file the
+user owns and we document with comments, is the wrong trade. Revisit only if the
+`flock { }` block can be patched surgically with comments preserved.
+
+Result: a fresh install shows a picker that explains itself — without scanning the
+filesystem behind the user's back, and without rewriting a file the user owns.
 
 ## Phase 4 — docs and diagnostics
 
