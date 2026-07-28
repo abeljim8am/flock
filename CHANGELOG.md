@@ -5,6 +5,8 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
 
 ## [Unreleased]
+
+## [26.10.1] - 2026-07-28
 * fix(remote): make the sidebar's upgrade confirmation mouse-reachable, report
   installed-but-still-running old daemons honestly, and add a confirmed Ctrl-R
   force restart in the selector for activating a new daemon at the explicit
