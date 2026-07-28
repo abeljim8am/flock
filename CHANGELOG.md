@@ -5,6 +5,33 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
 
 ## [Unreleased]
+* feat(config): add a `flock { }` configuration section — one place to tell Flock
+  where your projects are and which remote providers to offer.
+
+  ```kdl
+  flock {
+      root_dirs "~/src" "~/work"
+      individual_dirs "~/dotfiles"
+      devcontainers true
+      ssh true
+  }
+  ```
+
+  The values are merged in *underneath* the `flock-selector` and `flock-sidebar`
+  plugin aliases, so the selector, the `Super s` keybinding and the sidebar in
+  every session all derive from the same source, while anything stated on a
+  plugin or in a layout still wins and can opt out.
+
+  The config names read better than the plugin args they translate to —
+  `devcontainers true` rather than `devcontainers_enabled "true"`, and a real
+  list rather than a `;`-joined string. Both spellings are accepted for lists and
+  flags, so a value copied out of a layout works. An unrecognized key in the
+  block is a parse error rather than a silent skip, since a typo would otherwise
+  leave the selector mysteriously empty.
+
+  Layouts that name `zellij:flock-selector` / `zellij:flock-sidebar` *directly*
+  rather than by alias do not pick the section up, and keep whatever args they
+  state.
 * feat(setup): make a fresh install land in Flock rather than in plain Zellij.
   Everything that distinguishes Flock — the sidebar dock, the project selector,
   agent status — was previously opt-in through hand-authored KDL, so `flock` with
