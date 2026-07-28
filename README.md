@@ -50,26 +50,63 @@ cargo xtask run
 cargo xtask test
 ```
 
-## Enable Flock
+## Configure Flock
 
-The bundled `flock-selector` and `flock-sidebar` layouts work out of the box.
-Remote providers are opt-in:
+Flock works with no configuration: it starts with the sidebar docked to the left
+edge, and `Super s` opens the project selector. The one thing it cannot guess is
+where your projects live.
+
+Point it at them in `~/.config/flock/config.kdl` by giving the bundled
+`flock-selector` alias its folder args:
 
 ```kdl
-plugin location="zellij:flock-selector" {
-    root_dirs "~/src"
-    codespaces_enabled "true"
-    devcontainers_enabled "true"
-    coder_enabled "true"
-}
-
-plugin location="zellij:flock-sidebar" {
-    root_dirs "~/src"
-    codespaces_enabled "true"
-    devcontainers_enabled "true"
-    coder_enabled "true"
+plugins {
+    flock-selector location="zellij:flock-selector" {
+        cwd "/"
+        root_dirs "~/src;~/work"      // each scanned one level deep
+        individual_dirs "~/dotfiles"  // each is itself one project
+    }
+    flock-sidebar location="zellij:flock-sidebar" {
+        cwd "/"
+        root_dirs "~/src;~/work"
+        individual_dirs "~/dotfiles"
+    }
 }
 ```
+
+These are *aliases*, so this is the only place the args are stated — the bundled
+layouts, the `Super s` keybinding, and the sidebar in each project session all
+resolve through them. Run `flock setup --dump-config` to see the shipped defaults
+with every option documented inline.
+
+If `Super s` does nothing, your terminal is intercepting `Super` (Cmd on macOS)
+before Flock sees it. Bind a key that does reach the app — this adds to the
+shipped binding rather than replacing it, which is harmless:
+
+```kdl
+keybinds {
+    shared_except "locked" {
+        bind "Alt s" {
+            LaunchOrFocusPlugin "flock-selector" {
+                floating true
+                move_to_focused_tab true
+            };
+        }
+    }
+}
+```
+
+Remote providers are opt-in, because each needs an authenticated CLI on `PATH`.
+Add them to the aliases above:
+
+```kdl
+codespaces_enabled "true"
+devcontainers_enabled "true"
+coder_enabled "true"
+ssh_enabled "true"
+```
+
+To get the plain upstream Zellij chrome instead, set `default_layout "default"`.
 
 Provider requirements:
 

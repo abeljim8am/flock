@@ -172,6 +172,12 @@ keybinds clear-defaults=true {
         bind "Alt p" { TogglePaneInGroup; }
         bind "Alt Shift p" { ToggleGroupMarking; }
         bind "Ctrl q" { Quit; }
+        bind "Super s" {
+            LaunchOrFocusPlugin "flock-selector" {
+                floating true
+                move_to_focused_tab true
+            }
+        }
     }
     shared_except "locked" "move" {
         bind "Ctrl h" { SwitchToMode "move"; }
@@ -270,6 +276,12 @@ plugins {
     filepicker location="zellij:strider" {
         cwd "/"
     }
+    flock-selector location="zellij:flock-selector" {
+        cwd "/"
+    }
+    flock-sidebar location="zellij:flock-sidebar" {
+        cwd "/"
+    }
     plugin-manager location="zellij:plugin-manager"
     session-manager location="zellij:session-manager"
     status-bar location="zellij:status-bar"
@@ -336,7 +348,7 @@ web_client {
 // The name of the default layout to load on startup
 // Default: "default"
 // 
-// default_layout "compact"
+default_layout "flock"
  
 // The folder in which Zellij will look for layouts
 // (Requires restart)

@@ -5,6 +5,28 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
 
 ## [Unreleased]
+* feat(setup): make a fresh install land in Flock rather than in plain Zellij.
+  Everything that distinguishes Flock — the sidebar dock, the project selector,
+  agent status — was previously opt-in through hand-authored KDL, so `flock` with
+  no config behaved exactly like upstream `zellij`. Now:
+  - `default_layout` ships as `"flock"` (the default chrome plus the sidebar as a
+    left-edge dock) instead of being unset.
+  - `Super s` opens the project selector.
+  - `flock-selector` and `flock-sidebar` are registered as plugin aliases, so
+    their folder args are stated **once** in `config.kdl` and reach the bundled
+    layouts, the keybinding, and each project session's sidebar alike. The
+    bundled layouts now reference those aliases instead of restating args, which
+    removes by construction the arg-set disagreement that made a keybinding
+    launch a second selector.
+  - Sessions created from the selector default to the `flock` layout, so a
+    project opened through Flock has the sidebar. Previously they got Zellij's
+    `default` layout with no way back to the selector.
+
+  **Breaking:** a custom `~/.config/flock/layouts/default.kdl` is no longer
+  loaded on startup, because layout resolution now looks for the name `flock`.
+  Set `default_layout "default"` in your `config.kdl` to get it back, or rename
+  the file to `flock.kdl`. Setting `default_layout` to any explicit value has
+  always taken precedence and still does.
 
 ## [26.10.1] - 2026-07-28
 * fix(remote): make the sidebar's upgrade confirmation mouse-reachable, report

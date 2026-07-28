@@ -344,6 +344,35 @@ Config {
             ],
             KeyWithModifier {
                 bare_key: Char(
+                    's',
+                ),
+                key_modifiers: {
+                    Super,
+                },
+            }: [
+                LaunchOrFocusPlugin {
+                    plugin: Alias(
+                        PluginAlias {
+                            name: "flock-selector",
+                            configuration: Some(
+                                PluginUserConfiguration(
+                                    {},
+                                ),
+                            ),
+                            initial_cwd: None,
+                            run_plugin: None,
+                        },
+                    ),
+                    should_float: true,
+                    move_to_focused_tab: true,
+                    should_open_in_place: false,
+                    close_replaced_pane: false,
+                    skip_cache: false,
+                    tab_id: None,
+                },
+            ],
+            KeyWithModifier {
+                bare_key: Char(
                     't',
                 ),
                 key_modifiers: {
@@ -886,6 +915,35 @@ Config {
             }: [
                 SwitchToMode {
                     input_mode: Scroll,
+                },
+            ],
+            KeyWithModifier {
+                bare_key: Char(
+                    's',
+                ),
+                key_modifiers: {
+                    Super,
+                },
+            }: [
+                LaunchOrFocusPlugin {
+                    plugin: Alias(
+                        PluginAlias {
+                            name: "flock-selector",
+                            configuration: Some(
+                                PluginUserConfiguration(
+                                    {},
+                                ),
+                            ),
+                            initial_cwd: None,
+                            run_plugin: None,
+                        },
+                    ),
+                    should_float: true,
+                    move_to_focused_tab: true,
+                    should_open_in_place: false,
+                    close_replaced_pane: false,
+                    skip_cache: false,
+                    tab_id: None,
                 },
             ],
             KeyWithModifier {
@@ -1446,6 +1504,35 @@ Config {
             }: [
                 SwitchToMode {
                     input_mode: Scroll,
+                },
+            ],
+            KeyWithModifier {
+                bare_key: Char(
+                    's',
+                ),
+                key_modifiers: {
+                    Super,
+                },
+            }: [
+                LaunchOrFocusPlugin {
+                    plugin: Alias(
+                        PluginAlias {
+                            name: "flock-selector",
+                            configuration: Some(
+                                PluginUserConfiguration(
+                                    {},
+                                ),
+                            ),
+                            initial_cwd: None,
+                            run_plugin: None,
+                        },
+                    ),
+                    should_float: true,
+                    move_to_focused_tab: true,
+                    should_open_in_place: false,
+                    close_replaced_pane: false,
+                    skip_cache: false,
+                    tab_id: None,
                 },
             ],
             KeyWithModifier {
@@ -2103,6 +2190,35 @@ Config {
             ],
             KeyWithModifier {
                 bare_key: Char(
+                    's',
+                ),
+                key_modifiers: {
+                    Super,
+                },
+            }: [
+                LaunchOrFocusPlugin {
+                    plugin: Alias(
+                        PluginAlias {
+                            name: "flock-selector",
+                            configuration: Some(
+                                PluginUserConfiguration(
+                                    {},
+                                ),
+                            ),
+                            initial_cwd: None,
+                            run_plugin: None,
+                        },
+                    ),
+                    should_float: true,
+                    move_to_focused_tab: true,
+                    should_open_in_place: false,
+                    close_replaced_pane: false,
+                    skip_cache: false,
+                    tab_id: None,
+                },
+            ],
+            KeyWithModifier {
+                bare_key: Char(
                     't',
                 ),
                 key_modifiers: {
@@ -2612,6 +2728,35 @@ Config {
             ],
             KeyWithModifier {
                 bare_key: Char(
+                    's',
+                ),
+                key_modifiers: {
+                    Super,
+                },
+            }: [
+                LaunchOrFocusPlugin {
+                    plugin: Alias(
+                        PluginAlias {
+                            name: "flock-selector",
+                            configuration: Some(
+                                PluginUserConfiguration(
+                                    {},
+                                ),
+                            ),
+                            initial_cwd: None,
+                            run_plugin: None,
+                        },
+                    ),
+                    should_float: true,
+                    move_to_focused_tab: true,
+                    should_open_in_place: false,
+                    close_replaced_pane: false,
+                    skip_cache: false,
+                    tab_id: None,
+                },
+            ],
+            KeyWithModifier {
+                bare_key: Char(
                     't',
                 ),
                 key_modifiers: {
@@ -2995,6 +3140,35 @@ Config {
             }: [
                 SwitchToMode {
                     input_mode: Scroll,
+                },
+            ],
+            KeyWithModifier {
+                bare_key: Char(
+                    's',
+                ),
+                key_modifiers: {
+                    Super,
+                },
+            }: [
+                LaunchOrFocusPlugin {
+                    plugin: Alias(
+                        PluginAlias {
+                            name: "flock-selector",
+                            configuration: Some(
+                                PluginUserConfiguration(
+                                    {},
+                                ),
+                            ),
+                            initial_cwd: None,
+                            run_plugin: None,
+                        },
+                    ),
+                    should_float: true,
+                    move_to_focused_tab: true,
+                    should_open_in_place: false,
+                    close_replaced_pane: false,
+                    skip_cache: false,
+                    tab_id: None,
                 },
             ],
             KeyWithModifier {
@@ -3503,6 +3677,35 @@ Config {
             ],
             KeyWithModifier {
                 bare_key: Char(
+                    's',
+                ),
+                key_modifiers: {
+                    Super,
+                },
+            }: [
+                LaunchOrFocusPlugin {
+                    plugin: Alias(
+                        PluginAlias {
+                            name: "flock-selector",
+                            configuration: Some(
+                                PluginUserConfiguration(
+                                    {},
+                                ),
+                            ),
+                            initial_cwd: None,
+                            run_plugin: None,
+                        },
+                    ),
+                    should_float: true,
+                    move_to_focused_tab: true,
+                    should_open_in_place: false,
+                    close_replaced_pane: false,
+                    skip_cache: false,
+                    tab_id: None,
+                },
+            ],
+            KeyWithModifier {
+                bare_key: Char(
                     't',
                 ),
                 key_modifiers: {
@@ -3900,6 +4103,35 @@ Config {
             ],
             KeyWithModifier {
                 bare_key: Char(
+                    's',
+                ),
+                key_modifiers: {
+                    Super,
+                },
+            }: [
+                LaunchOrFocusPlugin {
+                    plugin: Alias(
+                        PluginAlias {
+                            name: "flock-selector",
+                            configuration: Some(
+                                PluginUserConfiguration(
+                                    {},
+                                ),
+                            ),
+                            initial_cwd: None,
+                            run_plugin: None,
+                        },
+                    ),
+                    should_float: true,
+                    move_to_focused_tab: true,
+                    should_open_in_place: false,
+                    close_replaced_pane: false,
+                    skip_cache: false,
+                    tab_id: None,
+                },
+            ],
+            KeyWithModifier {
+                bare_key: Char(
                     't',
                 ),
                 key_modifiers: {
@@ -4276,6 +4508,35 @@ Config {
             }: [
                 SwitchToMode {
                     input_mode: Scroll,
+                },
+            ],
+            KeyWithModifier {
+                bare_key: Char(
+                    's',
+                ),
+                key_modifiers: {
+                    Super,
+                },
+            }: [
+                LaunchOrFocusPlugin {
+                    plugin: Alias(
+                        PluginAlias {
+                            name: "flock-selector",
+                            configuration: Some(
+                                PluginUserConfiguration(
+                                    {},
+                                ),
+                            ),
+                            initial_cwd: None,
+                            run_plugin: None,
+                        },
+                    ),
+                    should_float: true,
+                    move_to_focused_tab: true,
+                    should_open_in_place: false,
+                    close_replaced_pane: false,
+                    skip_cache: false,
+                    tab_id: None,
                 },
             ],
             KeyWithModifier {
@@ -4812,6 +5073,35 @@ Config {
             ],
             KeyWithModifier {
                 bare_key: Char(
+                    's',
+                ),
+                key_modifiers: {
+                    Super,
+                },
+            }: [
+                LaunchOrFocusPlugin {
+                    plugin: Alias(
+                        PluginAlias {
+                            name: "flock-selector",
+                            configuration: Some(
+                                PluginUserConfiguration(
+                                    {},
+                                ),
+                            ),
+                            initial_cwd: None,
+                            run_plugin: None,
+                        },
+                    ),
+                    should_float: true,
+                    move_to_focused_tab: true,
+                    should_open_in_place: false,
+                    close_replaced_pane: false,
+                    skip_cache: false,
+                    tab_id: None,
+                },
+            ],
+            KeyWithModifier {
+                bare_key: Char(
                     't',
                 ),
                 key_modifiers: {
@@ -5315,6 +5605,35 @@ Config {
             ],
             KeyWithModifier {
                 bare_key: Char(
+                    's',
+                ),
+                key_modifiers: {
+                    Super,
+                },
+            }: [
+                LaunchOrFocusPlugin {
+                    plugin: Alias(
+                        PluginAlias {
+                            name: "flock-selector",
+                            configuration: Some(
+                                PluginUserConfiguration(
+                                    {},
+                                ),
+                            ),
+                            initial_cwd: None,
+                            run_plugin: None,
+                        },
+                    ),
+                    should_float: true,
+                    move_to_focused_tab: true,
+                    should_open_in_place: false,
+                    close_replaced_pane: false,
+                    skip_cache: false,
+                    tab_id: None,
+                },
+            ],
+            KeyWithModifier {
+                bare_key: Char(
                     't',
                 ),
                 key_modifiers: {
@@ -5686,6 +6005,35 @@ Config {
             }: [
                 SwitchToMode {
                     input_mode: Scroll,
+                },
+            ],
+            KeyWithModifier {
+                bare_key: Char(
+                    's',
+                ),
+                key_modifiers: {
+                    Super,
+                },
+            }: [
+                LaunchOrFocusPlugin {
+                    plugin: Alias(
+                        PluginAlias {
+                            name: "flock-selector",
+                            configuration: Some(
+                                PluginUserConfiguration(
+                                    {},
+                                ),
+                            ),
+                            initial_cwd: None,
+                            run_plugin: None,
+                        },
+                    ),
+                    should_float: true,
+                    move_to_focused_tab: true,
+                    should_open_in_place: false,
+                    close_replaced_pane: false,
+                    skip_cache: false,
+                    tab_id: None,
                 },
             ],
             KeyWithModifier {
@@ -6281,6 +6629,35 @@ Config {
             ],
             KeyWithModifier {
                 bare_key: Char(
+                    's',
+                ),
+                key_modifiers: {
+                    Super,
+                },
+            }: [
+                LaunchOrFocusPlugin {
+                    plugin: Alias(
+                        PluginAlias {
+                            name: "flock-selector",
+                            configuration: Some(
+                                PluginUserConfiguration(
+                                    {},
+                                ),
+                            ),
+                            initial_cwd: None,
+                            run_plugin: None,
+                        },
+                    ),
+                    should_float: true,
+                    move_to_focused_tab: true,
+                    should_open_in_place: false,
+                    close_replaced_pane: false,
+                    skip_cache: false,
+                    tab_id: None,
+                },
+            ],
+            KeyWithModifier {
+                bare_key: Char(
                     't',
                 ),
                 key_modifiers: {
@@ -6341,7 +6718,9 @@ Config {
         default_command: None,
         remote_backend: None,
         default_cwd: None,
-        default_layout: None,
+        default_layout: Some(
+            "flock",
+        ),
         layout_dir: None,
         theme_dir: None,
         mouse_mode: None,
@@ -6426,6 +6805,34 @@ Config {
                 location: Zellij(
                     PluginTag(
                         "strider",
+                    ),
+                ),
+                configuration: PluginUserConfiguration(
+                    {},
+                ),
+                initial_cwd: Some(
+                    "/",
+                ),
+            },
+            "flock-selector": RunPlugin {
+                _allow_exec_host_cmd: false,
+                location: Zellij(
+                    PluginTag(
+                        "flock-selector",
+                    ),
+                ),
+                configuration: PluginUserConfiguration(
+                    {},
+                ),
+                initial_cwd: Some(
+                    "/",
+                ),
+            },
+            "flock-sidebar": RunPlugin {
+                _allow_exec_host_cmd: false,
+                location: Zellij(
+                    PluginTag(
+                        "flock-sidebar",
                     ),
                 ),
                 configuration: PluginUserConfiguration(

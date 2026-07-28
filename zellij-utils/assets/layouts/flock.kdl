@@ -9,8 +9,12 @@ layout {
     // owns which one is in effect (Alt b toggles it) and clamps both so the
     // content area always stays usable. `closed_size` must stay under the
     // sidebar's 16-column label threshold for the rail to render.
+    //
+    // Referenced through the `flock-sidebar` alias (not `zellij:flock-sidebar`)
+    // so the folder args a user adds to that alias in config.kdl reach the
+    // sidebar here without editing this layout.
     dock size=40 closed_size=5 {
-        plugin location="zellij:flock-sidebar"
+        plugin location="flock-sidebar"
     }
     pane size=1 borderless=true {
         plugin location="tab-bar"

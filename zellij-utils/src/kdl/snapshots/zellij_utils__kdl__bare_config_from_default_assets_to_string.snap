@@ -172,6 +172,12 @@ keybinds clear-defaults=true {
         bind "Alt p" { TogglePaneInGroup; }
         bind "Alt Shift p" { ToggleGroupMarking; }
         bind "Ctrl q" { Quit; }
+        bind "Super s" {
+            LaunchOrFocusPlugin "flock-selector" {
+                floating true
+                move_to_focused_tab true
+            }
+        }
     }
     shared_except "locked" "move" {
         bind "Ctrl h" { SwitchToMode "move"; }
@@ -267,6 +273,12 @@ plugins {
     filepicker location="zellij:strider" {
         cwd "/"
     }
+    flock-selector location="zellij:flock-selector" {
+        cwd "/"
+    }
+    flock-sidebar location="zellij:flock-sidebar" {
+        cwd "/"
+    }
     plugin-manager location="zellij:plugin-manager"
     session-manager location="zellij:session-manager"
     status-bar location="zellij:status-bar"
@@ -282,4 +294,5 @@ load_plugins {
 web_client {
     font "monospace"
 }
+default_layout "flock"
 

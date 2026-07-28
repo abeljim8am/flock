@@ -99,7 +99,9 @@ Config {
         default_command: None,
         remote_backend: None,
         default_cwd: None,
-        default_layout: None,
+        default_layout: Some(
+            "flock",
+        ),
         layout_dir: None,
         theme_dir: None,
         mouse_mode: None,
@@ -184,6 +186,34 @@ Config {
                 location: Zellij(
                     PluginTag(
                         "strider",
+                    ),
+                ),
+                configuration: PluginUserConfiguration(
+                    {},
+                ),
+                initial_cwd: Some(
+                    "/",
+                ),
+            },
+            "flock-selector": RunPlugin {
+                _allow_exec_host_cmd: false,
+                location: Zellij(
+                    PluginTag(
+                        "flock-selector",
+                    ),
+                ),
+                configuration: PluginUserConfiguration(
+                    {},
+                ),
+                initial_cwd: Some(
+                    "/",
+                ),
+            },
+            "flock-sidebar": RunPlugin {
+                _allow_exec_host_cmd: false,
+                location: Zellij(
+                    PluginTag(
+                        "flock-sidebar",
                     ),
                 ),
                 configuration: PluginUserConfiguration(

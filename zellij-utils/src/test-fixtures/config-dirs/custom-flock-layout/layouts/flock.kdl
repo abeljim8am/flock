@@ -1,0 +1,9 @@
+// A user layout shadowing the built-in "flock" layout that Flock ships as
+// `default_layout`. Deliberately has no dock, so it is distinguishable from the
+// built-in one it overrides.
+layout {
+    pane size=1 borderless=true {
+        plugin location="tab-bar"
+    }
+    pane
+}
