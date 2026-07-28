@@ -198,7 +198,7 @@ impl ZellijPlugin for State {
         // - ChangeApplicationState: switch session / focus pane on activation,
         //   resize our pane, and publish cross-session sidebar state
         // - ReadCliPipes: agent hook reports via `zellij pipe` (Phase 5)
-        // - RunCommands: `flock remote-upgrade` from a remote-issue row
+        // - RunCommands: `flock remote-agent remote-upgrade` from a remote-issue row
         request_permission(&[
             PermissionType::ReadApplicationState,
             PermissionType::ReadPaneContents,
@@ -841,10 +841,11 @@ impl State {
             .is_some_and(|issue| issue.kind.is_actionable())
     }
 
-    /// Run `flock remote-upgrade` for a session's remote backend: reinstall the
-    /// agent, retire the daemon once its panes drain, and let each bridge
-    /// reconnect at its saved cursor. The panes stay open throughout — this is
-    /// why the confirm can honestly promise "reconnect" rather than "close".
+    /// Run `flock remote-agent remote-upgrade` for a session's remote backend:
+    /// reinstall the agent, retire the daemon once its panes drain, and let
+    /// each bridge reconnect at its saved cursor. The panes stay open
+    /// throughout — this is why the confirm can honestly promise "reconnect"
+    /// rather than "close".
     fn start_upgrade(&mut self, session: &str) {
         let Some(backend) = self
             .visible_sessions()
@@ -1181,11 +1182,13 @@ impl State {
 /// so its result lands on the right row.
 const UPGRADE_CONTEXT_KEY: &str = "flock_remote_upgrade";
 
-/// The `flock remote-upgrade` argv for a session's backend. Devcontainers are
-/// rebuilt rather than upgraded in place, so they are deliberately excluded.
+/// The `flock remote-agent remote-upgrade` argv for a session's backend.
+/// Devcontainers are rebuilt rather than upgraded in place, so they are
+/// deliberately excluded.
 fn remote_upgrade_argv(backend: &RemoteBackend, executable: Option<&str>) -> Option<Vec<String>> {
     let mut argv = vec![
         executable?.to_owned(),
+        "remote-agent".to_owned(),
         "remote-upgrade".to_owned(),
         "--provider".to_owned(),
     ];
@@ -1406,6 +1409,27 @@ mod tests {
             sessionizer: SessionizerConfig::from_args(&configuration),
             ..State::default()
         }
+    }
+
+    #[test]
+    fn remote_upgrade_argv_uses_the_nested_remote_agent_command() {
+        let backend = RemoteBackend::Coder {
+            workspace: "alice/api".into(),
+            local_session_id: "api".into(),
+        };
+
+        assert_eq!(
+            remote_upgrade_argv(&backend, Some("/opt/flock/bin/flock")),
+            Some(vec![
+                "/opt/flock/bin/flock".into(),
+                "remote-agent".into(),
+                "remote-upgrade".into(),
+                "--provider".into(),
+                "coder".into(),
+                "--workspace".into(),
+                "alice/api".into(),
+            ])
+        );
     }
 
     #[test]

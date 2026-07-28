@@ -1,7 +1,7 @@
 #[allow(unused_imports)] // some imports used only with web_server_capability feature
 use zellij_utils::consts::{
     session_info_cache_file_name, session_info_folder_for_session, session_layout_cache_file_name,
-    VERSION, ZELLIJ_SESSION_INFO_CACHE_DIR, ZELLIJ_SOCK_DIR,
+    VERSION, ZELLIJ_CACHE_DIR, ZELLIJ_SESSION_INFO_CACHE_DIR, ZELLIJ_SOCK_DIR,
 };
 #[allow(unused_imports)]
 use zellij_utils::data::{Event, HttpVerb, LayoutInfo, SessionInfo, WebServerStatus};
@@ -782,12 +782,36 @@ fn read_other_live_session_states(
             if let Ok(mut session_info) =
                 SessionInfo::from_string(&raw_session_info, &current_session_name)
             {
+                // Remote health is deliberately not serialized into session
+                // metadata: resurrection must not revive a stale mismatch or
+                // transport error. This scan only contains sessions whose
+                // sockets are live, though, so rehydrate their current health
+                // from the bridge sidecars before publishing the snapshot.
+                // Without this, every scan turns all remote panes healthy and
+                // races the screen's live in-memory picture, making the
+                // sidebar's mismatch row appear and disappear once per poll.
+                hydrate_live_remote_health(
+                    &mut session_info,
+                    &ZELLIJ_CACHE_DIR.join("remote-panes"),
+                );
                 session_info.creation_time = creation_time;
                 session_infos_on_machine.insert(session_name, session_info);
             }
         }
     }
     session_infos_on_machine
+}
+
+fn hydrate_live_remote_health(session_info: &mut SessionInfo, remote_pane_cache_dir: &Path) {
+    for pane in session_info.remote_panes.values_mut() {
+        let path = remote_pane_cache_dir.join(format!("{}.health", pane.pane_uuid));
+        let Ok(raw) = fs::read_to_string(path) else {
+            continue;
+        };
+        if let Ok(health) = serde_json::from_str(&raw) {
+            pane.health = health;
+        }
+    }
 }
 
 fn find_resurrectable_sessions(
@@ -880,7 +904,10 @@ mod tests {
     use super::*;
     use std::os::unix::net::UnixListener;
     use tempfile::tempdir;
-    use zellij_utils::data::SessionInfo;
+    use zellij_utils::data::{
+        PaneId as ZellijPaneId, RemotePaneHealth, RemotePaneMetadata, RemoteProtocolStatus,
+        SessionInfo,
+    };
 
     fn make_socket(dir: &std::path::Path, name: &str) -> UnixListener {
         UnixListener::bind(dir.join(name)).expect("bind unix socket")
@@ -976,5 +1003,41 @@ mod tests {
         for name in ["live-a", "live-b", "live-c"] {
             assert!(!resurrectable.contains_key(name));
         }
+    }
+
+    #[test]
+    fn live_session_scan_rehydrates_remote_health_sidecars() {
+        let remote_pane_cache = tempdir().unwrap();
+        let pane_uuid = "b7bb135a-685c-4e8e-ac30-172bfdb56b0d";
+        let health = RemotePaneHealth {
+            status: RemoteProtocolStatus::VersionSkew,
+            daemon_version: Some("26.7.0".into()),
+            local_version: Some("26.8.0".into()),
+            retry_count: 0,
+            last_error: None,
+        };
+        std::fs::write(
+            remote_pane_cache.path().join(format!("{pane_uuid}.health")),
+            serde_json::to_string(&health).unwrap(),
+        )
+        .unwrap();
+
+        let pane_id = ZellijPaneId::Terminal(4);
+        let mut session = SessionInfo::new("remote".into());
+        session.remote_panes.insert(
+            pane_id,
+            RemotePaneMetadata {
+                pane_uuid: pane_uuid.into(),
+                replay_cursor: 0,
+                close_pending: false,
+                foreground_argv: Vec::new(),
+                // This is what KDL deserialization produces.
+                health: RemotePaneHealth::default(),
+            },
+        );
+
+        hydrate_live_remote_health(&mut session, remote_pane_cache.path());
+
+        assert_eq!(session.remote_panes[&pane_id].health, health);
     }
 }
