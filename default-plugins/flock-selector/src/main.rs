@@ -228,6 +228,15 @@ fn enabled_modes_for(config: &SelectorConfig) -> Vec<PickerMode> {
     modes
 }
 
+fn remote_upgrade_base_argv(executable: String) -> Vec<String> {
+    vec![
+        executable,
+        "remote-agent".to_owned(),
+        "remote-upgrade".to_owned(),
+        "--provider".to_owned(),
+    ]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -485,6 +494,19 @@ mod tests {
         assert!(state.update_sessions(sessions.clone()));
         assert_eq!(state.sessions, sessions);
         assert!(!state.update_sessions(sessions));
+    }
+
+    #[test]
+    fn ctrl_r_uses_the_nested_remote_agent_command() {
+        assert_eq!(
+            remote_upgrade_base_argv("/opt/flock/bin/flock".into()),
+            [
+                "/opt/flock/bin/flock",
+                "remote-agent",
+                "remote-upgrade",
+                "--provider",
+            ]
+        );
     }
 
     #[test]
@@ -1864,11 +1886,7 @@ impl State {
         let Some(executable) = self.flock_executable.clone() else {
             return false;
         };
-        let mut argv = vec![
-            executable,
-            "remote-upgrade".to_owned(),
-            "--provider".to_owned(),
-        ];
+        let mut argv = remote_upgrade_base_argv(executable);
         let target = match self.mode {
             PickerMode::Coder => {
                 let ranked = coder::rank(&self.coder_workspaces, &self.query);
