@@ -5,6 +5,14 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
 
 ## [Unreleased]
+
+## [26.10.0] - 2026-07-27
+* fix(remote): rehydrate live remote pane health so the sidebar mismatch indicator
+  stays stable, and invoke the nested remote-agent upgrade from both the sidebar and
+  the Ctrl-R picker action.
+* fix(selector): queue sessions by agent attention (Blocked, Done-unseen, Stopped,
+  Running, then None), keep FIFO order within each bucket, and seed initial positions
+  by session age.
 * fix(plugins): stop a keybinding that names a plugin from spawning a duplicate of
   it. Finding a running plugin required the caller to restate the exact configuration
   it was launched with, so `MessagePlugin "zellij:flock-sidebar" { name "..." }`
