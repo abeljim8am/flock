@@ -8,8 +8,9 @@
 //! home-shortened workspace path with a name-hit bonus. Fuzzy ties break by
 //! agent attention (a session whose agent is blocked on the user lists first),
 //! so an empty query — where everything scores 0 — orders the whole list by
-//! attention, with the current session sunk to the end (it's the one entry
-//! switching to does nothing for).
+//! attention. Sessions that enter the same attention bucket are kept in FIFO
+//! order, so the tab doubles as an attention queue instead of reshuffling
+//! alphabetically whenever agent state changes.
 
 use std::collections::BTreeMap;
 
@@ -21,21 +22,20 @@ use crate::fuzzy::fuzzy_match;
 /// ranking's name-over-path preference.
 const NAME_MATCH_BONUS: i32 = 8;
 
-/// A session's agent attention bucket, following herdr's
-/// `pane_attention_priority`: Blocked > Done-unseen > Working > Idle(stopped) >
-/// none. Ordered by ascending priority so the highest discriminant wins —
-/// the same rollup flock-sidebar uses for its session dot, duplicated here
-/// (like `NAME_MATCH_BONUS`) because plugin crates can't import each other.
+/// A session's agent attention bucket. Selector priority is Blocked >
+/// Done-unseen > Idle(stopped) > Working > none: an agent that is still running
+/// does not need checking before one that has stopped. Ordered by ascending
+/// priority so the highest discriminant wins.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord)]
 pub enum SessionActivity {
     /// No agents published for the session (also: its flock-sidebar isn't
     /// running, so nothing was published).
     #[default]
     None,
-    /// One or more agents present, all idle and already seen — nothing to do.
-    Stopped,
     /// At least one agent is actively working.
     Running,
+    /// At least one agent is idle and already seen.
+    Stopped,
     /// At least one agent finished in the background and hasn't been looked at
     /// yet (and none is blocked) — worth a glance.
     DoneUnseen,
@@ -62,6 +62,57 @@ pub fn session_activity(states: &BTreeMap<PaneId, PaneAgentStatus>) -> SessionAc
     activity
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct QueuedActivity {
+    activity: SessionActivity,
+    order: u64,
+}
+
+/// Stable FIFO positions for sessions within each activity bucket.
+///
+/// A new session, or a session whose rolled-up activity changes, joins the back
+/// of its new bucket. Repeated snapshots with the same activity preserve its
+/// position. The caller controls the order of newly observed sessions, which
+/// lets startup seed the queue by session age even though the host snapshot is
+/// name-sorted.
+#[derive(Debug, Default)]
+pub struct ActivityQueue {
+    entries: BTreeMap<String, QueuedActivity>,
+    next_order: u64,
+}
+
+impl ActivityQueue {
+    pub fn update<'a>(&mut self, activities: impl IntoIterator<Item = (&'a str, SessionActivity)>) {
+        let activities: Vec<(&str, SessionActivity)> = activities.into_iter().collect();
+        self.entries
+            .retain(|name, _| activities.iter().any(|(live, _)| live == name));
+
+        for (name, activity) in activities {
+            let activity_changed = self
+                .entries
+                .get(name)
+                .is_none_or(|queued| queued.activity != activity);
+            if activity_changed {
+                self.entries.insert(
+                    name.to_owned(),
+                    QueuedActivity {
+                        activity,
+                        order: self.next_order,
+                    },
+                );
+                self.next_order = self.next_order.saturating_add(1);
+            }
+        }
+    }
+
+    pub fn order(&self, name: &str) -> u64 {
+        self.entries
+            .get(name)
+            .map(|queued| queued.order)
+            .unwrap_or(u64::MAX)
+    }
+}
+
 /// One live session, reduced to what the picker shows and switches to.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionEntry {
@@ -75,6 +126,8 @@ pub struct SessionEntry {
     /// The session's rolled-up agent attention, the ranking tiebreak under
     /// the fuzzy score and the row's status dot.
     pub activity: SessionActivity,
+    /// FIFO position assigned when the session entered its current activity.
+    pub queue_order: u64,
 }
 
 /// A session paired with its rank and the match ranges to highlight.
@@ -90,7 +143,7 @@ pub struct RankedSession<'a> {
 
 /// Rank `entries` for `query`, best-first. Non-matches are dropped for a
 /// non-empty query; an empty query keeps everything, ordered by agent
-/// attention (blocked first) then name, current session last.
+/// attention (blocked first) then FIFO position.
 pub fn rank<'a>(entries: &'a [SessionEntry], query: &str) -> Vec<RankedSession<'a>> {
     let query = query.trim();
     let mut ranked: Vec<RankedSession<'a>> = Vec::with_capacity(entries.len());
@@ -110,14 +163,15 @@ pub fn rank<'a>(entries: &'a [SessionEntry], query: &str) -> Vec<RankedSession<'
             path_ranges: path_match.map(|m| m.ranges).unwrap_or_default(),
         });
     }
-    // Best first; ties sink the current session (switching to it is a no-op
-    // even when its agent wants attention), then surface the most
-    // attention-worthy agents, then order by name for determinism.
+    // Best fuzzy match first, then the most attention-worthy agents. The
+    // current-session flag intentionally does not participate: sinking it used
+    // to hide a blocked current agent below inactive sessions. Within an
+    // activity bucket, older transitions are served first.
     ranked.sort_by(|a, b| {
         b.rank
             .cmp(&a.rank)
-            .then_with(|| a.entry.is_current.cmp(&b.entry.is_current))
             .then_with(|| b.entry.activity.cmp(&a.entry.activity))
+            .then_with(|| a.entry.queue_order.cmp(&b.entry.queue_order))
             .then_with(|| a.entry.name.cmp(&b.entry.name))
     });
     ranked
@@ -142,19 +196,29 @@ mod tests {
             display_path: path.to_owned(),
             is_current,
             activity,
+            queue_order: 0,
         }
     }
 
     #[test]
-    fn empty_query_orders_by_name_current_last() {
+    fn empty_query_uses_fifo_order_regardless_of_current_session() {
         let entries = vec![
-            entry("zeta", "~/zeta", false),
-            entry("alpha", "~/alpha", true),
-            entry("mid", "~/mid", false),
+            SessionEntry {
+                queue_order: 2,
+                ..entry("zeta", "~/zeta", false)
+            },
+            SessionEntry {
+                queue_order: 0,
+                ..entry("alpha", "~/alpha", true)
+            },
+            SessionEntry {
+                queue_order: 1,
+                ..entry("mid", "~/mid", false)
+            },
         ];
         let ranked = rank(&entries, "");
         let names: Vec<&str> = ranked.iter().map(|r| r.entry.name.as_str()).collect();
-        assert_eq!(names, vec!["mid", "zeta", "alpha"]);
+        assert_eq!(names, vec!["alpha", "mid", "zeta"]);
     }
 
     #[test]
@@ -172,32 +236,50 @@ mod tests {
     }
 
     #[test]
-    fn empty_query_orders_by_attention_then_name() {
+    fn empty_query_orders_by_attention_then_fifo() {
         let entries = vec![
-            entry_with_activity("idle", "~/idle", false, SessionActivity::Stopped),
-            entry_with_activity("no-agents", "~/none", false, SessionActivity::None),
-            entry_with_activity("busy", "~/busy", false, SessionActivity::Running),
-            entry_with_activity("zz-stuck", "~/stuck", false, SessionActivity::Blocked),
-            entry_with_activity("aa-stuck", "~/stuck2", false, SessionActivity::Blocked),
-            entry_with_activity("done", "~/done", false, SessionActivity::DoneUnseen),
+            SessionEntry {
+                queue_order: 5,
+                ..entry_with_activity("idle", "~/idle", false, SessionActivity::Stopped)
+            },
+            SessionEntry {
+                queue_order: 4,
+                ..entry_with_activity("no-agents", "~/none", false, SessionActivity::None)
+            },
+            SessionEntry {
+                queue_order: 3,
+                ..entry_with_activity("busy", "~/busy", false, SessionActivity::Running)
+            },
+            SessionEntry {
+                queue_order: 1,
+                ..entry_with_activity("zz-stuck", "~/stuck", false, SessionActivity::Blocked)
+            },
+            SessionEntry {
+                queue_order: 2,
+                ..entry_with_activity("aa-stuck", "~/stuck2", false, SessionActivity::Blocked)
+            },
+            SessionEntry {
+                queue_order: 0,
+                ..entry_with_activity("done", "~/done", false, SessionActivity::DoneUnseen)
+            },
         ];
         let ranked = rank(&entries, "");
         let names: Vec<&str> = ranked.iter().map(|r| r.entry.name.as_str()).collect();
         assert_eq!(
             names,
-            vec!["aa-stuck", "zz-stuck", "done", "busy", "idle", "no-agents"]
+            vec!["zz-stuck", "aa-stuck", "done", "idle", "busy", "no-agents"]
         );
     }
 
     #[test]
-    fn current_session_sinks_even_when_blocked() {
+    fn blocked_current_session_still_wins_by_attention() {
         let entries = vec![
             entry_with_activity("here", "~/here", true, SessionActivity::Blocked),
             entry_with_activity("calm", "~/calm", false, SessionActivity::None),
         ];
         let ranked = rank(&entries, "");
         let names: Vec<&str> = ranked.iter().map(|r| r.entry.name.as_str()).collect();
-        assert_eq!(names, vec!["calm", "here"]);
+        assert_eq!(names, vec!["here", "calm"]);
     }
 
     #[test]
@@ -231,13 +313,60 @@ mod tests {
         states.insert(PaneId::Terminal(1), status(AgentRunState::Idle, true));
         assert_eq!(session_activity(&states), SessionActivity::Stopped);
 
+        states.clear();
         states.insert(PaneId::Terminal(2), status(AgentRunState::Working, true));
         assert_eq!(session_activity(&states), SessionActivity::Running);
+
+        states.insert(PaneId::Terminal(1), status(AgentRunState::Idle, true));
+        assert_eq!(session_activity(&states), SessionActivity::Stopped);
 
         states.insert(PaneId::Terminal(3), status(AgentRunState::Idle, false));
         assert_eq!(session_activity(&states), SessionActivity::DoneUnseen);
 
         states.insert(PaneId::Terminal(4), status(AgentRunState::Blocked, false));
         assert_eq!(session_activity(&states), SessionActivity::Blocked);
+    }
+
+    #[test]
+    fn activity_changes_join_the_back_of_the_new_bucket() {
+        let mut queue = ActivityQueue::default();
+        queue.update([
+            ("older", SessionActivity::Blocked),
+            ("newer", SessionActivity::Running),
+        ]);
+        let older_first_order = queue.order("older");
+
+        queue.update([
+            ("older", SessionActivity::Blocked),
+            ("newer", SessionActivity::Blocked),
+        ]);
+
+        assert_eq!(queue.order("older"), older_first_order);
+        assert!(queue.order("older") < queue.order("newer"));
+    }
+
+    #[test]
+    fn unchanged_snapshots_preserve_fifo_positions_and_removed_names_are_fresh() {
+        let mut queue = ActivityQueue::default();
+        queue.update([
+            ("first", SessionActivity::Running),
+            ("second", SessionActivity::Running),
+        ]);
+        let first_order = queue.order("first");
+        let second_order = queue.order("second");
+
+        queue.update([
+            ("second", SessionActivity::Running),
+            ("first", SessionActivity::Running),
+        ]);
+        assert_eq!(queue.order("first"), first_order);
+        assert_eq!(queue.order("second"), second_order);
+
+        queue.update([("second", SessionActivity::Running)]);
+        queue.update([
+            ("first", SessionActivity::Running),
+            ("second", SessionActivity::Running),
+        ]);
+        assert!(queue.order("second") < queue.order("first"));
     }
 }

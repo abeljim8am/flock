@@ -52,7 +52,7 @@ use discovery::{
     SCAN_CONTEXT_KEY,
 };
 use frecency::{now_secs, FrecencyDb};
-use live_sessions::SessionEntry;
+use live_sessions::{ActivityQueue, SessionEntry};
 use palette::Theme;
 use session::{ExistingSession, OpenAction};
 use ui::PickerMode;
@@ -100,6 +100,10 @@ struct State {
     /// Latest cross-session list, for the open-session badge (matched against
     /// each `SessionInfo.workspace_root`).
     sessions: Vec<SessionInfo>,
+    /// FIFO positions within each rolled-up agent activity bucket. These are
+    /// updated from session snapshots, but only move when a session's activity
+    /// changes.
+    session_activity_queue: ActivityQueue,
     /// The typed query.
     query: String,
     /// Selection cursor: index into the ranked results (0 = best, bottom-most).
@@ -494,6 +498,58 @@ mod tests {
         assert!(state.update_sessions(sessions.clone()));
         assert_eq!(state.sessions, sessions);
         assert!(!state.update_sessions(sessions));
+    }
+
+    #[test]
+    fn session_snapshots_seed_and_advance_the_activity_fifo() {
+        fn session(name: &str, age: u64, activity: AgentRunState) -> SessionInfo {
+            let mut session = SessionInfo {
+                name: name.to_owned(),
+                creation_time: std::time::Duration::from_secs(age),
+                ..SessionInfo::default()
+            };
+            session.agent_states.insert(
+                PaneId::Terminal(1),
+                PaneAgentStatus {
+                    state: activity,
+                    label: "codex".to_owned(),
+                    seen: true,
+                },
+            );
+            session
+        }
+
+        let mut state = State::default();
+        let older = session("z-older", 100, AgentRunState::Blocked);
+        let newer = session("a-newer", 10, AgentRunState::Working);
+        state.update_sessions(vec![newer.clone(), older.clone()]);
+
+        let entries = state.session_entries();
+        assert!(
+            entries
+                .iter()
+                .find(|entry| entry.name == "z-older")
+                .unwrap()
+                .queue_order
+                < entries
+                    .iter()
+                    .find(|entry| entry.name == "a-newer")
+                    .unwrap()
+                    .queue_order
+        );
+
+        // When the newer session enters the older session's Blocked bucket, it
+        // goes behind it despite the host snapshot and names sorting the other
+        // way.
+        let newer_blocked = session("a-newer", 10, AgentRunState::Blocked);
+        state.update_sessions(vec![newer_blocked, older]);
+        let entries = state.session_entries();
+        let ranked = live_sessions::rank(&entries, "");
+        let names: Vec<&str> = ranked
+            .iter()
+            .map(|result| result.entry.name.as_str())
+            .collect();
+        assert_eq!(names, vec!["z-older", "a-newer"]);
     }
 
     #[test]
@@ -1037,6 +1093,28 @@ impl State {
         if self.sessions == sessions {
             false
         } else {
+            // The host snapshot comes from a BTreeMap and is therefore sorted
+            // by name. Seed newly observed sessions oldest-first so startup
+            // reflects their real arrival order; later activity transitions
+            // retain their own FIFO positions.
+            let mut activities: Vec<(&str, std::time::Duration, live_sessions::SessionActivity)> =
+                sessions
+                    .iter()
+                    .filter(|session| !self.is_selector_session(session))
+                    .map(|session| {
+                        (
+                            session.name.as_str(),
+                            session.creation_time,
+                            live_sessions::session_activity(&session.agent_states),
+                        )
+                    })
+                    .collect();
+            activities.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(b.0)));
+            self.session_activity_queue.update(
+                activities
+                    .iter()
+                    .map(|(name, _, activity)| (*name, *activity)),
+            );
             self.sessions = sessions;
             true
         }
@@ -1652,6 +1730,7 @@ impl State {
                 },
                 is_current: s.is_current_session,
                 activity: live_sessions::session_activity(&s.agent_states),
+                queue_order: self.session_activity_queue.order(&s.name),
             })
             .collect()
     }
