@@ -5,6 +5,27 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
 
 ## [Unreleased]
+* feat(setup): `flock setup --check` now reports what Flock actually resolved, not
+  just where it looked. It already listed the directories it searches; it now also
+  answers the questions that otherwise need a running session and a
+  `dump-layout`:
+
+  ```
+  [STARTUP LAYOUT]: built-in "flock"
+  [SELECTOR ON STARTUP]: yes
+  [PROJECT ROOT DIRS]: "~/src", "~/work"
+  [PROJECT INDIVIDUAL DIRS]: none
+  [REMOTE PROVIDERS]: devcontainers, ssh
+  [FLOCK PLUGIN ALIASES]: flock-selector, flock-sidebar
+  ```
+
+  `[STARTUP LAYOUT]` distinguishes a built-in from one of your own layout files by
+  path, so "why am I not getting my `default.kdl`" is answerable without starting
+  a session. Configuration that silently does nothing is the recurring failure
+  mode in this area, so the report is deliberately loud rather than terse when no
+  project folders are configured, when the selector is opted out of startup, and
+  if a `flock` plugin alias is missing — which would make the whole `flock { }`
+  section inert for that plugin.
 * feat(selector): make an empty project list explain itself instead of just
   reporting that it is empty. Flock deliberately does not go hunting for projects
   on its own, so on a fresh install the empty list is the first screen a new user
