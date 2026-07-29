@@ -5,6 +5,28 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
 
 ## [Unreleased]
+* fix(flock): close the gaps the out-of-the-box work left open.
+  - Sessions created from the selector actually get the `flock` layout now. The
+    selector asks for it by name; pinning that name to the user's layout dir
+    used to produce a path to a file that does not exist on a fresh install,
+    which silently fell back to the plain upstream layout — no sidebar, no way
+    back to the selector. The name is now only pinned when the file is really
+    there, so a bare built-in name survives to the new session and resolves to
+    the bundled asset.
+  - `flock pick` no longer takes the `p` alias: `p` already meant `flock plugin`,
+    and clap resolved the collision in `pick`'s favor, breaking `flock p <url>`.
+  - Bare `flock` (and `flock pick`) inside the picker session itself explains
+    that you are already there instead of panicking on attach-to-self.
+  - `setup --check` reads the selector's folders, providers and session layout
+    from the same merged view the plugin receives — the `flock { }` section
+    projected underneath the alias body — instead of the section alone, so a
+    selector configured with args on the alias is no longer reported as
+    unconfigured with a false "your project list is empty" warning.
+  - The empty project list's hint now says config is picked up when flock
+    starts afresh, not "reopen the selector" — a running session keeps the
+    configuration it started with, so reopening the picker alone changes
+    nothing. Hint lines are also truncated to the pane width instead of
+    wrapping, which could scroll a short pane's rows out of place.
 * feat(setup): `flock setup --check` now reports what Flock actually resolved, not
   just where it looked. It already listed the directories it searches; it now also
   answers the questions that otherwise need a running session and a
@@ -37,7 +59,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
        flock {
            root_dirs "~/src" "~/work"
        }
-   then reopen the selector
+   then start flock again — running sessions keep their startup config
   ```
 
   A configured list that still finds nothing now names the likely cause rather
@@ -50,7 +72,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
   no matches stays a plain status line — mid-search is not the moment for setup
   instructions.
 * feat(cli): bare `flock` opens the project selector instead of dropping into a
-  shell, and `flock pick` (alias `flock p`) opens it on demand.
+  shell, and `flock pick` opens it on demand.
 
   The selector runs in a single fixed session named `flock-selector`, so reaching
   for it repeatedly lands in the same session rather than accumulating throwaway
@@ -100,8 +122,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
   Everything that distinguishes Flock — the sidebar dock, the project selector,
   agent status — was previously opt-in through hand-authored KDL, so `flock` with
   no config behaved exactly like upstream `zellij`. Now:
-  - `default_layout` ships as `"flock"` (the default chrome plus the sidebar as a
-    left-edge dock) instead of being unset.
+  - Startup falls back to the built-in `flock` layout (the default chrome plus
+    the sidebar as a left-edge dock) instead of upstream's plain `default` when
+    no layout is named — `default_layout` itself stays unset; see below.
   - `Super s` opens the project selector.
   - `flock-selector` and `flock-sidebar` are registered as plugin aliases, so
     their folder args are stated **once** in `config.kdl` and reach the bundled
@@ -110,8 +133,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
     removes by construction the arg-set disagreement that made a keybinding
     launch a second selector.
   - Sessions created from the selector default to the `flock` layout, so a
-    project opened through Flock has the sidebar. Previously they got Zellij's
-    `default` layout with no way back to the selector.
+    project opened through Flock has the sidebar. Previously they followed the
+    `default` layout — your own `layouts/default.kdl` if you had written one,
+    upstream's plain chrome otherwise — with no way back to the selector.
+    `flock { session_layout "default" }` restores that behavior.
 
   Your own layouts still win. `default_layout` is deliberately left unset, and
   the `flock` layout is a *fallback*: startup still loads your

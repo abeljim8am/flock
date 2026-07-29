@@ -809,6 +809,16 @@ pub(crate) fn start_client(opts: CliArgs) {
         // `assert_session_ne` and abort outright once a stale resurrection
         // snapshot existed for the picker session.
         if should_open_selector(&opts, &config, &config_options, is_a_reconnect) {
+            // From inside the picker session itself, the rewrite below would
+            // become an attach-to-self, which is a hard error deeper in the
+            // attach branch. Answer the human instead of panicking.
+            if envs::get_session_name().ok().as_deref() == Some(FLOCK_SELECTOR_SESSION_NAME) {
+                eprintln!(
+                    "You are already inside the project selector. Pick a project from its list, \
+                     or detach first to open it from outside."
+                );
+                process::exit(1);
+            }
             opts.command = Some(Command::Sessions(Sessions::Attach {
                 session_name: Some(FLOCK_SELECTOR_SESSION_NAME.to_owned()),
                 create: true,

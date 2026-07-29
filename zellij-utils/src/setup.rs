@@ -10,7 +10,7 @@ use crate::{
     home::*,
     input::{
         config::{Config, ConfigError},
-        flock_config::FLOCK_PLUGIN_ALIASES,
+        flock_config::{FLOCK_PLUGIN_ALIASES, FLOCK_SELECTOR_PLUGIN_ALIAS},
         layout::Layout,
         options::Options,
     },
@@ -455,6 +455,38 @@ impl Setup {
     /// loud when they are empty or missing.
     fn write_flock_check(message: &mut String, config: &Config, layout_info: Option<&LayoutInfo>) {
         let flock = &config.flock;
+        // Folder, provider and layout values are read back from the same
+        // projection the runtime hands the plugin thread: the `flock { }` section
+        // merged *underneath* the selector alias body, where anything the body
+        // states wins. Reading `config.flock` alone would call a selector
+        // configured the pre-section way — args on the alias — unconfigured, and
+        // the loud "your project list is empty" claim below would be false.
+        let effective = config
+            .plugin_aliases_with_flock_defaults()
+            .aliases
+            .get(FLOCK_SELECTOR_PLUGIN_ALIAS)
+            .map(|alias| alias.configuration.inner().clone())
+            .unwrap_or_else(|| flock.to_plugin_configuration());
+        // Mirrors the plugin's own arg parsing: `;`-separated lists with empty
+        // segments dropped, and flags true only on a case-insensitive "true".
+        let effective_paths = |key: &str| -> Vec<String> {
+            effective
+                .get(key)
+                .map(|paths| {
+                    paths
+                        .split(';')
+                        .map(|path| path.trim())
+                        .filter(|path| !path.is_empty())
+                        .map(|path| path.to_owned())
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+        let effective_flag = |key: &str| -> bool {
+            effective
+                .get(key)
+                .is_some_and(|value| value.trim().eq_ignore_ascii_case("true"))
+        };
 
         match layout_info {
             Some(LayoutInfo::BuiltIn(name)) => {
@@ -494,19 +526,16 @@ impl Setup {
                     .join(", ")
             }
         };
-        writeln!(
-            message,
-            "[PROJECT ROOT DIRS]: {}",
-            describe(&flock.root_dirs)
-        )
-        .unwrap();
+        let root_dirs = effective_paths("root_dirs");
+        let individual_dirs = effective_paths("individual_dirs");
+        writeln!(message, "[PROJECT ROOT DIRS]: {}", describe(&root_dirs)).unwrap();
         writeln!(
             message,
             "[PROJECT INDIVIDUAL DIRS]: {}",
-            describe(&flock.individual_dirs)
+            describe(&individual_dirs)
         )
         .unwrap();
-        if flock.root_dirs.is_empty() && flock.individual_dirs.is_empty() {
+        if root_dirs.is_empty() && individual_dirs.is_empty() {
             message.push_str(
                 " No project folders are configured, so the selector's project list is empty.\n",
             );
@@ -515,13 +544,13 @@ impl Setup {
         }
 
         let providers = [
-            ("codespaces", flock.codespaces),
-            ("devcontainers", flock.devcontainers),
-            ("coder", flock.coder),
-            ("ssh", flock.ssh),
+            ("codespaces", "codespaces_enabled"),
+            ("devcontainers", "devcontainers_enabled"),
+            ("coder", "coder_enabled"),
+            ("ssh", "ssh_enabled"),
         ]
         .iter()
-        .filter(|(_, enabled)| *enabled == Some(true))
+        .filter(|(_, key)| effective_flag(key))
         .map(|(name, _)| *name)
         .collect::<Vec<_>>();
         writeln!(
@@ -535,7 +564,7 @@ impl Setup {
         )
         .unwrap();
 
-        if let Some(session_layout) = &flock.session_layout {
+        if let Some(session_layout) = effective.get("session_layout") {
             writeln!(message, "[PROJECT SESSION LAYOUT]: \"{}\"", session_layout).unwrap();
         }
 
@@ -943,6 +972,50 @@ mod setup_test {
         assert!(
             !out.contains("No project folders are configured"),
             "should not nag once folders are set, got: {}",
+            out
+        );
+    }
+
+    #[test]
+    fn check_reports_settings_stated_on_the_selector_alias_body() {
+        // The pre-`flock { }` configuration style: args on the plugin alias
+        // itself. The runtime lets those win over the section, so the check must
+        // read the same merged view — reporting only `config.flock` here called
+        // a working selector unconfigured, and its "project list is empty"
+        // warning was false.
+        let config = config_with_flock(
+            r#"
+            plugins {
+                flock-selector location="zellij:flock-selector" {
+                    root_dirs "~/src;~/work"
+                    ssh_enabled "false"
+                }
+            }
+            flock {
+                individual_dirs "~/dotfiles"
+                ssh true
+            }
+        "#,
+        );
+        let out = flock_check(&config, None);
+        assert!(
+            out.contains("[PROJECT ROOT DIRS]: \"~/src\", \"~/work\""),
+            "alias-body folders must be reported, got: {}",
+            out
+        );
+        assert!(
+            out.contains("[PROJECT INDIVIDUAL DIRS]: \"~/dotfiles\""),
+            "the section still fills in what the body does not state, got: {}",
+            out
+        );
+        assert!(
+            out.contains("[REMOTE PROVIDERS]: none enabled"),
+            "the body's ssh_enabled \"false\" wins over `flock {{ ssh true }}`, got: {}",
+            out
+        );
+        assert!(
+            !out.contains("No project folders are configured"),
+            "a selector configured through its alias is not unconfigured, got: {}",
             out
         );
     }
