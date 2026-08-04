@@ -1698,6 +1698,40 @@ mod flock_config_test {
     }
 
     #[test]
+    fn selector_on_startup_defaults_to_on_and_is_not_a_plugin_arg() {
+        let config = config_from(
+            r#"
+            flock {
+                root_dirs "~/src"
+            }
+        "#,
+        );
+        assert!(
+            config.flock.selector_on_startup(),
+            "bare flock should open the selector unless told otherwise"
+        );
+        assert!(
+            !config
+                .flock
+                .to_plugin_configuration()
+                .contains_key("selector_on_startup"),
+            "this key is consumed by the CLI and must not be sent to the plugins"
+        );
+
+        let opted_out = config_from(
+            r#"
+            flock {
+                selector_on_startup false
+            }
+        "#,
+        );
+        assert!(!opted_out.flock.selector_on_startup());
+        // Must survive a write-back like every other key.
+        let reparsed = Config::from_kdl(&opted_out.to_string(false), None).unwrap();
+        assert_eq!(reparsed.flock.selector_on_startup, Some(false));
+    }
+
+    #[test]
     fn the_shipped_default_config_configures_no_folders() {
         // The `flock` block in default.kdl must stay commented out: shipping
         // folder defaults would point the selector at directories that do not

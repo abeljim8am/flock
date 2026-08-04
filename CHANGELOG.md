@@ -5,6 +5,26 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
 
 ## [Unreleased]
+* feat(cli): bare `flock` opens the project selector instead of dropping into a
+  shell, and `flock pick` (alias `flock p`) opens it on demand.
+
+  The selector runs in a single fixed session named `flock-selector`, so reaching
+  for it repeatedly lands in the same session rather than accumulating throwaway
+  ones. Bare `flock` attaches to that session when it is already live, recovers it
+  when a stale snapshot is all that is left, and creates it otherwise.
+
+  Anything that names what it wants is untouched: `flock --session x`,
+  `flock --layout x`, `flock attach`, any other subcommand, a `session_name` in
+  the config, and reconnects after a detach. `flock options ...` still counts as a
+  plain startup and goes through the selector, since it only sets overrides.
+  `flock { selector_on_startup false }` restores the old behavior wholesale while
+  leaving `flock pick` available.
+
+  The bundled `flock-selector` layout is now just the picker as the session's only
+  pane. It previously floated over a shell with `tail -f /dev/null` underneath as
+  a keepalive, guarding against an interactive shell exiting during its own
+  startup and tearing the session down before the plugin finished loading. A
+  plugin pane cannot exit, so both the race and the sacrificial process are gone.
 * feat(config): add a `flock { }` configuration section — one place to tell Flock
   where your projects are and which remote providers to offer.
 

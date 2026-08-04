@@ -51,6 +51,11 @@ pub struct FlockConfig {
     pub coder_dotfiles_branch: Option<String>,
     pub coder_dotfiles_parameter: Option<String>,
     pub coder_dotfiles_branch_parameter: Option<String>,
+    /// Whether bare `flock` opens the project selector. Defaults to on; see
+    /// [`FlockConfig::selector_on_startup`]. Unlike every other field this one is
+    /// consumed by the CLI rather than passed to a plugin, so it is deliberately
+    /// absent from [`FlockConfig::to_plugin_configuration`].
+    pub selector_on_startup: Option<bool>,
 }
 
 impl FlockConfig {
@@ -89,7 +94,17 @@ impl FlockConfig {
             coder_dotfiles_branch_parameter: other
                 .coder_dotfiles_branch_parameter
                 .or_else(|| self.coder_dotfiles_branch_parameter.clone()),
+            selector_on_startup: other.selector_on_startup.or(self.selector_on_startup),
         }
+    }
+
+    /// Whether bare `flock` opens the project selector instead of dropping
+    /// straight into a shell. On by default — it is what makes a fresh install
+    /// land in Flock rather than in a plain multiplexer. Setting it to false keeps
+    /// Flock usable as a drop-in Zellij replacement; `flock pick` still opens the
+    /// selector on demand.
+    pub fn selector_on_startup(&self) -> bool {
+        self.selector_on_startup.unwrap_or(true)
     }
 
     /// True when nothing was configured, so callers can skip projecting entirely
@@ -147,3 +162,15 @@ impl FlockConfig {
 
 /// The plugin alias names the `flock { }` section feeds.
 pub const FLOCK_PLUGIN_ALIASES: [&str; 2] = ["flock-selector", "flock-sidebar"];
+
+/// The fixed session name the project selector runs in.
+///
+/// Fixed rather than generated so that repeatedly reaching for the picker lands
+/// in the same session instead of accumulating throwaway ones, and so the sidebar
+/// can recognise and hide it. The bundled `flock-selector` layout states the same
+/// name in its `session_name` plugin arg; a test keeps the two in step.
+pub const FLOCK_SELECTOR_SESSION_NAME: &str = "flock-selector";
+
+/// The layout the selector session opens with. Resolved by name, so a user's own
+/// `layouts/flock-selector.kdl` takes precedence over the bundled one.
+pub const FLOCK_SELECTOR_LAYOUT_NAME: &str = "flock-selector";

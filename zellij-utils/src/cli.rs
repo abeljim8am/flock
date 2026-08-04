@@ -401,6 +401,12 @@ pub enum Sessions {
     /// List existing plugin aliases
     #[clap(visible_alias = "la")]
     ListAliases,
+    /// Open the project selector, attaching to its session if it is already
+    /// running. This is what bare `flock` does by default; the explicit command
+    /// exists for scripts, for a shell alias, and for reaching the picker when
+    /// `flock { selector_on_startup false }` has turned the default off.
+    #[clap(visible_alias = "p")]
+    Pick,
     /// Attach to a session
     #[clap(visible_alias = "a")]
     Attach {
