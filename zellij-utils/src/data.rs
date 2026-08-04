@@ -3268,12 +3268,61 @@ pub struct ConnectToSession {
 }
 
 impl ConnectToSession {
+    /// Pin a by-name layout to the client's layout dir, but only when that dir
+    /// actually holds the file. A name with no backing file (e.g. the built-in
+    /// `flock`) must stay bare: the receiving session resolves bare names
+    /// against the bundled assets, while an absolute path that doesn't exist
+    /// resolves to nothing and silently falls back to the plain default layout.
     pub fn apply_layout_dir(&mut self, layout_dir: &PathBuf) {
         if let Some(LayoutInfo::File(file_path, _layout_metadata)) = self.layout.as_mut() {
-            *file_path = Path::join(layout_dir, &file_path)
-                .to_string_lossy()
-                .to_string();
+            let path_in_layout_dir = Path::join(layout_dir, &file_path);
+            if path_in_layout_dir.exists() || path_in_layout_dir.with_extension("kdl").exists() {
+                *file_path = path_in_layout_dir.to_string_lossy().to_string();
+            }
         }
+    }
+}
+
+#[cfg(test)]
+mod connect_to_session_tests {
+    use super::*;
+
+    fn with_layout(name: &str) -> ConnectToSession {
+        ConnectToSession {
+            layout: Some(LayoutInfo::File(name.to_owned(), Default::default())),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn layout_names_with_a_file_in_the_layout_dir_are_pinned_to_it() {
+        let layout_dir = tempfile::tempdir().unwrap();
+        let layout_file = layout_dir.path().join("custom.kdl");
+        std::fs::write(&layout_file, "layout").unwrap();
+        let mut connect_to_session = with_layout("custom");
+        connect_to_session.apply_layout_dir(&layout_dir.path().to_path_buf());
+        assert_eq!(
+            connect_to_session.layout,
+            Some(LayoutInfo::File(
+                layout_dir
+                    .path()
+                    .join("custom")
+                    .to_string_lossy()
+                    .to_string(),
+                Default::default()
+            )),
+        );
+    }
+
+    #[test]
+    fn layout_names_with_no_file_in_the_layout_dir_stay_bare_for_asset_fallback() {
+        let layout_dir = tempfile::tempdir().unwrap();
+        let mut connect_to_session = with_layout("flock");
+        connect_to_session.apply_layout_dir(&layout_dir.path().to_path_buf());
+        assert_eq!(
+            connect_to_session.layout,
+            Some(LayoutInfo::File("flock".to_owned(), Default::default())),
+        );
     }
 }
 

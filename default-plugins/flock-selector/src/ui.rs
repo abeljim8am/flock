@@ -1622,7 +1622,9 @@ fn project_hint(configured: bool, query: &str, capacity: usize, p: &Theme) -> Ve
             code("     flock {"),
             code("         root_dirs \"~/src\" \"~/work\""),
             code("     }"),
-            dim(" then reopen the selector"),
+            // Config is read when a session starts, so "reopen the picker" would
+            // be false advice inside a running session.
+            dim(" then start flock again — running sessions keep their startup config"),
         ];
         if capacity >= full.len() {
             return full;
@@ -1691,8 +1693,12 @@ fn render_row(
             out.push_str(&bg(row_bg));
         }
         out.push_str(&fg(span.fg));
-        out.push_str(&span.text);
-        used += span.text.width();
+        // A span longer than the remaining row must not run past it: the grid
+        // wraps overflow onto the next line, which in a short pane scrolls the
+        // rows above out of place.
+        let text = truncate_text(&span.text, width - used);
+        out.push_str(&text);
+        used += text.width();
     }
     if used < width {
         out.push_str(NORMAL_INTENSITY);
@@ -1772,6 +1778,36 @@ mod tests {
             teal: c,
             blue: c,
         }
+    }
+
+    #[test]
+    fn render_row_truncates_spans_to_the_pane_width_instead_of_wrapping() {
+        // The grid wraps overflow onto the next line, which in a short pane
+        // scrolls the rows above out of place — a row must never run past it.
+        let c = PaletteColor::EightBit(1);
+        let mut out = String::new();
+        render_row(
+            &mut out,
+            1,
+            1,
+            10,
+            None,
+            &[
+                Span::new("123456", c),
+                Span::new("this span does not fit", c),
+            ],
+        );
+        assert!(out.contains("123456"), "{:?}", out);
+        assert!(
+            out.contains("thi…"),
+            "the overflowing span is cut at the row's edge with an ellipsis, got: {:?}",
+            out
+        );
+        assert!(
+            !out.contains("this s"),
+            "nothing may run past the row width, got: {:?}",
+            out
+        );
     }
 
     #[test]
@@ -2244,7 +2280,10 @@ mod tests {
                 cols,
             })
         };
-        assert!(render_wizard(&wizard, 4, 18)
+        // 18 columns cannot hold "loading Coder templates" whole; the row is
+        // truncated to the pane width rather than wrapped into the next row.
+        assert!(render_wizard(&wizard, 4, 18).ansi.contains("loading Coder"));
+        assert!(!render_wizard(&wizard, 4, 18)
             .ansi
             .contains("loading Coder templates"));
 
@@ -2256,7 +2295,9 @@ mod tests {
         assert!(wizard.select_current_template());
         wizard.workspace_name = "demo".into();
         wizard.fail_submit(crate::coder::CreateError::DuplicateName);
-        let summary = render_wizard(&wizard, 8, 42).ansi;
+        // Wide enough for every summary line whole — rows are truncated to the
+        // pane width now, so content assertions need the content to fit.
+        let summary = render_wizard(&wizard, 8, 100).ansi;
         assert!(summary.contains("applied when the template supports"));
         assert!(summary.contains("continues in the background"));
         assert!(summary.contains("already exists"));
@@ -2265,9 +2306,19 @@ mod tests {
         wizard.phase = crate::coder::CreatePhase::Templates;
         wizard.templates.clear();
         wizard.set_template_error(crate::coder::CoderError::NotAuthenticated);
-        let error = render_wizard(&wizard, 3, 20).ansi;
+        let error = render_wizard(&wizard, 3, 100).ansi;
         assert!(error.contains("authentication required"));
         assert!(error.contains("Enter to retry"));
+        // A pane too narrow for the message keeps the actionable head of the
+        // row — the retry affordance — cut at the row's edge rather than
+        // wrapped over the row below.
+        let narrow_error = render_wizard(&wizard, 3, 20).ansi;
+        assert!(
+            narrow_error.contains("Enter to retry"),
+            "{:?}",
+            narrow_error
+        );
+        assert!(!narrow_error.contains("authentication required"));
     }
 
     #[test]

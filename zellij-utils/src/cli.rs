@@ -405,7 +405,7 @@ pub enum Sessions {
     /// running. This is what bare `flock` does by default; the explicit command
     /// exists for scripts, for a shell alias, and for reaching the picker when
     /// `flock { selector_on_startup false }` has turned the default off.
-    #[clap(visible_alias = "p")]
+    /// No short alias: `p` already belongs to `plugin`.
     Pick,
     /// Attach to a session
     #[clap(visible_alias = "a")]

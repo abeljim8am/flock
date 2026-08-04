@@ -160,8 +160,11 @@ impl FlockConfig {
     }
 }
 
+/// The alias name of the project selector plugin.
+pub const FLOCK_SELECTOR_PLUGIN_ALIAS: &str = "flock-selector";
+
 /// The plugin alias names the `flock { }` section feeds.
-pub const FLOCK_PLUGIN_ALIASES: [&str; 2] = ["flock-selector", "flock-sidebar"];
+pub const FLOCK_PLUGIN_ALIASES: [&str; 2] = [FLOCK_SELECTOR_PLUGIN_ALIAS, "flock-sidebar"];
 
 /// The fixed session name the project selector runs in.
 ///
