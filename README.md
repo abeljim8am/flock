@@ -64,7 +64,9 @@ sessions. Anything that names what it wants skips it: `flock --session work`,
 To go back to a plain shell on startup, set `selector_on_startup false` in the
 `flock` section below — `flock pick` still works.
 
-The one thing Flock cannot guess is where your projects live.
+The one thing Flock cannot guess is where your projects live. It will not go
+hunting through your filesystem for them either, so until you say where they are
+the project list is empty — and tells you how to fill it.
 
 Point it at them with the `flock` section of `~/.config/flock/config.kdl`:
 

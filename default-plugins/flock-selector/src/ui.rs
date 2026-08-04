@@ -288,14 +288,11 @@ pub fn render(input: RenderInput) -> RenderOutput {
                 vec![Span::new(msg, p.muted).dim()]
             },
             PickerMode::Projects => {
-                let msg = if !configured {
-                    " no project folders configured"
-                } else if query.trim().is_empty() {
-                    " no projects found"
-                } else {
-                    " no matches"
-                };
-                vec![Span::new(msg, p.muted).dim()]
+                // Handled below as a multi-row block: with no auto-discovery, an
+                // unconfigured project list is the first thing a new user sees, so
+                // it has to say what to do about it rather than just report itself
+                // as empty.
+                Vec::new()
             },
             PickerMode::Codespaces => match codespaces_error {
                 Some(err) => codespaces_error_spans(err, p),
@@ -338,7 +335,18 @@ pub fn render(input: RenderInput) -> RenderOutput {
                 },
             },
         };
-        render_row(&mut out, 0, input_y.saturating_sub(1), cols, None, &spans);
+        if matches!(mode, PickerMode::Projects) {
+            // Rendered upward from just above the input, so the block reads
+            // top-to-bottom with its last line closest to the prompt.
+            let lines = project_hint(configured, query, capacity, p);
+            let used = lines.len().min(capacity);
+            for (offset, line) in lines.iter().take(used).enumerate() {
+                let y = input_y.saturating_sub(used - offset);
+                render_row(&mut out, 0, y, cols, None, line);
+            }
+        } else {
+            render_row(&mut out, 0, input_y.saturating_sub(1), cols, None, &spans);
+        }
     }
 
     let mut row_map = Vec::new();
@@ -1590,6 +1598,71 @@ fn clip_ranges(ranges: &[(usize, usize)], text: &str) -> Vec<(usize, usize)> {
 
 /// Emit one row of styled spans at `(x, y)`, padded to `width` with `row_bg`.
 /// (The selected row's background is re-asserted per span so it fills the width.)
+/// The empty-state block for the projects tab.
+///
+/// Flock deliberately does not go looking for projects on its own, so an
+/// unconfigured list is not a failure — it is the one thing Flock cannot guess,
+/// and on a fresh install it is the first screen a user sees. This block is
+/// therefore the setup instructions, not a status line.
+///
+/// Returns one entry per row, first line first. `capacity` is how many rows are
+/// free above the input: the caller renders as many as fit, so the ordering here
+/// has to put the essential line first. When the full block will not fit, a
+/// one-line form that still names the fix is used instead of a truncated block
+/// that would trail off mid-snippet.
+fn project_hint(configured: bool, query: &str, capacity: usize, p: &Theme) -> Vec<Vec<Span>> {
+    let dim = |text: &str| vec![Span::new(text.to_owned(), p.muted).dim()];
+    let code = |text: &str| vec![Span::new(text.to_owned(), p.accent)];
+
+    if !configured {
+        // The full block, when there is room for all of it.
+        let full: Vec<Vec<Span>> = vec![
+            vec![Span::new(" no project folders configured", p.text)],
+            dim(" add them to your config.kdl:"),
+            code("     flock {"),
+            code("         root_dirs \"~/src\" \"~/work\""),
+            code("     }"),
+            dim(" then reopen the selector"),
+        ];
+        if capacity >= full.len() {
+            return full;
+        }
+        if capacity >= 2 {
+            return vec![
+                vec![Span::new(" no project folders configured", p.text)],
+                dim(" set flock { root_dirs \"~/src\" } in your config.kdl"),
+            ];
+        }
+        // One row left. Keep the fix in it rather than spending the row on the
+        // problem alone — `render_row` truncates horizontally if it is too long.
+        return vec![vec![
+            Span::new(" no project folders configured", p.text),
+            Span::new(
+                " — set flock { root_dirs \"~/src\" } in config.kdl",
+                p.muted,
+            )
+            .dim(),
+        ]];
+    }
+    if !query.trim().is_empty() {
+        return vec![dim(" no matches")];
+    }
+    // Configured, yet nothing turned up. By far the most common cause is pointing
+    // root_dirs at a project itself rather than at the folder containing it, so
+    // name that distinction instead of just reporting emptiness.
+    let explained: Vec<Vec<Span>> = vec![
+        vec![Span::new(" no projects found", p.text)],
+        dim(" root_dirs is scanned one level deep — each subfolder is a project"),
+        dim(" for a folder that is itself a project, use individual_dirs"),
+    ];
+    if capacity >= explained.len() {
+        return explained;
+    }
+    vec![dim(
+        " no projects found — root_dirs is scanned one level deep",
+    )]
+}
+
 fn render_row(
     out: &mut String,
     x: usize,
@@ -1685,6 +1758,182 @@ fn tail_text(text: &str, max_width: usize) -> String {
 
 #[cfg(test)]
 mod tests {
+    fn flat_theme() -> Theme {
+        let c = PaletteColor::EightBit(1);
+        Theme {
+            text: c,
+            muted: c,
+            separator: c,
+            selection_bg: c,
+            accent: c,
+            red: c,
+            yellow: c,
+            green: c,
+            teal: c,
+            blue: c,
+        }
+    }
+
+    #[test]
+    fn the_unconfigured_block_reaches_the_rendered_output() {
+        // Proves the wiring, not just the builder: the projects empty state is
+        // rendered as a multi-row block, which the single-row hint path could not
+        // do.
+        let theme = flat_theme();
+        let out = render(RenderInput {
+            permissions_granted: true,
+            configured: false,
+            query: "",
+            mode: PickerMode::Projects,
+            enabled_modes: &[PickerMode::Sessions, PickerMode::Projects],
+            session_results: &[],
+            results: &[],
+            open_paths: &std::collections::HashSet::new(),
+            codespace_results: &[],
+            bound_codespaces: &std::collections::HashSet::new(),
+            codespaces_error: None,
+            codespaces_refreshing: false,
+            pending_stop: None,
+            coder_results: &[],
+            bound_coder_workspaces: &std::collections::HashSet::new(),
+            coder_error: None,
+            coder_refreshing: false,
+            pending_coder_stop: None,
+            coder_create: None,
+            coder_create_notice: None,
+            pending_start: None,
+            pending_reinstall: None,
+            remote_agent_versions: &std::collections::BTreeMap::new(),
+            local_version: "26.7.0",
+            ssh_results: &[],
+            bound_ssh_destinations: &std::collections::HashSet::new(),
+            ssh_wizard: None,
+            ssh_error: None,
+            ssh_notice: None,
+            pending_ssh_delete: None,
+            pending_devcontainer: None,
+            spinner_frame: None,
+            palette: &theme,
+            selected: 0,
+            scroll: 0,
+            total_candidates: 0,
+            rows: 14,
+            cols: 80,
+        });
+        assert!(
+            out.ansi.contains("no project folders configured"),
+            "{}",
+            out.ansi
+        );
+        assert!(out.ansi.contains("root_dirs"), "{}", out.ansi);
+        assert!(out.ansi.contains("config.kdl"), "{}", out.ansi);
+        assert!(
+            out.row_map.is_empty(),
+            "the hint block must not be selectable"
+        );
+    }
+
+    /// The rows of a hint block, flattened to plain text.
+    fn hint_text(configured: bool, query: &str, capacity: usize) -> Vec<String> {
+        let theme = flat_theme();
+        project_hint(configured, query, capacity, &theme)
+            .iter()
+            .map(|line| {
+                line.iter()
+                    .map(|span| span.text.as_str())
+                    .collect::<String>()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn an_unconfigured_project_list_explains_how_to_configure_it() {
+        // With no auto-discovery, this is the first screen a new user sees. It has
+        // to be setup instructions, not a status line.
+        let lines = hint_text(false, "", 20);
+        let joined = lines.join("\n");
+        assert!(
+            joined.contains("no project folders configured"),
+            "should still say what is wrong, got:\n{}",
+            joined
+        );
+        assert!(
+            joined.contains("config.kdl"),
+            "should name the file to edit, got:\n{}",
+            joined
+        );
+        assert!(
+            joined.contains("root_dirs") && joined.contains("flock {"),
+            "should show the snippet to paste, got:\n{}",
+            joined
+        );
+    }
+
+    #[test]
+    fn the_unconfigured_hint_degrades_to_one_line_in_a_short_pane() {
+        // A truncated block would trail off mid-snippet, which is worse than a
+        // single line that still names the fix.
+        let lines = hint_text(false, "", 2);
+        assert!(
+            lines.len() <= 2,
+            "should not overflow the space available, got {:?}",
+            lines
+        );
+        let joined = lines.join(" ");
+        assert!(
+            joined.contains("no project folders configured") && joined.contains("root_dirs"),
+            "the compact form must still name the problem and the fix, got: {}",
+            joined
+        );
+    }
+
+    #[test]
+    fn every_hint_fits_the_capacity_it_was_given() {
+        for capacity in 0..8 {
+            for configured in [true, false] {
+                let lines = hint_text(configured, "", capacity);
+                assert!(
+                    lines.len() <= capacity.max(1),
+                    "capacity {} produced {} lines",
+                    capacity,
+                    lines.len()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_configured_but_empty_list_names_the_likely_misconfiguration() {
+        // Pointing root_dirs at a project itself rather than its parent is the
+        // common mistake, and "no projects found" alone gives no way to spot it.
+        let joined = hint_text(true, "", 20).join("\n");
+        assert!(joined.contains("no projects found"), "{}", joined);
+        assert!(
+            joined.contains("one level deep"),
+            "should explain how root_dirs is scanned, got:\n{}",
+            joined
+        );
+        assert!(
+            joined.contains("individual_dirs"),
+            "should point at the option for a folder that is itself a project, got:\n{}",
+            joined
+        );
+    }
+
+    #[test]
+    fn a_search_with_no_matches_stays_a_plain_status_line() {
+        // Mid-search is not the moment for setup instructions.
+        let lines = hint_text(true, "zzz", 20);
+        assert_eq!(lines.len(), 1);
+        assert!(lines[0].contains("no matches"), "{:?}", lines);
+        let unconfigured = hint_text(false, "zzz", 20).join("\n");
+        assert!(
+            unconfigured.contains("no project folders configured"),
+            "an unconfigured list is worth explaining even mid-search, got:\n{}",
+            unconfigured
+        );
+    }
+
     use super::*;
 
     /// A pane squeezed to a single row has no room for result rows; the
