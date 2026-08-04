@@ -80,7 +80,8 @@ flock {
 That is the only place these are stated. The project selector, the `Super s`
 keybinding, and the sidebar in every session all read from it. Run
 `flock setup --dump-config` to see the section with every option documented
-inline.
+inline, and `flock setup --check` to see what Flock resolved — which layout it
+starts with, which folders it found, which providers are on.
 
 Anything set directly on a plugin — in a layout, or on the `flock-selector` /
 `flock-sidebar` aliases in the `plugins` block — still wins over this section, so

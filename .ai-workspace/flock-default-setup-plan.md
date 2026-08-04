@@ -185,13 +185,27 @@ filesystem behind the user's back, and without rewriting a file the user owns.
 
 ## Phase 4 — docs and diagnostics
 
-- Rewrite the README "Enable Flock" section. It currently teaches arg-pasting
-  into layouts; it should read "works out of the box, here is how to point it at
-  your projects," plus the `Super s` terminal caveat and how to rebind.
-- Add the `flock { }` block, commented and documented, to `default.kdl` so
-  `flock setup --dump-config` teaches it.
-- Extend `flock setup --check` to report the resolved Flock config: project
-  roots, which providers are enabled, which layout is default.
+- ~~Rewrite the README "Enable Flock" section.~~ Done incrementally across
+  phases 0–3; it now reads "works out of the box, here is how to point it at your
+  projects", with the `Super s` caveat and the rebind.
+- ~~Add the `flock { }` block, commented and documented, to `default.kdl`.~~ Done
+  in Phase 1, so `flock setup --dump-config` teaches it.
+- `flock setup --check` reports the resolved Flock config. It already listed the
+  directories Flock *searches*; it now also reports what it *resolved* —
+  `[STARTUP LAYOUT]` (built-in vs. a user file, by path), `[SELECTOR ON STARTUP]`,
+  the project folders, the enabled providers, and the `flock` plugin aliases.
+
+  Deliberately loud rather than terse in the cases where configuration silently
+  does nothing: no project folders, selector opted out, or a missing `flock`
+  plugin alias (which makes the whole `flock { }` section inert for that plugin).
+  That last case is unreachable by editing config.kdl — alias merging can override
+  an entry but never remove one — but it is reachable through the public
+  `plugin_aliases_with_flock_defaults`, and is unit-tested rather than left as
+  dead code.
+
+  This is the diagnostic whose absence made verifying Phase 0 and Phase 2 by hand
+  so awkward: both needed a live session and a `dump-layout` to answer "which
+  layout won" and "did the config reach the plugin".
 
 ## Open risks
 

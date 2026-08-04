@@ -10,6 +10,7 @@ use crate::{
     home::*,
     input::{
         config::{Config, ConfigError},
+        flock_config::FLOCK_PLUGIN_ALIASES,
         layout::Layout,
         options::Options,
     },
@@ -363,7 +364,7 @@ impl Setup {
 
         if let Some(Command::Setup(ref setup)) = &cli_args.command {
             setup
-                .from_cli_with_options(cli_args, &config_options)
+                .from_cli_with_options(cli_args, &config_options, &config, layout_info.as_ref())
                 .map_or_else(
                     |e| {
                         eprintln!("{:?}", e);
@@ -416,9 +417,15 @@ impl Setup {
     }
 
     /// Checks the merged configuration
-    pub fn from_cli_with_options(&self, opts: &CliArgs, config_options: &Options) -> Result<()> {
+    pub fn from_cli_with_options(
+        &self,
+        opts: &CliArgs,
+        config_options: &Options,
+        config: &Config,
+        layout_info: Option<&LayoutInfo>,
+    ) -> Result<()> {
         if self.check {
-            Setup::check_defaults_config(opts, config_options)?;
+            Setup::check_defaults_config(opts, config_options, config, layout_info)?;
             std::process::exit(0);
         }
 
@@ -437,7 +444,139 @@ impl Setup {
         Ok(())
     }
 
-    pub fn check_defaults_config(opts: &CliArgs, config_options: &Options) -> std::io::Result<()> {
+    /// The Flock-specific half of `setup --check`: what Flock actually resolved,
+    /// as opposed to where it looked.
+    ///
+    /// Every line here answers a question that otherwise needs a running session
+    /// and a `dump-layout` to answer — which layout won, whether the `flock { }`
+    /// section reached the plugins, and whether bare `flock` will open the
+    /// selector. Configuration that silently does nothing is the recurring
+    /// failure mode in this area, so the folder and alias lines are deliberately
+    /// loud when they are empty or missing.
+    fn write_flock_check(message: &mut String, config: &Config, layout_info: Option<&LayoutInfo>) {
+        let flock = &config.flock;
+
+        match layout_info {
+            Some(LayoutInfo::BuiltIn(name)) => {
+                writeln!(message, "[STARTUP LAYOUT]: built-in \"{}\"", name).unwrap()
+            },
+            Some(LayoutInfo::File(path, _)) => {
+                writeln!(message, "[STARTUP LAYOUT]: \"{}\"", path).unwrap()
+            },
+            Some(LayoutInfo::Url(url)) => writeln!(message, "[STARTUP LAYOUT]: {}", url).unwrap(),
+            Some(LayoutInfo::Stringified(_)) => {
+                message.push_str("[STARTUP LAYOUT]: passed in on the command line\n")
+            },
+            None => message.push_str("[STARTUP LAYOUT]: Not Found\n"),
+        }
+
+        writeln!(
+            message,
+            "[SELECTOR ON STARTUP]: {}",
+            if flock.selector_on_startup() {
+                "yes"
+            } else {
+                "no"
+            }
+        )
+        .unwrap();
+        if !flock.selector_on_startup() {
+            message.push_str(" A bare 'flock' opens a plain session. Use 'flock pick' for the project selector.\n");
+        }
+
+        let describe = |dirs: &Vec<String>| {
+            if dirs.is_empty() {
+                "none".to_owned()
+            } else {
+                dirs.iter()
+                    .map(|dir| format!("\"{}\"", dir))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            }
+        };
+        writeln!(
+            message,
+            "[PROJECT ROOT DIRS]: {}",
+            describe(&flock.root_dirs)
+        )
+        .unwrap();
+        writeln!(
+            message,
+            "[PROJECT INDIVIDUAL DIRS]: {}",
+            describe(&flock.individual_dirs)
+        )
+        .unwrap();
+        if flock.root_dirs.is_empty() && flock.individual_dirs.is_empty() {
+            message.push_str(
+                " No project folders are configured, so the selector's project list is empty.\n",
+            );
+            message.push_str(" Flock does not search your filesystem for them. Set them in the 'flock' section\n");
+            message.push_str(" of your config file, eg: flock { root_dirs \"~/src\" }\n");
+        }
+
+        let providers = [
+            ("codespaces", flock.codespaces),
+            ("devcontainers", flock.devcontainers),
+            ("coder", flock.coder),
+            ("ssh", flock.ssh),
+        ]
+        .iter()
+        .filter(|(_, enabled)| *enabled == Some(true))
+        .map(|(name, _)| *name)
+        .collect::<Vec<_>>();
+        writeln!(
+            message,
+            "[REMOTE PROVIDERS]: {}",
+            if providers.is_empty() {
+                "none enabled".to_owned()
+            } else {
+                providers.join(", ")
+            }
+        )
+        .unwrap();
+
+        if let Some(session_layout) = &flock.session_layout {
+            writeln!(message, "[PROJECT SESSION LAYOUT]: \"{}\"", session_layout).unwrap();
+        }
+
+        // The `flock { }` section reaches the plugins by being merged underneath
+        // these aliases, so an alias a user's own `plugins` block has replaced or
+        // dropped makes the whole section silently inert for that plugin.
+        let missing = FLOCK_PLUGIN_ALIASES
+            .iter()
+            .filter(|alias| !config.plugins.aliases.contains_key(**alias))
+            .collect::<Vec<_>>();
+        if missing.is_empty() {
+            writeln!(
+                message,
+                "[FLOCK PLUGIN ALIASES]: {}",
+                FLOCK_PLUGIN_ALIASES.join(", ")
+            )
+            .unwrap();
+        } else {
+            for alias in missing {
+                writeln!(
+                    message,
+                    "[FLOCK PLUGIN ALIASES]: \"{}\" is not defined",
+                    alias
+                )
+                .unwrap();
+            }
+            message.push_str(
+                " The 'flock' section is applied through these aliases, so it will not reach a\n",
+            );
+            message.push_str(
+                " plugin whose alias is missing. Check the 'plugins' block in your config file.\n",
+            );
+        }
+    }
+
+    pub fn check_defaults_config(
+        opts: &CliArgs,
+        config_options: &Options,
+        config: &Config,
+        layout_info: Option<&LayoutInfo>,
+    ) -> std::io::Result<()> {
         let data_dir = opts.data_dir.clone().unwrap_or_else(get_default_data_dir);
         let config_dir = opts.config_dir.clone().or_else(find_default_config_dir);
         let plugin_dir = data_dir.join("plugins");
@@ -527,6 +666,8 @@ impl Setup {
             system_data_dir.display()
         )
         .unwrap();
+
+        Setup::write_flock_check(&mut message, config, layout_info);
 
         writeln!(&mut message, "[ARROW SEPARATOR]: {}", ARROW_SEPARATOR).unwrap();
         message.push_str(" Is the [ARROW_SEPARATOR] displayed correctly?\n");
@@ -701,9 +842,150 @@ mod setup_test {
     use super::Setup;
     use crate::cli::{CliArgs, Command};
     use crate::data::LayoutInfo;
+    use crate::input::config::Config;
     use crate::input::options::Options;
     use insta::assert_snapshot;
     use std::path::PathBuf;
+
+    fn flock_check(config: &Config, layout_info: Option<&LayoutInfo>) -> String {
+        let mut message = String::new();
+        Setup::write_flock_check(&mut message, config, layout_info);
+        message
+    }
+
+    fn config_with_flock(kdl: &str) -> Config {
+        Config::from_kdl(kdl, Some(Config::from_default_assets().unwrap())).unwrap()
+    }
+
+    #[test]
+    fn check_reports_which_layout_actually_won() {
+        // The question that otherwise needs a running session and a dump-layout.
+        let config = Config::from_default_assets().unwrap();
+        let builtin = flock_check(&config, Some(&LayoutInfo::BuiltIn("flock".to_owned())));
+        assert!(
+            builtin.contains("[STARTUP LAYOUT]: built-in \"flock\""),
+            "{}",
+            builtin
+        );
+
+        let from_file = flock_check(
+            &config,
+            Some(&LayoutInfo::File(
+                "/home/me/.config/flock/layouts/default.kdl".to_owned(),
+                Default::default(),
+            )),
+        );
+        assert!(
+            from_file.contains("/home/me/.config/flock/layouts/default.kdl"),
+            "a user's own layout must be reported by path, got: {}",
+            from_file
+        );
+    }
+
+    #[test]
+    fn check_is_loud_when_no_project_folders_are_configured() {
+        // Silent no-op configuration is the recurring failure mode here, so an
+        // empty project list has to be called out rather than printed as "none".
+        let out = flock_check(&Config::from_default_assets().unwrap(), None);
+        assert!(out.contains("[PROJECT ROOT DIRS]: none"), "{}", out);
+        assert!(
+            out.contains("No project folders are configured"),
+            "should explain the consequence, got: {}",
+            out
+        );
+        assert!(
+            out.contains("root_dirs"),
+            "should name the fix, got: {}",
+            out
+        );
+    }
+
+    #[test]
+    fn check_reports_configured_folders_and_providers() {
+        let config = config_with_flock(
+            r#"
+            flock {
+                root_dirs "~/src" "~/work"
+                individual_dirs "~/dotfiles"
+                devcontainers true
+                ssh true
+                coder false
+                session_layout "flock"
+            }
+        "#,
+        );
+        let out = flock_check(&config, None);
+        assert!(
+            out.contains("[PROJECT ROOT DIRS]: \"~/src\", \"~/work\""),
+            "{}",
+            out
+        );
+        assert!(
+            out.contains("[PROJECT INDIVIDUAL DIRS]: \"~/dotfiles\""),
+            "{}",
+            out
+        );
+        assert!(
+            out.contains("[REMOTE PROVIDERS]: devcontainers, ssh"),
+            "{}",
+            out
+        );
+        assert!(
+            !out.contains("coder"),
+            "a provider set to false is not enabled, got: {}",
+            out
+        );
+        assert!(
+            out.contains("[PROJECT SESSION LAYOUT]: \"flock\""),
+            "{}",
+            out
+        );
+        assert!(
+            !out.contains("No project folders are configured"),
+            "should not nag once folders are set, got: {}",
+            out
+        );
+    }
+
+    #[test]
+    fn check_explains_how_to_reach_the_selector_when_startup_is_opted_out() {
+        let on = flock_check(&Config::from_default_assets().unwrap(), None);
+        assert!(on.contains("[SELECTOR ON STARTUP]: yes"), "{}", on);
+        assert!(!on.contains("flock pick"), "no need to mention it when on");
+
+        let off = config_with_flock(
+            r#"
+            flock {
+                selector_on_startup false
+            }
+        "#,
+        );
+        let out = flock_check(&off, None);
+        assert!(out.contains("[SELECTOR ON STARTUP]: no"), "{}", out);
+        assert!(
+            out.contains("flock pick"),
+            "should name the way back to the selector, got: {}",
+            out
+        );
+    }
+
+    #[test]
+    fn check_warns_when_a_flock_plugin_alias_is_missing() {
+        // Not reachable by editing config.kdl — alias merging can override an
+        // entry but never remove one — but `plugin_aliases_with_flock_defaults`
+        // is public API, and a Config without these aliases silently ignores the
+        // whole `flock` section for the missing plugin. Worth reporting rather
+        // than leaving to be discovered.
+        let mut config = Config::from_default_assets().unwrap();
+        config.plugins.aliases.remove("flock-sidebar");
+        let out = flock_check(&config, None);
+        assert!(out.contains("\"flock-sidebar\" is not defined"), "{}", out);
+        assert!(
+            out.contains("will not reach"),
+            "should explain the consequence, got: {}",
+            out
+        );
+    }
 
     #[test]
     fn default_config_with_no_cli_arguments() {
