@@ -270,33 +270,11 @@ plugins {
     // every one of them resolves to the same configuration. Adding args at a
     // call site still overrides the alias, so a single layout can opt out.
     //
-    // Point the selector at your projects by giving the alias its folder args:
-    //
-    //   flock-selector location="zellij:flock-selector" {
-    //       root_dirs "~/src;~/work"     // each scanned one level deep
-    //       individual_dirs "~/dotfiles" // each is itself one project
-    //   }
-    //
-    // The sidebar takes the same folder args and uses them to decide which
-    // sessions belong to which project, so keep the two in sync.
-    //
-    // Remote providers are opt-in and off by default, because each needs an
-    // authenticated CLI on PATH to work at all:
-    //
-    //   codespaces_enabled "true"    // needs an authenticated `gh`
-    //   devcontainers_enabled "true" // needs the `devcontainer` CLI + Docker
-    //   coder_enabled "true"         // needs an authenticated `coder`
-    //   ssh_enabled "true"           // saved-hosts tab; Ctrl-o adds a host.
-    //                                // Key or agent auth is required — the
-    //                                // transport runs ssh with BatchMode=yes.
-    //
-    // Selector-only (the sidebar never creates workspaces), and applied only
-    // when the chosen Coder template exposes the named parameter:
-    //
-    //   coder_dotfiles_uri "https://github.com/example/dotfiles.git"
-    //   coder_dotfiles_branch "main"
-    //   coder_dotfiles_parameter "dotfiles_uri"
-    //   coder_dotfiles_branch_parameter "dotfiles_branch"
+    // You normally do not edit these. Configure Flock in the `flock` section
+    // further down instead — its values are merged in underneath both aliases,
+    // which keeps the settings in one readable place and out of this plumbing.
+    // Args written here still win over that section, for the rare case where you
+    // want one plugin to differ.
     //
     // `cwd` is a reserved plugin property: it sets the plugin's initial working
     // directory (its `/host` mount) and is deliberately *not* forwarded as a
@@ -316,6 +294,47 @@ load_plugins {
     // "file:/path/to/my-plugin.wasm"
     // "https://example.com/my-plugin.wasm"
 }
+
+// Flock's own settings: where your projects are, and which remote providers to
+// offer. This is the one place to state them — the values are merged in
+// underneath the `flock-selector` and `flock-sidebar` aliases above, so the
+// project selector, the `Super s` keybinding, and the sidebar in every session
+// all read the same thing. Anything written directly on an alias or at a call
+// site still wins.
+//
+// Commented out because Flock cannot guess where your projects live. Until you
+// set `root_dirs` or `individual_dirs`, the selector's project list is empty.
+//
+// flock {
+//     // Scanned one level deep: every immediate subdirectory is a project.
+//     root_dirs "~/src" "~/work"
+//
+//     // Each entry is itself one project.
+//     individual_dirs "~/dotfiles"
+//
+//     // Layout new local project sessions open with. Defaults to "flock".
+//     session_layout "flock"
+//
+//     // Layout used as the base for sessions bound to a remote machine.
+//     remote_session_layout "~/.config/flock/layouts/flock-remote.kdl"
+//
+//     // Remote providers, off by default because each needs an authenticated
+//     // CLI on PATH to work at all.
+//     codespaces true    // needs an authenticated `gh`
+//     devcontainers true // needs the `devcontainer` CLI and Docker
+//     coder true         // needs an authenticated `coder`
+//     ssh true           // saved-hosts tab; Ctrl-o adds a host. Key or agent
+//                        // auth is required — the transport runs ssh with
+//                        // BatchMode=yes.
+//
+//     // Supplied when Flock creates a Coder workspace, and only when the chosen
+//     // template exposes the named parameter. Selector-only: the sidebar never
+//     // creates workspaces.
+//     coder_dotfiles_uri "https://github.com/example/dotfiles.git"
+//     coder_dotfiles_branch "main"
+//     coder_dotfiles_parameter "dotfiles_uri"
+//     coder_dotfiles_branch_parameter "dotfiles_branch"
+// }
 
 // Choose what to do when zellij receives SIGTERM, SIGINT, SIGQUIT or SIGHUP
 // eg. when terminal window with an active zellij session is closed

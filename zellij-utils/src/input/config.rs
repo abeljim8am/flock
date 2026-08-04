@@ -13,8 +13,9 @@ use thiserror::Error;
 
 use std::convert::TryFrom;
 
+use super::flock_config::{FlockConfig, FLOCK_PLUGIN_ALIASES};
 use super::keybinds::Keybinds;
-use super::layout::RunPluginOrAlias;
+use super::layout::{PluginUserConfiguration, RunPluginOrAlias};
 use super::options::Options;
 use super::plugins::{PluginAliases, PluginsConfigError};
 use super::theme::{Themes, UiConfig};
@@ -38,6 +39,11 @@ pub struct Config {
     pub env: EnvironmentVariables,
     pub background_plugins: HashSet<RunPluginOrAlias>,
     pub web_client: WebClientConfig,
+    /// The `flock { }` section: folder sources and provider flags for the Flock
+    /// plugins, stated once here instead of per call site. Projected onto the
+    /// plugin aliases by [`Config::plugin_aliases_with_flock_defaults`] rather
+    /// than stored into them — see that method for why.
+    pub flock: FlockConfig,
 }
 
 #[derive(Error, Debug, Serialize, Deserialize)]
@@ -268,7 +274,40 @@ impl Config {
         self.plugins.merge(other.plugins);
         self.ui = self.ui.merge(other.ui);
         self.env = self.env.merge(other.env);
+        self.flock = self.flock.merge(other.flock);
         Ok(())
+    }
+    /// The plugin aliases as consumers should use them: the two Flock plugin
+    /// aliases with the `flock { }` values merged **underneath** whatever the
+    /// alias body already states, so a call site always wins and a single layout
+    /// can opt out.
+    ///
+    /// Deliberately computed on demand rather than folded into `self.plugins`.
+    /// The stored aliases are what gets written back to disk (the setup wizard
+    /// serializes the whole config), and baking the projection into them would be
+    /// a one-way door: the next write would copy the `flock { }` values into each
+    /// alias body, where they outrank `flock { }` itself — so editing the block
+    /// would silently stop having any effect.
+    ///
+    /// Only aliases are fed. A layout naming `zellij:flock-sidebar` directly
+    /// bypasses this, and keeps whatever args it states; reference the plugins by
+    /// alias to pick up `flock { }`.
+    pub fn plugin_aliases_with_flock_defaults(&self) -> PluginAliases {
+        if self.flock.is_empty() {
+            return self.plugins.clone();
+        }
+        let flock_configuration = self.flock.to_plugin_configuration();
+        let mut aliases = self.plugins.clone();
+        for alias_name in FLOCK_PLUGIN_ALIASES {
+            let Some(alias) = aliases.aliases.get_mut(alias_name) else {
+                continue;
+            };
+            let mut merged = flock_configuration.clone();
+            // The alias body last, so it overrides the flock defaults.
+            merged.extend(alias.configuration.inner().clone());
+            alias.configuration = PluginUserConfiguration::new(merged);
+        }
+        aliases
     }
     pub fn config_file_path(opts: &CliArgs) -> Option<PathBuf> {
         opts.config.clone().or_else(|| {
@@ -1331,5 +1370,364 @@ mod config_test {
             EnvironmentVariables::from_data(expected_env_config),
             "Env variables defined in config"
         );
+    }
+}
+
+#[cfg(test)]
+mod flock_config_test {
+    use super::*;
+    use crate::input::layout::RunPlugin;
+    use std::collections::BTreeMap;
+
+    fn config_from(kdl: &str) -> Config {
+        Config::from_kdl(kdl, None).unwrap()
+    }
+
+    /// The configuration the selector alias resolves to, which is what the plugin
+    /// actually receives.
+    fn selector_configuration(config: &Config) -> BTreeMap<String, String> {
+        config
+            .plugin_aliases_with_flock_defaults()
+            .aliases
+            .get("flock-selector")
+            .expect("the flock-selector alias must exist")
+            .configuration
+            .inner()
+            .clone()
+    }
+
+    #[test]
+    fn folder_lists_accept_multiple_entries() {
+        let config = config_from(
+            r#"
+            flock {
+                root_dirs "~/src" "~/work"
+                individual_dirs "~/dotfiles"
+            }
+        "#,
+        );
+        assert_eq!(config.flock.root_dirs, vec!["~/src", "~/work"]);
+        assert_eq!(config.flock.individual_dirs, vec!["~/dotfiles"]);
+    }
+
+    #[test]
+    fn folder_lists_also_accept_the_semicolon_joined_plugin_form() {
+        // The plugins take `;`-joined strings natively, so a value copied out of a
+        // layout or an older config keeps working here.
+        let config = config_from(
+            r#"
+            flock {
+                root_dirs "~/src;~/work"
+            }
+        "#,
+        );
+        assert_eq!(config.flock.root_dirs, vec!["~/src", "~/work"]);
+    }
+
+    #[test]
+    fn provider_flags_accept_bools_and_quoted_strings() {
+        let config = config_from(
+            r#"
+            flock {
+                devcontainers true
+                ssh "true"
+                coder false
+            }
+        "#,
+        );
+        assert_eq!(config.flock.devcontainers, Some(true));
+        assert_eq!(config.flock.ssh, Some(true));
+        assert_eq!(config.flock.coder, Some(false));
+        assert_eq!(config.flock.codespaces, None, "unset stays unset");
+    }
+
+    #[test]
+    fn an_unknown_key_is_an_error_rather_than_a_silent_skip() {
+        // A typo here would otherwise leave the selector mysteriously empty with
+        // nothing to point at.
+        let result = Config::from_kdl(
+            r#"
+            flock {
+                root_dirs_typo "~/src"
+            }
+        "#,
+            None,
+        );
+        let Err(ConfigError::KdlError(error)) = result else {
+            panic!("a misspelled flock key must fail to parse");
+        };
+        assert!(
+            error.error_message.contains("root_dirs_typo"),
+            "the error should name the offending key, got: {}",
+            error.error_message
+        );
+    }
+
+    #[test]
+    fn values_are_translated_to_the_plugin_arg_names() {
+        let config = config_from(
+            r#"
+            plugins {
+                flock-selector location="zellij:flock-selector"
+            }
+            flock {
+                root_dirs "~/src" "~/work"
+                devcontainers true
+                coder false
+            }
+        "#,
+        );
+        let configuration = selector_configuration(&config);
+        assert_eq!(
+            configuration.get("root_dirs").map(|s| s.as_str()),
+            Some("~/src;~/work"),
+            "path lists are `;`-joined for the plugin"
+        );
+        assert_eq!(
+            configuration
+                .get("devcontainers_enabled")
+                .map(|s| s.as_str()),
+            Some("true"),
+            "`devcontainers` becomes the plugin's `devcontainers_enabled`"
+        );
+        assert_eq!(
+            configuration.get("coder_enabled").map(|s| s.as_str()),
+            Some("false")
+        );
+        assert_eq!(
+            configuration.get("codespaces_enabled"),
+            None,
+            "an unset flag must say nothing, leaving the plugin's own default"
+        );
+    }
+
+    #[test]
+    fn both_flock_plugins_receive_the_same_configuration() {
+        // They must agree, or plugin matching can near-miss between them.
+        let config = config_from(
+            r#"
+            plugins {
+                flock-selector location="zellij:flock-selector"
+                flock-sidebar location="zellij:flock-sidebar"
+            }
+            flock {
+                root_dirs "~/src"
+                ssh true
+            }
+        "#,
+        );
+        let aliases = config.plugin_aliases_with_flock_defaults();
+        let selector = aliases.aliases.get("flock-selector").unwrap();
+        let sidebar = aliases.aliases.get("flock-sidebar").unwrap();
+        assert_eq!(
+            selector.configuration.inner().get("root_dirs"),
+            sidebar.configuration.inner().get("root_dirs")
+        );
+        assert_eq!(
+            selector.configuration.inner().get("ssh_enabled"),
+            sidebar.configuration.inner().get("ssh_enabled")
+        );
+    }
+
+    #[test]
+    fn an_alias_body_overrides_the_flock_section() {
+        // flock { } is a default layer, not an override: a call site wins so a
+        // single plugin or layout can opt out.
+        let config = config_from(
+            r#"
+            plugins {
+                flock-selector location="zellij:flock-selector" {
+                    root_dirs "~/only-here"
+                }
+            }
+            flock {
+                root_dirs "~/src"
+                ssh true
+            }
+        "#,
+        );
+        let configuration = selector_configuration(&config);
+        assert_eq!(
+            configuration.get("root_dirs").map(|s| s.as_str()),
+            Some("~/only-here"),
+            "the alias body must win"
+        );
+        assert_eq!(
+            configuration.get("ssh_enabled").map(|s| s.as_str()),
+            Some("true"),
+            "keys the alias does not mention still come from flock {{ }}"
+        );
+    }
+
+    #[test]
+    fn an_empty_flock_section_leaves_aliases_untouched() {
+        let config = config_from(
+            r#"
+            plugins {
+                flock-selector location="zellij:flock-selector"
+            }
+        "#,
+        );
+        assert_eq!(
+            config.plugin_aliases_with_flock_defaults(),
+            config.plugins,
+            "with nothing configured, plugin configuration must be byte-identical"
+        );
+    }
+
+    #[test]
+    fn the_projection_is_not_stored_on_the_config() {
+        // The stored aliases are what gets written back to disk. If the projection
+        // were folded into them, the next write would copy the values into each
+        // alias body where they outrank `flock { }` — so editing the block would
+        // silently stop having any effect.
+        let config = config_from(
+            r#"
+            plugins {
+                flock-selector location="zellij:flock-selector"
+            }
+            flock {
+                root_dirs "~/src"
+            }
+        "#,
+        );
+        assert_eq!(
+            config
+                .plugins
+                .aliases
+                .get("flock-selector")
+                .unwrap()
+                .configuration
+                .inner()
+                .get("root_dirs"),
+            None,
+            "the stored alias must stay pristine"
+        );
+    }
+
+    #[test]
+    fn the_section_survives_a_write_back_to_disk() {
+        // The configuration plugin serializes the whole config (the first-run
+        // setup wizard does this). A section missing from `to_string` would be
+        // silently dropped on that write.
+        let original = config_from(
+            r#"
+            flock {
+                root_dirs "~/src" "~/work"
+                individual_dirs "~/dotfiles"
+                session_layout "flock"
+                devcontainers true
+                coder false
+                coder_dotfiles_uri "https://example.com/dotfiles.git"
+            }
+        "#,
+        );
+        let written = original.to_string(false);
+        let reparsed = Config::from_kdl(&written, None).unwrap();
+        assert_eq!(
+            reparsed.flock, original.flock,
+            "flock config must round-trip through to_string"
+        );
+
+        // And the written `plugins` block must NOT have absorbed the values. If a
+        // write-back copied them into an alias body they would outrank `flock { }`
+        // from then on, and editing the block would silently stop having an effect.
+        let plugins_block = written
+            .split_once("plugins {")
+            .map(|(_, rest)| {
+                rest.split_once("\n}")
+                    .map(|(block, _)| block)
+                    .unwrap_or(rest)
+            })
+            .unwrap_or("");
+        assert!(
+            !plugins_block.contains("root_dirs"),
+            "a write-back must not copy flock values into the plugin aliases, got:\n{}",
+            plugins_block
+        );
+    }
+
+    #[test]
+    fn a_later_config_merges_over_an_earlier_one() {
+        let mut base = config_from(
+            r#"
+            flock {
+                root_dirs "~/base"
+                ssh true
+                devcontainers true
+            }
+        "#,
+        );
+        let other = config_from(
+            r#"
+            flock {
+                root_dirs "~/override"
+                ssh false
+            }
+        "#,
+        );
+        base.merge(other).unwrap();
+        assert_eq!(base.flock.root_dirs, vec!["~/override"]);
+        assert_eq!(base.flock.ssh, Some(false));
+        assert_eq!(
+            base.flock.devcontainers,
+            Some(true),
+            "a key the later config omits must be kept, not erased"
+        );
+    }
+
+    #[test]
+    fn a_later_config_that_says_nothing_about_folders_does_not_erase_them() {
+        let mut base = config_from(
+            r#"
+            flock {
+                root_dirs "~/base"
+            }
+        "#,
+        );
+        let other = config_from(
+            r#"
+            flock {
+                ssh true
+            }
+        "#,
+        );
+        base.merge(other).unwrap();
+        assert_eq!(base.flock.root_dirs, vec!["~/base"]);
+        assert_eq!(base.flock.ssh, Some(true));
+    }
+
+    #[test]
+    fn the_shipped_default_config_configures_no_folders() {
+        // The `flock` block in default.kdl must stay commented out: shipping
+        // folder defaults would point the selector at directories that do not
+        // exist on most machines.
+        let config = Config::from_default_assets().unwrap();
+        assert!(
+            config.flock.is_empty(),
+            "shipped default must leave flock unconfigured, got {:?}",
+            config.flock
+        );
+        // ...and the aliases it does ship must be the ones the section feeds.
+        for alias_name in crate::input::flock_config::FLOCK_PLUGIN_ALIASES {
+            assert!(
+                config.plugins.aliases.contains_key(alias_name),
+                "default config must define the `{}` alias for flock {{ }} to feed",
+                alias_name
+            );
+        }
+    }
+
+    #[test]
+    fn the_default_aliases_still_point_at_the_builtin_plugins() {
+        let config = Config::from_default_assets().unwrap();
+        let aliases = config.plugin_aliases_with_flock_defaults();
+        for (alias_name, expected_location) in [
+            ("flock-selector", "zellij:flock-selector"),
+            ("flock-sidebar", "zellij:flock-sidebar"),
+        ] {
+            let alias: &RunPlugin = aliases.aliases.get(alias_name).unwrap();
+            assert_eq!(alias.location.display(), expected_location);
+        }
     }
 }

@@ -458,7 +458,7 @@ impl SessionMetaData {
         let mut new_plugin_config = None;
         for (client_id, new_config) in config_changes {
             if new_plugin_config.is_none() {
-                new_plugin_config = Some(new_config.plugins.clone());
+                new_plugin_config = Some(new_config.plugin_aliases_with_flock_defaults());
             }
 
             let default_cwd = host_cwd_for_remote_backend(
@@ -1064,7 +1064,7 @@ pub fn start_server(mut os_input: Box<dyn ServerOsApi>, socket_path: PathBuf) {
                     Box::new(layout.clone()),                 // TODO: no box
                     cli_assets.clone(),
                     config.clone(),
-                    config.plugins.clone(),
+                    config.plugin_aliases_with_flock_defaults(),
                     client_id,
                 );
                 info!("FirstClientConnected: session initialized, spawning tabs");

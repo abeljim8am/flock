@@ -9,6 +9,7 @@ use crate::data::{
 use crate::envs::EnvironmentVariables;
 use crate::home::{find_default_config_dir, get_layout_dir};
 use crate::input::config::{Config, ConfigError, KdlError};
+use crate::input::flock_config::FlockConfig;
 use crate::input::keybinds::Keybinds;
 use crate::input::layout::{
     Layout, PercentOrFixed, PluginUserConfiguration, RunPlugin, RunPluginOrAlias, TabLayoutInfo,
@@ -4923,6 +4924,10 @@ impl Config {
             let load_plugins = load_plugins_from_kdl(kdl_load_plugins)?;
             config.background_plugins = load_plugins;
         }
+        if let Some(kdl_flock_config) = kdl_config.get("flock") {
+            let config_flock = FlockConfig::from_kdl(kdl_flock_config)?;
+            config.flock = config.flock.merge(config_flock);
+        }
         if let Some(kdl_ui_config) = kdl_config.get("ui") {
             let config_ui = UiConfig::from_kdl(&kdl_ui_config)?;
             config.ui = config.ui.merge(config_ui);
@@ -4953,6 +4958,13 @@ impl Config {
 
         let load_plugins = load_plugins_to_kdl(&self.background_plugins, add_comments);
         document.nodes_mut().push(load_plugins);
+
+        // Must be serialized, not just parsed: the configuration plugin writes the
+        // whole config back to disk (the first-run setup wizard does this), and a
+        // section missing from here would be silently dropped on that write.
+        if let Some(flock_config) = self.flock.to_kdl() {
+            document.nodes_mut().push(flock_config);
+        }
 
         if let Some(ui_config) = self.ui.to_kdl() {
             document.nodes_mut().push(ui_config);
@@ -5140,6 +5152,159 @@ fn load_plugins_from_kdl(
         }
     }
     Ok(load_plugins)
+}
+
+impl FlockConfig {
+    pub fn from_kdl(kdl_flock_config: &KdlNode) -> Result<FlockConfig, ConfigError> {
+        let mut flock_config = FlockConfig::default();
+        let Some(children) = kdl_children_nodes!(kdl_flock_config) else {
+            return Ok(flock_config);
+        };
+        for node in children {
+            let name = kdl_name!(node);
+            match name {
+                "root_dirs" => flock_config.root_dirs = path_list_from_kdl(node)?,
+                "individual_dirs" => flock_config.individual_dirs = path_list_from_kdl(node)?,
+                "session_layout" => flock_config.session_layout = flock_string(node)?,
+                "remote_session_layout" => flock_config.remote_session_layout = flock_string(node)?,
+                "codespaces" => flock_config.codespaces = Some(flock_flag(node)?),
+                "devcontainers" => flock_config.devcontainers = Some(flock_flag(node)?),
+                "coder" => flock_config.coder = Some(flock_flag(node)?),
+                "ssh" => flock_config.ssh = Some(flock_flag(node)?),
+                "coder_dotfiles_uri" => flock_config.coder_dotfiles_uri = flock_string(node)?,
+                "coder_dotfiles_branch" => flock_config.coder_dotfiles_branch = flock_string(node)?,
+                "coder_dotfiles_parameter" => {
+                    flock_config.coder_dotfiles_parameter = flock_string(node)?
+                },
+                "coder_dotfiles_branch_parameter" => {
+                    flock_config.coder_dotfiles_branch_parameter = flock_string(node)?
+                },
+                // Deliberately an error rather than a silent skip: a typo'd key in
+                // this block would otherwise leave the selector mysteriously empty
+                // with nothing to point at.
+                unknown => {
+                    return Err(ConfigError::new_kdl_error(
+                        format!(
+                            "Unknown \"flock\" configuration key: \"{}\". Expected one of: \
+                             root_dirs, individual_dirs, session_layout, remote_session_layout, \
+                             codespaces, devcontainers, coder, ssh, coder_dotfiles_uri, \
+                             coder_dotfiles_branch, coder_dotfiles_parameter, \
+                             coder_dotfiles_branch_parameter",
+                            unknown
+                        ),
+                        node.span().offset(),
+                        node.span().len(),
+                    ))
+                },
+            }
+        }
+        Ok(flock_config)
+    }
+    pub fn to_kdl(&self) -> Option<KdlNode> {
+        if self.is_empty() {
+            return None;
+        }
+        let mut flock_node = KdlNode::new("flock");
+        let mut children = KdlDocument::new();
+
+        let mut push_paths = |key: &str, paths: &Vec<String>| {
+            if !paths.is_empty() {
+                let mut node = KdlNode::new(key);
+                for path in paths {
+                    node.push(path.clone());
+                }
+                children.nodes_mut().push(node);
+            }
+        };
+        push_paths("root_dirs", &self.root_dirs);
+        push_paths("individual_dirs", &self.individual_dirs);
+
+        let mut push_string = |key: &str, value: &Option<String>| {
+            if let Some(value) = value {
+                let mut node = KdlNode::new(key);
+                node.push(value.clone());
+                children.nodes_mut().push(node);
+            }
+        };
+        push_string("session_layout", &self.session_layout);
+        push_string("remote_session_layout", &self.remote_session_layout);
+        push_string("coder_dotfiles_uri", &self.coder_dotfiles_uri);
+        push_string("coder_dotfiles_branch", &self.coder_dotfiles_branch);
+        push_string("coder_dotfiles_parameter", &self.coder_dotfiles_parameter);
+        push_string(
+            "coder_dotfiles_branch_parameter",
+            &self.coder_dotfiles_branch_parameter,
+        );
+
+        let mut push_flag = |key: &str, value: Option<bool>| {
+            if let Some(value) = value {
+                let mut node = KdlNode::new(key);
+                node.push(KdlValue::Bool(value));
+                children.nodes_mut().push(node);
+            }
+        };
+        push_flag("codespaces", self.codespaces);
+        push_flag("devcontainers", self.devcontainers);
+        push_flag("coder", self.coder);
+        push_flag("ssh", self.ssh);
+
+        flock_node.set_children(children);
+        Some(flock_node)
+    }
+}
+
+/// A `flock { }` path list: `root_dirs "~/a" "~/b"`. Each entry is also split on
+/// `;`, so the `;`-joined form the plugins take natively keeps working here.
+fn path_list_from_kdl(node: &KdlNode) -> Result<Vec<String>, ConfigError> {
+    let mut paths = Vec::new();
+    for entry in node.entries() {
+        let Some(value) = entry.value().as_string() else {
+            return Err(ConfigError::new_kdl_error(
+                format!(
+                    "\"{}\" entries must be strings, eg. root_dirs \"~/src\" \"~/work\"",
+                    kdl_name!(node)
+                ),
+                node.span().offset(),
+                node.span().len(),
+            ));
+        };
+        paths.extend(
+            value
+                .split(';')
+                .map(|path| path.trim())
+                .filter(|path| !path.is_empty())
+                .map(|path| path.to_owned()),
+        );
+    }
+    Ok(paths)
+}
+
+fn flock_string(node: &KdlNode) -> Result<Option<String>, ConfigError> {
+    match kdl_first_entry_as_string!(node) {
+        Some(value) => Ok(Some(value.to_owned())),
+        None => Err(ConfigError::new_kdl_error(
+            format!("\"{}\" must be given a string value", kdl_name!(node)),
+            node.span().offset(),
+            node.span().len(),
+        )),
+    }
+}
+
+/// A provider flag. Accepts the KDL bool (`ssh true`) and the quoted string
+/// (`ssh "true"`) the plugin args use, so a value copied out of a layout works.
+fn flock_flag(node: &KdlNode) -> Result<bool, ConfigError> {
+    if let Some(value) = kdl_first_entry_as_bool!(node) {
+        return Ok(value);
+    }
+    match kdl_first_entry_as_string!(node).map(|value| value.trim().to_ascii_lowercase()) {
+        Some(value) if value == "true" => Ok(true),
+        Some(value) if value == "false" => Ok(false),
+        _ => Err(ConfigError::new_kdl_error(
+            format!("\"{}\" must be true or false", kdl_name!(node)),
+            node.span().offset(),
+            node.span().len(),
+        )),
+    }
 }
 
 impl UiConfig {

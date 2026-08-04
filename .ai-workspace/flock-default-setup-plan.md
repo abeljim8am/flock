@@ -95,24 +95,35 @@ flock {
 }
 ```
 
-Inject the resolved `FlockConfig` **underneath** the call-site configuration for
-every `zellij:flock-selector` / `zellij:flock-sidebar` instance, at plugin-load
-time in `zellij-server`. Doing it there (rather than only in alias resolution)
-means it applies uniformly to a direct `zellij:flock-selector` in a layout, to
-the alias, and to the keybind.
-
-Layout args still override, so a project layout can opt out per-session.
+Project the resolved `FlockConfig` **underneath** the `flock-selector` /
+`flock-sidebar` plugin aliases, computed on demand via
+`Config::plugin_aliases_with_flock_defaults()` and applied where the server
+consumes the aliases. Call-site args still override, so a layout can opt out.
 
 Two payoffs:
 
 - Zero args needed anywhere in the common case.
-- **The duplicate-selector bug class disappears by construction.** All three call
-  sites now derive identical configuration, so `running_plugin_satisfies_request`
+- **The duplicate-selector bug class disappears by construction.** Every call
+  site derives identical configuration, so `running_plugin_satisfies_request`
   always matches instead of near-missing.
 
-Also add a `flock { }` key to disable the selector-on-startup behavior, so Flock
-stays usable as a drop-in Zellij replacement for anyone who wants a shell when
-they type `flock`.
+The plan originally called for injecting at plugin-load time in `zellij-server`,
+to also cover a layout naming `zellij:flock-selector` directly. Projecting onto
+the aliases instead accepts that gap — documented, and narrow now that the
+bundled layouts and the README all use the alias form — in exchange for one seam
+in `zellij-utils` that is fully unit-testable.
+
+What it must **not** do is fold the projection into `Config.plugins`. The stored
+aliases are what gets serialized back to disk (the configuration plugin writes
+the whole config, and the first-run wizard triggers it), so baking the values in
+would be a one-way door: the next write copies them into each alias body, where
+they outrank `flock { }` itself, and editing the block silently stops having any
+effect. `FlockConfig` therefore needs `to_kdl` as well, or the section is dropped
+on that same write.
+
+Deferred to Phase 2: the key that disables selector-on-startup. That behavior
+does not exist yet, and shipping a config key that does nothing is worse than
+adding it when it works.
 
 ## Phase 2 — bare `flock` opens the selector
 

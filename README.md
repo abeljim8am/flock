@@ -56,28 +56,25 @@ Flock works with no configuration: it starts with the sidebar docked to the left
 edge, and `Super s` opens the project selector. The one thing it cannot guess is
 where your projects live.
 
-Point it at them in `~/.config/flock/config.kdl` by giving the bundled
-`flock-selector` alias its folder args:
+Point it at them with the `flock` section of `~/.config/flock/config.kdl`:
 
 ```kdl
-plugins {
-    flock-selector location="zellij:flock-selector" {
-        cwd "/"
-        root_dirs "~/src;~/work"      // each scanned one level deep
-        individual_dirs "~/dotfiles"  // each is itself one project
-    }
-    flock-sidebar location="zellij:flock-sidebar" {
-        cwd "/"
-        root_dirs "~/src;~/work"
-        individual_dirs "~/dotfiles"
-    }
+flock {
+    root_dirs "~/src" "~/work"    // each scanned one level deep
+    individual_dirs "~/dotfiles"  // each is itself one project
 }
 ```
 
-These are *aliases*, so this is the only place the args are stated — the bundled
-layouts, the `Super s` keybinding, and the sidebar in each project session all
-resolve through them. Run `flock setup --dump-config` to see the shipped defaults
-with every option documented inline.
+That is the only place these are stated. The project selector, the `Super s`
+keybinding, and the sidebar in every session all read from it. Run
+`flock setup --dump-config` to see the section with every option documented
+inline.
+
+Anything set directly on a plugin — in a layout, or on the `flock-selector` /
+`flock-sidebar` aliases in the `plugins` block — still wins over this section, so
+a single layout can differ. Note that a layout naming `zellij:flock-sidebar`
+*directly* rather than by alias does not pick up the `flock` section at all;
+reference the plugins by alias.
 
 If `Super s` does nothing, your terminal is intercepting `Super` (Cmd on macOS)
 before Flock sees it. Bind a key that does reach the app — this adds to the
@@ -97,13 +94,17 @@ keybinds {
 ```
 
 Remote providers are opt-in, because each needs an authenticated CLI on `PATH`.
-Add them to the aliases above:
+Add them to the same `flock` section:
 
 ```kdl
-codespaces_enabled "true"
-devcontainers_enabled "true"
-coder_enabled "true"
-ssh_enabled "true"
+flock {
+    root_dirs "~/src"
+
+    codespaces true    // needs an authenticated `gh`
+    devcontainers true // needs the `devcontainer` CLI and Docker
+    coder true         // needs an authenticated `coder`
+    ssh true           // saved-hosts tab; Ctrl-o adds a host
+}
 ```
 
 Your own layouts take precedence over Flock's chrome. If you have a

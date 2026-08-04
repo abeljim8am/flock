@@ -6952,4 +6952,18 @@ Config {
         mac_option_is_meta: true,
         base_url: None,
     },
+    flock: FlockConfig {
+        root_dirs: [],
+        individual_dirs: [],
+        session_layout: None,
+        remote_session_layout: None,
+        codespaces: None,
+        devcontainers: None,
+        coder: None,
+        ssh: None,
+        coder_dotfiles_uri: None,
+        coder_dotfiles_branch: None,
+        coder_dotfiles_parameter: None,
+        coder_dotfiles_branch_parameter: None,
+    },
 }
