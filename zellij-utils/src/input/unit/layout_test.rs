@@ -2581,6 +2581,79 @@ fn flock_builtin_layout_loads_with_swap_layout() {
     .unwrap();
 }
 
+#[test]
+fn flock_bundled_layout_dock_resolves_through_the_shipped_alias() {
+    // The bundled flock layout names the sidebar by *alias*
+    // (`location="flock-sidebar"`), not by `zellij:flock-sidebar`, so that folder
+    // args a user adds to that alias in config.kdl reach the sidebar without
+    // editing the layout. That indirection is silent when it breaks: an
+    // unresolved alias simply loads no plugin and the dock renders empty. Assert
+    // the shipped default config actually resolves it.
+    let kdl_layout = include_str!("../../../assets/layouts/flock.kdl");
+    let mut layout = Layout::from_kdl(kdl_layout, Some("flock.kdl".into()), None, None).unwrap();
+
+    let dock_run = &dock_of(&layout).run;
+    assert!(
+        matches!(dock_run, RunPluginOrAlias::Alias(alias) if alias.name == "flock-sidebar"),
+        "the dock should name the sidebar by alias, got {:?}",
+        dock_run
+    );
+    assert!(
+        dock_run.get_run_plugin().is_none(),
+        "an alias should be unresolved before populating"
+    );
+
+    let default_config = crate::input::config::Config::from_default_assets().unwrap();
+    layout.populate_plugin_aliases_in_layout(&default_config.plugins);
+
+    let resolved = dock_of(&layout)
+        .run
+        .get_run_plugin()
+        .expect("the shipped default config must define a `flock-sidebar` alias");
+    assert_eq!(
+        resolved.location,
+        RunPluginLocation::parse("zellij:flock-sidebar", None).unwrap(),
+        "the alias must resolve to the built-in flock-sidebar plugin"
+    );
+}
+
+#[test]
+fn flock_selector_bundled_layout_resolves_through_the_shipped_alias() {
+    // Same contract for the cold-shell picker layout. It keeps only
+    // `session_name` as a call-site arg; everything else must come from the
+    // alias, so that this layout and the `Super s` keybinding agree on
+    // configuration and the keybinding focuses the running picker instead of
+    // launching a second one.
+    let (layout_path, kdl_layout, _) =
+        Layout::stringified_from_default_assets(std::path::Path::new("flock-selector")).unwrap();
+    let mut layout = Layout::from_kdl(&kdl_layout, Some(layout_path), None, None).unwrap();
+
+    let default_config = crate::input::config::Config::from_default_assets().unwrap();
+    layout.populate_plugin_aliases_in_layout(&default_config.plugins);
+
+    let (_, floating_panes) = layout.template.clone().expect("layout has a template");
+    let selector = floating_panes
+        .iter()
+        .find_map(|pane| match pane.run.as_ref() {
+            Some(Run::Plugin(run)) => run.get_run_plugin(),
+            _ => None,
+        })
+        .expect("the selector layout floats a resolved plugin pane");
+    assert_eq!(
+        selector.location,
+        RunPluginLocation::parse("zellij:flock-selector", None).unwrap(),
+    );
+    assert_eq!(
+        selector
+            .configuration
+            .inner()
+            .get("session_name")
+            .map(|s| s.as_str()),
+        Some("flock-selector"),
+        "the call-site session_name must survive alias merging"
+    );
+}
+
 fn dock_of(layout: &Layout) -> &DockLayout {
     layout.dock.as_ref().expect("layout should have a dock")
 }

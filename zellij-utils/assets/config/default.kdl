@@ -204,6 +204,21 @@ keybinds {
         // conjure a second dock pane, which is exactly what a plugin-URL pipe does
         // when the keybind's configuration doesn't match the layout's.
         bind "Alt b" { MessagePlugin { name "flock-toggle-dock"; }; }
+        // Open the project selector. Deliberately bound through the
+        // `flock-selector` *alias* (declared in the `plugins` block below) and
+        // with no configuration of its own: the alias is the single place the
+        // selector's args are stated, so this binding can never disagree with
+        // the layout's copy and launch a second selector.
+        //
+        // Note that `Super` (Cmd on macOS) is swallowed by some terminal
+        // emulators before Flock ever sees it. Rebind this to eg. "Alt s" if
+        // the key does nothing in your terminal.
+        bind "Super s" {
+            LaunchOrFocusPlugin "flock-selector" {
+                floating true
+                move_to_focused_tab true
+            };
+        }
     }
     shared_except "normal" "locked" {
         bind "Enter" "Esc" { SwitchToMode "Normal"; }
@@ -248,6 +263,51 @@ plugins {
     configuration location="zellij:configuration"
     plugin-manager location="zellij:plugin-manager"
     about location="zellij:about"
+
+    // The two Flock plugins. Aliasing them here is what makes their
+    // configuration statable *once*: a layout, a keybinding and a generated
+    // remote layout can all say `location="flock-selector"` with no args, and
+    // every one of them resolves to the same configuration. Adding args at a
+    // call site still overrides the alias, so a single layout can opt out.
+    //
+    // Point the selector at your projects by giving the alias its folder args:
+    //
+    //   flock-selector location="zellij:flock-selector" {
+    //       root_dirs "~/src;~/work"     // each scanned one level deep
+    //       individual_dirs "~/dotfiles" // each is itself one project
+    //   }
+    //
+    // The sidebar takes the same folder args and uses them to decide which
+    // sessions belong to which project, so keep the two in sync.
+    //
+    // Remote providers are opt-in and off by default, because each needs an
+    // authenticated CLI on PATH to work at all:
+    //
+    //   codespaces_enabled "true"    // needs an authenticated `gh`
+    //   devcontainers_enabled "true" // needs the `devcontainer` CLI + Docker
+    //   coder_enabled "true"         // needs an authenticated `coder`
+    //   ssh_enabled "true"           // saved-hosts tab; Ctrl-o adds a host.
+    //                                // Key or agent auth is required — the
+    //                                // transport runs ssh with BatchMode=yes.
+    //
+    // Selector-only (the sidebar never creates workspaces), and applied only
+    // when the chosen Coder template exposes the named parameter:
+    //
+    //   coder_dotfiles_uri "https://github.com/example/dotfiles.git"
+    //   coder_dotfiles_branch "main"
+    //   coder_dotfiles_parameter "dotfiles_uri"
+    //   coder_dotfiles_branch_parameter "dotfiles_branch"
+    //
+    // `cwd` is a reserved plugin property: it sets the plugin's initial working
+    // directory (its `/host` mount) and is deliberately *not* forwarded as a
+    // configuration key. Both plugins need `/` because the project folders they
+    // scan are arbitrary host paths outside any single project.
+    flock-selector location="zellij:flock-selector" {
+        cwd "/"
+    }
+    flock-sidebar location="zellij:flock-sidebar" {
+        cwd "/"
+    }
 }
 
 // Plugins to load in the background when a new session starts
@@ -345,8 +405,16 @@ load_plugins {
 // theme "default"
 
 // The name of the default layout to load on startup
-// Default: "default"
 // (Requires restart)
+//
+// Left unset on purpose. While it is unset, Flock loads your own
+// `layouts/default.kdl` if you have written one, and only falls back to its
+// built-in "flock" layout — the default chrome plus the flock-sidebar as a
+// left-edge dock — when you have not. Setting this option would skip that
+// lookup and ignore your `default.kdl`.
+//
+// Set it to name a specific layout: "default" for the plain upstream Zellij
+// chrome with no sidebar, or "compact" / "classic" / "strider".
 //
 // default_layout "compact"
 

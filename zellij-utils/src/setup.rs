@@ -847,6 +847,10 @@ mod setup_test {
     }
     #[test]
     fn cli_config_dir_finds_custom_default() {
+        // A user's own `layouts/default.kdl` is their startup layout. Flock's
+        // built-in `flock` fallback must not shadow it — that is the whole reason
+        // the fallback lives in layout resolution rather than in a shipped
+        // `default_layout` value.
         let config_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("src")
             .join("test-fixtures")
@@ -866,6 +870,51 @@ mod setup_test {
             .canonicalize()
             .unwrap();
         assert_eq!(layout_path, expected.display().to_string());
+    }
+
+    #[test]
+    fn no_user_default_layout_falls_back_to_the_flock_builtin() {
+        // The other half: a config dir with a layouts/ directory but no
+        // `default.kdl` gets Flock's built-in `flock` layout (sidebar docked),
+        // not upstream Zellij's plain `default`.
+        let config_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("src")
+            .join("test-fixtures")
+            .join("config-dirs")
+            .join("no-default-layout");
+        let cli_args = CliArgs {
+            config_dir: Some(config_dir.clone()),
+            ..Default::default()
+        };
+        let (_, layout_info, _, _, _) = Setup::from_cli_args(&cli_args).unwrap();
+        assert_eq!(
+            layout_info,
+            Some(LayoutInfo::BuiltIn("flock".to_owned())),
+            "with no user default.kdl, the flock builtin is the startup layout"
+        );
+    }
+
+    #[test]
+    fn explicit_default_layout_still_selects_the_upstream_builtin() {
+        // The escape hatch to plain Zellij chrome: naming `default` explicitly
+        // must reach upstream's builtin, not be redirected to flock. Uses a
+        // fixture with no `default.kdl`, so the builtin is what resolves.
+        let config_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("src")
+            .join("test-fixtures")
+            .join("config-dirs")
+            .join("no-default-layout");
+        let cli_args = CliArgs {
+            config_dir: Some(config_dir.clone()),
+            config: Some(config_dir.join("opt-out-config.kdl")),
+            ..Default::default()
+        };
+        let (_, layout_info, _, _, _) = Setup::from_cli_args(&cli_args).unwrap();
+        assert_eq!(
+            layout_info,
+            Some(LayoutInfo::BuiltIn("default".to_owned())),
+            "an explicit default_layout must not be redirected to flock"
+        );
     }
 
     #[test]

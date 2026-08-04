@@ -2104,6 +2104,25 @@ impl From<RunPlugin> for PluginInfo {
     }
 }
 
+/// The built-in layout used on startup when the user named no layout at all —
+/// no `--layout`, no `default_layout` — *and* has no `layouts/default.kdl` of
+/// their own.
+///
+/// Upstream Zellij falls back to its plain `default`; Flock falls back to
+/// `flock`, the same chrome plus the flock-sidebar as a left-edge dock, so a
+/// fresh install shows agent status and session switching with no setup.
+///
+/// This is deliberately a *fallback* rather than a shipped `default_layout`
+/// value: setting that option skips the `default.kdl` lookup entirely, which
+/// would silently ignore a layout the user wrote and expects to be their
+/// startup layout.
+///
+/// Two places must agree on this rule — [`LayoutInfo::from_config`], which
+/// decides what the session records it started from, and
+/// [`crate::input::layout::Layout::stringified_from_path_or_default`], which
+/// actually reads the KDL. Change them together.
+pub const FALLBACK_BUILTIN_LAYOUT: &str = "flock";
+
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 pub enum LayoutInfo {
     BuiltIn(String),
@@ -2442,6 +2461,7 @@ impl LayoutInfo {
         // resolution below will correctly handle this.
         // The docs promise this behavior, so we have to abide:
         // <https://zellij.dev/documentation/layouts.html#layout-default-directory>
+        let layout_unspecified = maybe_layout_path.is_none();
         let layout_path = maybe_layout_path
             .clone()
             .unwrap_or(PathBuf::from("default"));
@@ -2486,7 +2506,14 @@ impl LayoutInfo {
                     ));
                 }
             }
-            // Assume a builtin layout by default
+            // Assume a builtin layout by default. When the caller named no layout
+            // at all, that builtin is Flock's rather than upstream's — see
+            // [`FALLBACK_BUILTIN_LAYOUT`]. Reaching here means the user has no
+            // `default.kdl` of their own; if they do, the lookup above returned it
+            // and this fallback never applies.
+            if layout_unspecified {
+                return Some(LayoutInfo::BuiltIn(FALLBACK_BUILTIN_LAYOUT.to_owned()));
+            }
             Some(LayoutInfo::BuiltIn(layout_path.display().to_string()))
         }
     }

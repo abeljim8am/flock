@@ -1,0 +1,4 @@
+// Present only so the layouts dir exists; deliberately not named default.kdl.
+layout {
+    pane
+}

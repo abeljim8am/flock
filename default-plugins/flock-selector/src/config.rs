@@ -19,7 +19,13 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 /// Layout new sessions open with when none is configured.
-pub const DEFAULT_SESSION_LAYOUT: &str = "default";
+///
+/// The bundled `flock` layout, not Zellij's `default`: a session opened *from
+/// the selector* that lacked the sidebar dock had no way back to the selector
+/// and no agent status, which is the entire reason to pick a project through
+/// Flock. Remote-bound sessions already default to a dock-bearing layout (see
+/// `codespaces::FLOCK_LAYOUT_TEMPLATE`); this makes local ones agree.
+pub const DEFAULT_SESSION_LAYOUT: &str = "flock";
 pub const DEFAULT_CODER_DOTFILES_PARAMETER: &str = "dotfiles_uri";
 pub const DEFAULT_CODER_DOTFILES_BRANCH_PARAMETER: &str = "dotfiles_branch";
 
